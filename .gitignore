@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Pipeline data and results (never committed)
+data/
+results/
+work/
+*.sif
+
+# Slurm logs
+slurm-*.out
+logs/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+*.key
