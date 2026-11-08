@@ -1,0 +1,12 @@
+# Apache Struts: MVC web framework (multi-module Maven).
+name: struts
+repo_url: https://github.com/apache/struts
+commit: d59aea5f5d6099ba09e894cb8810e00a37e112b1
+language: java
+build: maven
+detectors:
+  - tool: arcan
+    path: Arcan/Struts
+  - tool: designite
+    path: Designite/struts
+protected_api: []

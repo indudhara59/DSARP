@@ -1,0 +1,10 @@
+project,versionId,versionIndex,versionDate,AbstractnessMetric,ChangeHasOccurred,ComponentType,FanIn,FanOut,InstabilityMetric,IsNested,LinesOfCode,NumberOfChildren,PageRank,TotalAmountOfChanges,constructType,filePathReal,filePathRelative,name,simpleName,vertexId,vertexLabel
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,PACKAGE,2,1,0.33,false,0,2,0.1,0,PACKAGE,.,.,com.acme.core,core,1,container
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,PACKAGE,1,2,0.66,false,0,1,0.1,0,PACKAGE,.,.,com.acme.util,util,2,container
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,PACKAGE,0,1,1.0,false,0,1,0.1,0,PACKAGE,.,.,com.acme.web,web,3,container
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,PACKAGE,1,0,0.0,false,0,0,0.1,0,PACKAGE,.,.,com.acme,acme,4,container
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,PACKAGE,1,0,0.0,false,0,0,0.1,0,PACKAGE,.,.,org.lib,lib,5,container
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,CONCRETE_CLASS,3,2,0.4,false,120,0,0.2,0,CONCRETE_CLASS,x,core/src/main/java/com/acme/core/Engine.java,com.acme.core.Engine,Engine,10,unit
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,CONCRETE_CLASS,1,1,0.5,false,40,0,0.1,0,CONCRETE_CLASS,x,core/src/main/java/com/acme/util/Dates.java,com.acme.util.Dates,Dates,11,unit
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,CONCRETE_CLASS,0,2,1.0,false,60,0,0.1,0,CONCRETE_CLASS,x,web/src/main/java/com/acme/web/Page.java,com.acme.web.Page,Page,12,unit
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01T00:00:00.000,0.0,false,CONCRETE_CLASS,0,1,1.0,false,30,0,0.1,0,CONCRETE_CLASS,x,core/src/test/java/com/acme/core/EngineTest.java,com.acme.core.EngineTest,EngineTest,13,unit

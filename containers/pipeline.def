@@ -1,0 +1,48 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# Apptainer image for the whole pipeline (no Docker needed on the cluster).
+#
+# Build on a Noctua 2 login node (Apptainer uses user namespaces there):
+#   module load tools Apptainer
+#   export APPTAINER_CACHEDIR=$PC2PFS/<project>/apptainer-cache
+#   export APPTAINER_TMPDIR=$PC2PFS/<project>/apptainer-tmp
+#   apptainer build dsarp.sif containers/pipeline.def
+#
+# Run:
+#   apptainer exec dsarp.sif dsarp --version
+
+%files
+    pyproject.toml /opt/dsarp/pyproject.toml
+    README.md /opt/dsarp/README.md
+    dsarp /opt/dsarp/dsarp
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        openjdk-21-jdk-headless maven git ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    python3 -m venv /opt/venv
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+    /opt/venv/bin/pip install --no-cache-dir "/opt/dsarp[dev]"
+    # Solver used from phase 4 on.
+    /opt/venv/bin/pip install --no-cache-dir "ortools>=9.10"
+
+%environment
+    export PATH=/opt/venv/bin:$PATH
+    export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+    export LC_ALL=C.UTF-8
+
+%runscript
+    exec dsarp "$@"
+
+%test
+    dsarp --version
+    java -version
+
+%labels
+    Name dsarp
+    Description Architectural smell refactoring planner

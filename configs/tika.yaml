@@ -1,0 +1,13 @@
+# Apache Tika: content detection and extraction toolkit (multi-module Maven).
+name: tika
+repo_url: https://github.com/apache/tika
+commit: 697d7c047daf1f661a4ed067bbc8f9c58bb6faa2
+language: java
+build: maven
+detectors:
+  - tool: arcan
+    path: Arcan/Tika
+  - tool: designite
+    path: Designite/Tika
+# Public API that plans must never move (filled in during phase 4).
+protected_api: []

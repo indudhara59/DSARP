@@ -1,0 +1,4 @@
+project,versionId,versionIndex,versionDate,ATDI,AffectedComponentType,AffectedConstructType,AffectedElements,CentralComponent,NumberOfEdges,PageRankWeighted,Severity,Shape,Size,Strength,TotalNumberOfChanges,smellType,vertexId,vertexLabel,Unnamed: 19
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,10.5,CONTAINER,PACKAGE,"[com.acme.core, com.acme.util]",,4,0.0001,6.5,TINY,2,0.0,0,cyclicDep,100,smell,
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,5.0,UNIT,CONCRETE_CLASS,"[com.acme.core.Engine, com.acme.util.Dates, com.acme.web.Page]",com.acme.core.Engine,6,0.0002,7.0,,3,0.0,0,hubLikeDep,101,smell,
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,3.0,CONTAINER,PACKAGE,"[com.acme, org.lib]",,2,0.0,2.0,TINY,2,0.0,0,cyclicDep,102,smell,

@@ -1,0 +1,8 @@
+name: demo
+repo_url: https://example.org/demo.git
+commit: 0123456789abcdef0123456789abcdef01234567
+detectors:
+  - tool: arcan
+    path: sample/arcan
+  - tool: designite
+    path: sample/designite

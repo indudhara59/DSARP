@@ -1,0 +1,5 @@
+Project,Package,Class,NOF,NOPF,NOM,NOPM,LOC,WMC,NC,DIT,LCOM,Fan-In,Fan-Out,File,Line no
+demo,com.acme.core,Engine,2,0,5,4,120,9,0,0,0.3,3,2,/home/u/demo/./core/src/main/java/com/acme/core/Engine.java,10
+demo,com.acme.util,Dates,0,0,3,3,40,4,0,0,0.0,1,1,/home/u/demo/./core/src/main/java/com/acme/util/Dates.java,5
+demo,com.acme.web,Page,1,0,2,2,60,3,0,0,0.0,0,2,/home/u/demo/./web/src/main/java/com/acme/web/Page.java,7
+demo,com.acme.core,EngineTest,0,0,1,1,30,1,0,0,0.0,0,1,/home/u/demo/./core/src/test/java/com/acme/core/EngineTest.java,3
