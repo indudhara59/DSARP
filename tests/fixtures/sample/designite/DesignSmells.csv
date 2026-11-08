@@ -1,0 +1,4 @@
+Project,Package,Class,Smell,Description,File
+demo,com.acme.core,Engine,Cyclically-dependent Modularization,The tool detected the smell in this class because this class participates in a cyclic dependency. The participating classes in the cycle are: Engine; Dates,/home/u/demo/./core/src/main/java/com/acme/core/Engine.java
+demo,com.acme.util,Dates,Cyclically-dependent Modularization,The tool detected the smell in this class because this class participates in a cyclic dependency. The participating classes in the cycle are: Dates; Engine,/home/u/demo/./core/src/main/java/com/acme/util/Dates.java
+demo,com.acme.core,Engine,Deficient Encapsulation,Not architectural,/home/u/demo/./core/src/main/java/com/acme/core/Engine.java

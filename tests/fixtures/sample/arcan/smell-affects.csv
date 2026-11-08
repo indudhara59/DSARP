@@ -1,0 +1,6 @@
+project,versionId,versionIndex,versionDate,edgeId,edgeLabel,from,fromId,to,toId
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,200,affects,cyclicDep,100,com.acme.core,1
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,201,affects,cyclicDep,100,com.acme.util,2
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,202,affects,hubLikeDep,101,com.acme.core.Engine,10
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,203,affects,cyclicDep,102,com.acme,4
+demo,0123456789abcdef0123456789abcdef01234567,1,2026-01-01,204,affects,cyclicDep,102,org.lib,5

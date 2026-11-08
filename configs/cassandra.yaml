@@ -1,0 +1,22 @@
+# Apache Cassandra: distributed database (Ant build, custom source layout).
+# The available Arcan output has component metrics only (no smell files) and a
+# run id instead of a commit hash. Set 'commit' to the analysed commit.
+name: cassandra
+repo_url: https://github.com/apache/cassandra
+commit: null
+language: java
+build: auto
+detectors:
+  - tool: arcan
+    path: Arcan/Cassandra
+  - tool: designite
+    path: Designite/cassandra/db_Output
+    module: db
+  - tool: designite
+    path: Designite/cassandra/cql3_Output
+    module: cql3
+  - tool: designite
+    path: Designite/cassandra/tools_Output
+    module: tools
+protected_api: []
+notes: Arcan smell files missing; Designite run per package group (db, cql3, tools).

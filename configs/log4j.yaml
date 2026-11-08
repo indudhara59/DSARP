@@ -1,0 +1,12 @@
+# Apache Log4j 2: logging library (multi-module Maven).
+name: log4j
+repo_url: https://github.com/apache/logging-log4j2
+commit: 4f474b32751f4ccad67424ca585612584440cd63
+language: java
+build: maven
+detectors:
+  - tool: arcan
+    path: Arcan/Loggin_log4j
+  - tool: designite
+    path: Designite/logging_log4j
+protected_api: []

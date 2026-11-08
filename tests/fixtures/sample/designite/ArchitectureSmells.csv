@@ -1,0 +1,8 @@
+Project,Package,Smell,Description
+demo,com.acme.core,Cyclic Dependency,The tool detected the smell in this component because this component participates in a cyclic dependency. The participating components in the cycle are: com.acme.core; com.acme.util; com.acme.core
+demo,com.acme.util,Cyclic Dependency,The tool detected the smell in this component because this component participates in a cyclic dependency. The participating components in the cycle are: com.acme.util; com.acme.core; com.acme.util
+demo,com.acme.web,Unstable Dependency,The tool detected the smell in this component because this component depends on other components that are less stable than itself. This component depends on following less stable component(s): com.acme.util
+demo,com.acme.core,Feature Concentration,The tool detected the smell in this component because the component realizes more than one architectural concern/feature. Independent sets of related classes within this component are: [Engine; EngineTest]; [Helper]. LCC (Lack of Component Cohesion) = 0.5
+demo,com.acme.util,Scattered Functionality,The tool detected the smell in this component because a set of two or more components realizes the same high-level architectural concern. Following components realize the same concern: com.acme.util; com.acme.web
+demo,com.acme.core,God Component,The tool detected the smell in this component because the component contains high number of classes. Number of classes in the component are: 54
+demo,<All packages>,Dense Structure, The tool detected the smell because all the analyzed components exhibit excessive and dense dependencies among themselves. Average degree = 4.5. All the dependencies among components: from: com.acme.web to: com.acme.core; from: com.acme.core to: com.acme.util

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsarp"
+version = "0.1.0"
+description = "Architectural smell refactoring planner: turns Arcan and Designite results into verified refactoring plans for any Java repository and commit."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+dsarp = "dsarp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dsarp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs real detector output (set DSARP_DATA to the data folder)",
+]

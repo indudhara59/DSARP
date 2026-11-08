@@ -1,0 +1,23 @@
+# Apache Karaf: OSGi runtime (multi-module Maven, OSGi wiring).
+# Designite was run separately on four modules; they are imported together.
+name: karaf
+repo_url: https://github.com/apache/karaf
+commit: 5f5677d7395170208907f2f1655ae9fd9b3bff9e
+language: java
+build: maven
+detectors:
+  - tool: arcan
+    path: Arcan/Karaf
+  - tool: designite
+    path: Designite/Karaf/Main
+    module: main
+  - tool: designite
+    path: Designite/Karaf/jms_Output
+    module: jms
+  - tool: designite
+    path: Designite/Karaf/jaas_Output
+    module: jaas
+  - tool: designite
+    path: Designite/Karaf/jdbc_Output
+    module: jdbc
+protected_api: []
