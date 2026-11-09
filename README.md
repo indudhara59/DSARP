@@ -10,9 +10,10 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: phase 3 of 6.** Detector import (stages 0-1), program model
-> (stage 2) and triage with in-memory smell detection (stage 3) are
-> implemented and tested. See [Roadmap](#roadmap).
+> **Status: phase 4 of 6.** Detector import (stages 0-1), program model
+> (stage 2), triage with in-memory smell detection (stage 3) and the
+> constraint plan generator with simulation, checks and ranking (stages 5a, 6)
+> are implemented and tested. See [Roadmap](#roadmap).
 
 ## Pipeline
 
@@ -23,8 +24,8 @@ re-analysed on the real code.
 | 2 Program model | Classes, methods, fields, typed dependencies, modules, API, history | done |
 | 3 Triage | Drop false smells, group into components, prioritize, set scope | done |
 | 4 Learned priors | Affinity of elements to places, learned from refactoring history | phase 5 |
-| 5 Generate plans | Constraint solver (CP-SAT); LLM + tree search as fallback | phases 4-5 |
-| 6 Filter and rank | Graph simulation, preconditions, smell re-detection, ranking | phase 4 |
+| 5 Generate plans | Constraint solver (CP-SAT or HiGHS); LLM + tree search as fallback | 5a done, 5b phase 5 |
+| 6 Filter and rank | Graph simulation, preconditions, smell re-detection, ranking | done |
 | 7 Explain | LLM agents write exact edit steps | phase 5 |
 | 8 Verify | Apply, build, test, re-run detectors (once per run) | phase 6 |
 | 9 Report | Ranked roadmap for users; evaluation for research | phase 6 |
@@ -158,6 +159,59 @@ g = m.package_graph()            # production code; include_tests=True to add te
 m.callers("org.apache.tika.mime.MimeTypes#getMimeType(java.io.File)")
 ```
 
+### 5. Refactoring plans
+
+```bash
+dsarp plan results/tika --groups 10 --time-limit 60          # needs model/ and triage/
+dsarp plan results/tika --types cyclic_dependency --backend cpsat
+```
+
+For each of the top groups (package cycles, unstable dependencies, hub-like
+packages) a **mixed-integer model** decides where the classes of the group
+should live and which dependencies to remove:
+
+| Operation | When the model may use it |
+|---|---|
+| `move_class` | to a neighbouring package of the same build module, without a name clash, unless the class is protected API |
+| `delete_member` | deprecated method/field/constructor without production callers |
+| `remove_unused_import` | the dependency exists only through an import |
+| `extract_interface` | the client only calls instance methods of the provider (Dependency Inversion: the interface lives in the client's package) |
+
+Constraints keep every class in one package, turn class dependencies into
+package dependencies, require the target smell to disappear (cycles: a
+topological order of the packages, cycles are added lazily; unstable: the
+dependencies on less stable packages go; hub: fan-in or fan-out drops to the
+threshold) and stop packages from growing into god components. The cost of a
+change grows with poor fit (affinity from structure, co-change and names),
+the number of classes that use the moved class, public API and framework
+wiring; new package dependencies cost extra. Several **trade-off plans** are
+solved: `most_removed`, `least_change` (if the smell can be removed
+completely), an `alternative` (diversity cut) and plans for 50% and 25% of the
+cost (epsilon constraint).
+
+Every plan is then **applied in memory to the whole repository** and the
+smells are detected again (L1, L3: target smell removed? new cycles, hubs,
+unstable dependencies or god components elsewhere?), its operations are
+**checked** against the member-level facts (L2: members that must become
+public, imports and tests to update, wiring files, API warnings, blocked
+operations) and the plans are **ranked** (benefit − new smells − cost; the
+weights are in `dsarp/plan/run.py`). A plan is recommended only if it is not
+blocked and has a positive score.
+
+| File in `plans/` | Content |
+|---|---|
+| `plans.json` | per group: plans, operations with their checks and follow-up edits, simulation before/after, score, recommended plan |
+| `operations.csv` | one row per operation: group, plan, step, operation, element, from, to, check status |
+| `summary.csv` | one row per plan: cost, benefit, new smells, checks, solver status and gap |
+
+Example (Tika, Karaf, Struts, 30 s per plan with HiGHS): small and medium
+cycles are removed completely or mostly with 1-12 operations (Karaf: one move
+each); the 17-package tika-core cycle is reduced (benefit 0.86, 37
+operations); for the 41-package Struts cycle no plan reaches a positive score
+with HiGHS in this time, so none is recommended and the candidates are listed.
+Use CP-SAT (installed in the container) and longer time limits on the cluster
+for large groups.
+
 ### Supported detector output
 
 * **Arcan**: `smell-characteristics.csv`, `smell-affects.csv`, `component-metrics.csv`.
@@ -198,6 +252,7 @@ apptainer exec dsarp.sif dsarp checkout configs/*.yaml --workdir $DSARP_WORK
 ls configs/*.yaml > configs.list
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/ingest_array.sbatch
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch   # stages 0-3
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/plan_array.sbatch    # plans (CP-SAT)
 
 # Test suite on a compute node
 sbatch -A <project> slurm/run_tests.sbatch
@@ -228,7 +283,7 @@ Detector output of the study repositories is not stored in this repository.
 1. **Foundation and data import** (stages 0-1). Done.
 2. **Program model** (stage 2): extraction with the JDK compiler API of elements, typed dependencies, modules, framework wiring, public API and co-change history. Done.
 3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization, scope and quick fixes; detection rules calibrated against Arcan and Designite. Done.
-4. **Constraint plan generator** (stages 5a, 6): CP-SAT model, several trade-off plans, graph simulation and precondition checks.
+4. **Constraint plan generator** (stages 5a, 6): mixed-integer model (CP-SAT or HiGHS), trade-off plans, whole-repository simulation and re-detection, precondition checks, ranking. Done.
 5. **Learning and LLM parts** (stages 4, 5b, 7): learned affinity and ranking, LLM with tree search, explanation agents.
 6. **Verification, report and evaluation** (stages 8-9): OpenRewrite, builds, delta debugging, reports, evaluation against baselines.
 
@@ -251,6 +306,13 @@ dsarp/            Python package
   detect.py       in-memory smell detection (cycles, hubs, unstable, god components)
   calibrate.py    agreement with Arcan/Designite, threshold search
   triage.py       stage 3: decisions, groups, priority, scope, quick fixes
+  plan/           stages 5a and 6
+    solver.py     linear model, HiGHS and CP-SAT backends
+    facts.py      candidates, affinity and costs per group
+    generator.py  plan model and trade-off plans
+    simulate.py   apply a plan in memory and detect again (L1, L3)
+    checks.py     Java preconditions and follow-up edits (L2)
+    run.py        plan the top groups, score, rank, write results
   cli.py          command-line interface
 java-helpers/
   extractor/      program-model extractor (JDK compiler API, no dependencies)

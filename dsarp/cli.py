@@ -10,6 +10,7 @@ Examples::
     dsarp model configs/tika.yaml --repo work/tika --out results/tika/model
     dsarp triage results/tika
     dsarp calibrate results/tika
+    dsarp plan results/tika --groups 10 --time-limit 60
 """
 
 from __future__ import annotations
@@ -182,6 +183,28 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_plan(args: argparse.Namespace) -> int:
+    from .plan.run import Planner, write
+    status = 0
+    for d in args.results:
+        d = Path(d)
+        model = Path(args.model) if args.model else d / "model"
+        triage_dir = d / "triage"
+        if not (model / "model.json").exists() or not (triage_dir / "groups.csv").exists():
+            print(f"ERROR {d}: needs {model}/model.json (dsarp model) and {triage_dir}/groups.csv (dsarp triage)",
+                  file=sys.stderr)
+            status = 1
+            continue
+        print(f"\n{d.name}:")
+        planner = Planner(model, triage_dir, backend=args.backend, time_limit=args.time_limit)
+        types = set(args.types.split(",")) if args.types else None
+        result = planner.run(args.groups, types)
+        result["repo"] = d.name
+        paths = write(result, Path(args.out) if args.out else d / "plans")
+        print("  written: " + ", ".join(str(p) for p in paths.values()))
+    return status
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dsarp", description="Architectural smell refactoring planner")
     p.add_argument("--version", action="version", version=f"dsarp {__version__}")
@@ -230,6 +253,17 @@ def build_parser() -> argparse.ArgumentParser:
     ca.add_argument("results", nargs="+")
     ca.add_argument("--model", help="program model folder (default: <results>/model)")
     ca.set_defaults(func=_cmd_calibrate)
+
+    pl = sub.add_parser("plan", help="stages 5a-6: generate, check, simulate and rank refactoring plans")
+    pl.add_argument("results", nargs="+", help="result folders with model/ and triage/")
+    pl.add_argument("--model", help="program model folder (default: <results>/model)")
+    pl.add_argument("--out", help="output folder (default: <results>/plans)")
+    pl.add_argument("--groups", type=int, default=10, help="number of top supported groups to plan (default: 10)")
+    pl.add_argument("--types", help="comma-separated smell types (default: all supported)")
+    pl.add_argument("--time-limit", type=float, default=60.0, help="solver seconds per plan (default: 60)")
+    pl.add_argument("--backend", default="auto", choices=["auto", "cpsat", "highs"],
+                    help="solver (auto: CP-SAT if installed, else HiGHS)")
+    pl.set_defaults(func=_cmd_plan)
 
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")
