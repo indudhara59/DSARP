@@ -10,9 +10,9 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: phase 2 of 6.** Detector import and normalization (stages 0-1)
-> and the program model (stage 2) are implemented and tested. See
-> [Roadmap](#roadmap).
+> **Status: phase 3 of 6.** Detector import (stages 0-1), program model
+> (stage 2) and triage with in-memory smell detection (stage 3) are
+> implemented and tested. See [Roadmap](#roadmap).
 
 ## Pipeline
 
@@ -21,7 +21,7 @@ re-analysed on the real code.
 | 0 Detect | Run Arcan and Designite at the commit, or import their output | import done |
 | 1 Normalize | One smell table and one component table for all tools | done |
 | 2 Program model | Classes, methods, fields, typed dependencies, modules, API, history | done |
-| 3 Triage | Drop false smells, group into components, prioritize, set scope | phase 3 |
+| 3 Triage | Drop false smells, group into components, prioritize, set scope | done |
 | 4 Learned priors | Affinity of elements to places, learned from refactoring history | phase 5 |
 | 5 Generate plans | Constraint solver (CP-SAT); LLM + tree search as fallback | phases 4-5 |
 | 6 Filter and rank | Graph simulation, preconditions, smell re-detection, ranking | phase 4 |
@@ -116,6 +116,41 @@ improves resolution further. Large repositories need more memory
 Classes in files that do not exist at the commit mean the detector analysed
 a different version of the code; a warning is raised.
 
+### 4. Triage and in-memory detection
+
+```bash
+dsarp triage results/tika          # needs results/tika/smells.csv and results/tika/model/
+dsarp calibrate results/tika       # optional: agreement with Arcan and Designite (slower)
+```
+
+Every detector smell gets a decision: **keep**, **drop** with a reason
+(test code only, generated code only, only external libraries, not in the
+analysed code, a reported cycle that does not exist between production
+classes, or exists only through test code), or **report only** (dense
+structure). Kept smells are **grouped**: all cycles inside one strongly
+connected component of the production graph form one group, other smells are
+grouped by the element they are centred on. Each group gets a **priority**
+(severity × (0.1 + PageRank) × (1 + change activity), ×1.2 when both tools
+report it) and a **scope** (core elements, neighbouring packages or classes
+that are possible targets, and **quick fixes**: package dependencies inside a
+cycle that exist only through unused imports or deprecated code).
+
+| File in `triage/` | Content |
+|---|---|
+| `smells_triaged.csv` | every smell with decision, reason and group |
+| `groups.csv` | groups ranked by priority, with size, edges, PageRank, changes, API members, quick fixes |
+| `scopes.json` | per group: core elements, neighbours, core classes, quick fixes |
+| `detected_baseline.csv` | in-memory detection on production code (baseline for measuring plans) |
+| `triage.json` | counts per decision and reason, top groups, baseline summary |
+
+`dsarp.detect` re-implements the detection rules on the program model, so the
+effect of a plan on the smells can be measured in memory. Package-level cycles
+agree closely with Arcan (recall 0.91-0.96, precision 0.94-1.0 on Tika, Karaf
+and Struts). Hub-like and unstable dependency use thresholds calibrated against
+Arcan 2.x (fan-in and fan-out above the 90th percentile; at least half of the
+dependencies on less stable packages), because the published rules (median,
+30%) flag many more components than Arcan 2.x reports.
+
 ```python
 from dsarp.program import ProgramModel
 m = ProgramModel("results/tika/model")
@@ -162,7 +197,7 @@ apptainer exec dsarp.sif dsarp checkout configs/*.yaml --workdir $DSARP_WORK
 # All repositories as one Slurm job array: stages 0-1 only, or stages 0-2
 ls configs/*.yaml > configs.list
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/ingest_array.sbatch
-sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch   # stages 0-3
 
 # Test suite on a compute node
 sbatch -A <project> slurm/run_tests.sbatch
@@ -192,7 +227,7 @@ Detector output of the study repositories is not stored in this repository.
 
 1. **Foundation and data import** (stages 0-1). Done.
 2. **Program model** (stage 2): extraction with the JDK compiler API of elements, typed dependencies, modules, framework wiring, public API and co-change history. Done.
-3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization; detection rules calibrated against Arcan.
+3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization, scope and quick fixes; detection rules calibrated against Arcan and Designite. Done.
 4. **Constraint plan generator** (stages 5a, 6): CP-SAT model, several trade-off plans, graph simulation and precondition checks.
 5. **Learning and LLM parts** (stages 4, 5b, 7): learned affinity and ranking, LLM with tree search, explanation agents.
 6. **Verification, report and evaluation** (stages 8-9): OpenRewrite, builds, delta debugging, reports, evaluation against baselines.
@@ -213,6 +248,9 @@ dsarp/            Python package
   history.py      change and co-change counts from git
   extractor.py    runs the Java extractor
   program.py      stage 2: program model, class and package graphs
+  detect.py       in-memory smell detection (cycles, hubs, unstable, god components)
+  calibrate.py    agreement with Arcan/Designite, threshold search
+  triage.py       stage 3: decisions, groups, priority, scope, quick fixes
   cli.py          command-line interface
 java-helpers/
   extractor/      program-model extractor (JDK compiler API, no dependencies)
