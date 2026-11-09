@@ -16,6 +16,7 @@ From: ubuntu:24.04
     pyproject.toml /opt/dsarp/pyproject.toml
     README.md /opt/dsarp/README.md
     dsarp /opt/dsarp/dsarp
+    java-helpers /opt/dsarp/java-helpers
 
 %post
     export DEBIAN_FRONTEND=noninteractive
@@ -28,6 +29,10 @@ From: ubuntu:24.04
     python3 -m venv /opt/venv
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip
     /opt/venv/bin/pip install --no-cache-dir "/opt/dsarp[dev]"
+    # Program-model extractor (JDK only, no downloads)
+    sh /opt/dsarp/java-helpers/extractor/build.sh
+    cp /opt/dsarp/java-helpers/extractor/build/dsarp-extractor.jar /opt/dsarp/dsarp-extractor.jar
+
     # Solver used from phase 4 on.
     /opt/venv/bin/pip install --no-cache-dir "ortools>=9.10"
 
@@ -42,6 +47,7 @@ From: ubuntu:24.04
 %test
     dsarp --version
     java -version
+    test -f /opt/dsarp/dsarp-extractor.jar
 
 %labels
     Name dsarp

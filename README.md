@@ -10,8 +10,9 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: phase 1 of 6.** Detector import and normalization (pipeline
-> stages 0 and 1) are implemented and tested. See [Roadmap](#roadmap).
+> **Status: phase 2 of 6.** Detector import and normalization (stages 0-1)
+> and the program model (stage 2) are implemented and tested. See
+> [Roadmap](#roadmap).
 
 ## Pipeline
 
@@ -19,7 +20,7 @@ re-analysed on the real code.
 |---|---|---|
 | 0 Detect | Run Arcan and Designite at the commit, or import their output | import done |
 | 1 Normalize | One smell table and one component table for all tools | done |
-| 2 Program model | Classes, methods, fields, typed dependencies, modules, API, history | phase 2 |
+| 2 Program model | Classes, methods, fields, typed dependencies, modules, API, history | done |
 | 3 Triage | Drop false smells, group into components, prioritize, set scope | phase 3 |
 | 4 Learned priors | Affinity of elements to places, learned from refactoring history | phase 5 |
 | 5 Generate plans | Constraint solver (CP-SAT); LLM + tree search as fallback | phases 4-5 |
@@ -35,8 +36,10 @@ python3 -m pip install -e ".[dev]"
 dsarp --version
 ```
 
-Python 3.10 or newer. Later phases also need Java 21 and Maven or Gradle; the
-Apptainer image in `containers/` has everything.
+Python 3.10 or newer and a JDK 17 or newer (for the program-model
+extractor, built automatically on first use with `java-helpers/extractor/build.sh`;
+no Maven or downloads needed). The Apptainer image in `containers/` has
+everything.
 
 ## Usage
 
@@ -83,6 +86,43 @@ Output per repository:
 
 Nothing is removed at this stage; stage 3 decides what to drop, using the flags.
 
+### 3. Build the program model
+
+```bash
+dsarp checkout configs/tika.yaml --workdir work          # clone with history, check out the commit
+dsarp model configs/tika.yaml --workdir work --out results/tika/model --ingest results/tika
+```
+
+The extractor in `java-helpers/extractor` uses the JDK's own compiler API
+(parse and attribute), so names resolve exactly as `javac` resolves them.
+External libraries are not needed: references to them are recorded as
+unresolved and analysis continues. Passing their jars with `--classpath`
+improves resolution further. Large repositories need more memory
+(`--memory 16g`).
+
+| File | Content |
+|---|---|
+| `files.csv` | every Java file: module, test, generated, excluded and why, lines, changes |
+| `types.csv` | classes, interfaces, enums, records, annotations: package, module, visibility, deprecated, public API, protected by config, wiring references, changes |
+| `members.csv` | methods, constructors, fields, initializers: visibility, static, deprecated, `@Override`, callers (all and from tests) |
+| `deps.csv` | dependencies from a member or type to a type or member, with kind (`call`, `field_access`, `new`, `extends`, `implements`, `import`, `param_type`, `return_type`, `field_type`, `local_type`, `type_ref`, `annotation`, ...) and count |
+| `packages.csv` | per package: modules, size, test-only, API types, changes |
+| `modules.json` | build modules (Maven or Gradle), allowed module dependencies, OSGi exported packages and activators |
+| `wiring.csv` | non-Java files that name classes: ServiceLoader, Spring factories, XML (Blueprint, Spring, Struts, web.xml), bundle activators |
+| `cochange.csv` | pairs of files that changed together in git history, with counts |
+| `model.json` | commit, counts, compiler diagnostics, history statistics, coverage of the detectors' classes, warnings |
+
+`model.json` reports, per detector, how many of its classes the model found.
+Classes in files that do not exist at the commit mean the detector analysed
+a different version of the code; a warning is raised.
+
+```python
+from dsarp.program import ProgramModel
+m = ProgramModel("results/tika/model")
+g = m.package_graph()            # production code; include_tests=True to add tests
+m.callers("org.apache.tika.mime.MimeTypes#getMimeType(java.io.File)")
+```
+
 ### Supported detector output
 
 * **Arcan**: `smell-characteristics.csv`, `smell-affects.csv`, `component-metrics.csv`.
@@ -115,9 +155,14 @@ apptainer build dsarp.sif containers/pipeline.def
 # Detector output on the parallel file system, not in $HOME
 export DSARP_DATA=$PC2PFS/<project>/dsarp-data
 
-# All repositories as one Slurm job array
+# Checkouts on the login node (compute nodes may have no internet access)
+export DSARP_WORK=$PC2PFS/<project>/work
+apptainer exec dsarp.sif dsarp checkout configs/*.yaml --workdir $DSARP_WORK
+
+# All repositories as one Slurm job array: stages 0-1 only, or stages 0-2
 ls configs/*.yaml > configs.list
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/ingest_array.sbatch
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch
 
 # Test suite on a compute node
 sbatch -A <project> slurm/run_tests.sbatch
@@ -126,8 +171,9 @@ sbatch -A <project> slurm/run_tests.sbatch
 ## Tests
 
 ```bash
-python3 -m pytest -q                                   # unit tests (synthetic fixtures)
-DSARP_DATA=/path/to/data python3 -m pytest -q          # also checks the five study repositories
+python3 -m pytest -q                                   # unit tests (synthetic fixtures, small Java project)
+DSARP_DATA=/path/to/data python3 -m pytest -q          # also checks the detector data of the study repositories
+DSARP_DATA=... DSARP_WORK=/path/to/checkouts python3 -m pytest -q   # also builds real program models
 ```
 
 Detector output of the study repositories is not stored in this repository.
@@ -136,7 +182,7 @@ Detector output of the study repositories is not stored in this repository.
 
 | Repository | Commit | Notes |
 |---|---|---|
-| Apache Tika | `697d7c0` | multi-module Maven |
+| Apache Tika | `697d7c0` | multi-module Maven; the Designite output comes from a later version (413 classes in files that do not exist at this commit) |
 | Apache Struts | `d59aea5` | multi-module Maven |
 | Apache Karaf | `5f5677d` | OSGi; Designite run per module |
 | Apache Log4j 2 | `4f474b3` | multi-module Maven |
@@ -145,7 +191,7 @@ Detector output of the study repositories is not stored in this repository.
 ## Roadmap
 
 1. **Foundation and data import** (stages 0-1). Done.
-2. **Program model** (stage 2): JavaParser-based extraction of elements, typed dependencies, modules, framework wiring, public API and co-change history.
+2. **Program model** (stage 2): extraction with the JDK compiler API of elements, typed dependencies, modules, framework wiring, public API and co-change history. Done.
 3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization; detection rules calibrated against Arcan.
 4. **Constraint plan generator** (stages 5a, 6): CP-SAT model, several trade-off plans, graph simulation and precondition checks.
 5. **Learning and LLM parts** (stages 4, 5b, 7): learned affinity and ranking, LLM with tree search, explanation agents.
@@ -160,7 +206,16 @@ dsarp/            Python package
   paths.py        source roots, modules, test and generated code
   detectors/      one adapter per detector (arcan, designite)
   ingest.py       stages 0-1: import, merge, flags, manifest
+  checkout.py     clone and check out the configured commit
+  sources.py      find and classify Java files
+  buildinfo.py    Maven/Gradle modules, OSGi headers
+  wiring.py       ServiceLoader, Spring, XML and activator references
+  history.py      change and co-change counts from git
+  extractor.py    runs the Java extractor
+  program.py      stage 2: program model, class and package graphs
   cli.py          command-line interface
+java-helpers/
+  extractor/      program-model extractor (JDK compiler API, no dependencies)
 configs/          one YAML file per study repository
 containers/       Apptainer definition
 slurm/            Slurm job scripts for Noctua 2

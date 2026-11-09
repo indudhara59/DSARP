@@ -1,0 +1,9 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId><version>1.0</version></parent>
+  <artifactId>acme-web</artifactId>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>acme-core</artifactId><version>${project.version}</version></dependency>
+    <dependency><groupId>org.external</groupId><artifactId>lib</artifactId><version>2.0</version></dependency>
+  </dependencies>
+</project>
