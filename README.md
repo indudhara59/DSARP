@@ -10,7 +10,7 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: all six phases implemented (version 0.6.0).** Stages 0-9:
+> **Status: all six phases implemented (version 0.6.1).** Stages 0-9:
 > detector import, program model, triage, learned affinity, constraint plans,
 > tree search with an optional language model, simulation and checks,
 > step-by-step reports, verification on the real code (apply, compile, delta
@@ -299,18 +299,22 @@ the dependencies once on a login node; the build runs offline).
 | `new_errors.csv`, `new_errors_full_plan.csv` | compiler errors caused by the plan |
 | `verification.json` | result: compiles, kept/dropped, smell before/after, prediction, build |
 
-Results (compile check, no build):
+Results (compile check, no build; 6 groups per repository, 30 s solver and 60 s search):
 
-| Repository, group | Steps | Compile | Smell after (verified) | Simulation predicted |
+| Repository | Plans | Steps kept | Smell removed (on the code) | Result equals simulation |
 |---|---|---|---|---|
-| Karaf, 4 cycles | 1 each | all | removed (4/4) | same |
-| Tika, unstable `metadata` | 2 | all | removed | same |
-| Tika, OneNote cycle | 9 | all | 4 packages, 1 dependency to cut (from 8, 7) | same |
-| Tika, tika-core cycle | 25 | 22 (3 dropped) | 13 packages, 10 to cut (from 17, 22) | 12, 8 |
+| Karaf | 4 | 4/4 | 4 | 4/4 |
+| Struts | 6 | 46/46 | 2 (hubs); the others reduced | 6/6 |
+| Tika | 6 | 40/41 | 1; cycles reduced, e.g. 8 → 2 and 17 → 16 packages | 6/6 |
 
-The three dropped Tika steps moved `AutoDetectParser` and `ServiceLoader` and
-deleted a deprecated method that tests still call; the patch touches 623 files
-(most for the `ParseContext` move).
+The one dropped Tika step extracted an interface for `ParseContext` in a class
+that passes the object on to methods that expect a `ParseContext`; the compiler
+rejects it and delta debugging removes it. In a stress test on Tika, single
+random operations were applied and compiled one by one: 10/10 class moves
+compiled, and 8/8 interface extractions under the final rules (only classes
+as clients, no inherited signatures, no nested provider types). Passing the
+object on as the concrete type is not visible in the dependency facts, so such
+steps are left to the verification.
 
 ### 8. Report and evaluation
 
@@ -328,20 +332,24 @@ least the same number of evaluations), `random`, `llm_only` (with `--llm`) and
 `hybrid_fixed_affinity` (ablation). It also reports how stable the
 recommendation is when each score weight is halved or increased by half.
 
-Struts, top 5 plannable groups (30 s solver, 60 s search per group):
+Struts, top 5 plannable groups (30 s solver, 60 s search per group; at least
+600 evaluations for NSGA-II and random search):
 
-| approach | mean score | mean benefit | best in group | mean steps |
-|---|---|---|---|---|
-| hybrid | **0.52** | 0.60 | 2 | 11.6 |
-| hybrid, fixed affinity | 0.49 | 0.54 | 1 | 7.6 |
-| search only | 0.46 | 0.50 | 2 | 3.2 |
-| NSGA-II | 0.44 | 0.55 | 0 | 4.0 |
-| random | 0.30 | 0.43 | 0 | 5.0 |
-| solver only | 0.19 | 0.60 | 0 | 9.8 |
+| approach | mean score | mean benefit | best in group | mean new smells | mean steps |
+|---|---|---|---|---|---|
+| hybrid | **0.52** | 0.60 | 3 | 0.0 | 13.4 |
+| search only | 0.45 | 0.50 | 1 | 0.0 | 3.2 |
+| NSGA-II | 0.41 | 0.53 | 0 | 0.0 | 2.8 |
+| random | 0.40 | 0.49 | 1 | 0.0 | 4.6 |
+| hybrid, fixed affinity | 0.33 | 0.59 | 1 | 0.4 | 11.8 |
+| solver only | 0.16 | 0.59 | 0 | 1.2 | 12.0 |
 
-The solver alone removes as much of the smells as the hybrid but creates new
-smells and visibility changes; the search repairs those plans. Run the full
-evaluation on the cluster (`slurm/evaluate_array.sbatch`).
+The solver alone removes about as much of the smells as the hybrid but creates
+new smells and visibility changes; the search repairs those plans. The learned
+affinity matters: with the fixed weights the hybrid scores 0.33 instead of
+0.52. The recommendation is stable: it stays the same in 98% of the runs in
+which one score weight is halved or increased by half. These are short local
+runs; run the full evaluation on the cluster (`slurm/evaluate_array.sbatch`).
 
 ### Supported detector output
 
@@ -426,7 +434,10 @@ Detector output of the study repositories is not stored in this repository.
 Known limitations: the compile check compiles the whole repository at once,
 so it does not see build-module boundaries (use `--build`); history moves are
 described by the code at the analysed commit; class-level smells (class
-cycles, god classes) are triaged but not yet planned.
+cycles, god classes) are triaged but not yet planned; an extracted interface
+fails to compile when the client passes the object on as the concrete type
+(the verification drops such steps); only deprecated members that nothing
+calls any more (tests included) are deleted.
 
 ## Project layout
 

@@ -143,20 +143,61 @@ class RepoFacts:
     # ------------------------------------------------------------ members
 
     def _deletable(self) -> dict[str, dict]:
-        """Deprecated members without production callers that can be deleted."""
+        """Deprecated methods and fields that nothing calls any more (neither production code nor
+        tests) and can be deleted.
+
+        Uses from inside the owner itself count as production uses (the
+        program model's caller counts only other classes). Methods that are
+        overridden in a subtype are kept (the override would no longer
+        compile), and constructors are never deleted (implicit ``super()``
+        calls are not visible in the dependencies)."""
+        d = self.model.deps
+        used_inside = set(d.loc[(d["source"] != d["target"]) & d["target"].str.contains("#", regex=False)
+                                & (d["source_type"] == d["target_type"]), "target"])
+        ext = d[d["kind"].isin(["extends", "implements"])]
+        subtypes: dict[str, set[str]] = defaultdict(set)
+        for a, b in zip(ext["source_type"], ext["target_type"]):
+            if a != b:
+                subtypes[b].add(a)
         out = {}
         for mid, info in self.member_info.items():
             if not info["deprecated"] or info["override"] or info["protected"]:
                 continue
-            if info["kind"] not in ("method", "constructor", "field"):
+            if info["kind"] not in ("method", "field"):
                 continue
             owner = self.top.get(info["owner"])
             if owner not in self.prod or self.kind.get(owner) in ("interface", "annotation"):
                 continue
-            if info["callers"] - info["test_callers"] > 0:
+            if info["callers"] > 0 or mid in used_inside:
+                continue                      # used by production code or by tests (tests would break)
+            if info["kind"] == "method" and self._overridden(mid, subtypes):
                 continue
             out[mid] = {"owner": owner, "test_callers": int(info["test_callers"]), "api": bool(info["api"])}
         return out
+
+    def _is_overridden(self, mid: str) -> bool:
+        if "_subtypes" not in self.__dict__:
+            d = self.model.deps
+            ext = d[d["kind"].isin(["extends", "implements"])]
+            sub: dict[str, set[str]] = defaultdict(set)
+            for a, b in zip(ext["source_type"], ext["target_type"]):
+                if a != b:
+                    sub[b].add(a)
+            self.__dict__["_subtypes"] = sub
+        return self._overridden(mid, self.__dict__["_subtypes"])
+
+    def _overridden(self, mid: str, subtypes: dict[str, set[str]]) -> bool:
+        owner, sig = mid.split("#", 1)
+        todo, seen = [owner], {owner}
+        while todo:
+            for sub in subtypes.get(todo.pop(), ()):
+                if sub in seen:
+                    continue
+                if f"{sub}#{sig}" in self.member_info:
+                    return True
+                seen.add(sub)
+                todo.append(sub)
+        return False
 
     # ------------------------------------------------------------ affinity
 
@@ -242,15 +283,42 @@ class RepoFacts:
             return None
         if self.protected.get(e.target) or self.protected.get(e.source):
             return None
+        if self.kind.get(e.source) != "class":
+            return None            # an interface or enum client: implementers would stop compiling
+        for m in e.source_members:
+            info = self.member_info.get(m)
+            if info is not None and info["kind"] == "method" and (info["override"] or self._is_overridden(m)):
+                return None        # the provider type is part of an inherited signature
         methods = []
         for m in e.target_members:
             if "#" not in m:
+                if m != e.target:
+                    return None    # a nested type of the provider is used
                 continue
             info = self.member_info.get(m)
             if info is None or info["kind"] != "method" or info["static"]:
                 return None
             methods.append(m)
         return sorted(methods) if methods else None
+
+    def signature_types(self, methods: list[str]) -> set[str]:
+        """Production classes named in the signatures of ``methods`` (return, parameter, throws types).
+
+        An interface extracted for these methods depends on them."""
+        if "_sig" not in self.__dict__:
+            d = self.model.deps
+            d = d[d["kind"].isin(["return_type", "param_type", "throws", "type_arg", "type_bound"])
+                  & d["source"].str.contains("#", regex=False)]
+            sig: dict[str, set[str]] = defaultdict(set)
+            for src, tgt in zip(d["source"], d["target_type"]):
+                t = self.top.get(tgt)
+                if t in self.prod:
+                    sig[src].add(t)
+            self.__dict__["_sig"] = sig
+        out: set[str] = set()
+        for m in methods:
+            out |= self.__dict__["_sig"].get(m, set())
+        return out
 
     def dependents(self, c: str) -> set[str]:
         return {k[0] for k in self.in_edges.get(c, [])}
@@ -382,7 +450,3 @@ def inversion_cost(methods: list[str]) -> float:
 IMPORT_COST = 0.05
 EDGE_COST = 0.01   # tie-breaker: prefer fewer package dependencies
 NEW_EDGE_COST = 1.5   # a package dependency that does not exist today (architecture erosion)
-
-
-def log_weight(w: int) -> float:
-    return math.log1p(w)

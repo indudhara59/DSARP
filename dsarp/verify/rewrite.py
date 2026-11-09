@@ -189,6 +189,8 @@ class Rewriter:
                 lines[i] = self._make_public(lines[i])
             elif op[0] == "remove_import":
                 lines = [ln for ln in lines if not re.match(r"\s*import\s+" + re.escape(op[2]) + r"\s*;", ln)]
+        if any(op[0] == "delete" for op in ops):
+            lines = _drop_unused_imports(lines)       # the deleted code may have been the only user
         self._write(path, lines)
         res.changed.add(file)
 
@@ -214,7 +216,7 @@ class Rewriter:
         text = re.sub(r"\b(public|protected|private|final|synchronized|native|abstract|default|static)\b", "", text)
         return re.sub(r"\s+", " ", text).strip() + ";"
 
-    def _extract_interface(self, op: dict, repo: Path, res: ApplyResult) -> None:
+    def _extract_interface(self, op: dict, repo: Path, res: ApplyResult, clients: list[str] | None = None) -> None:
         iface = interface_name(op)
         pkg, simple = iface.rsplit(".", 1)
         client_file = self.type_file[op["client"]]
@@ -222,7 +224,25 @@ class Rewriter:
         sigs = [s for s in (self._signature(m, repo) for m in op.get("methods", [])) if s]
         root = self.file_root.get(client_file, "")
         path = posixpath.join(root, pkg.replace(".", "/"), simple + ".java")
-        body = [f"package {pkg};", "", f"/** Operations of {op['provider'].rsplit('.', 1)[-1]} used by "
+        # imports: those of the provider (unused ones are harmless) and classes of the provider's
+        # package named in the signatures (these keep a dependency; re-detection will show it)
+        ptext = (repo / provider_file).read_text(encoding="utf-8", errors="replace")
+        ppkg = op["provider"].rsplit(".", 1)[0]
+        same_pkg = {t.rsplit(".", 1)[-1] for t, q in self.type_pkg.items() if q == ppkg and self.top.get(t) == t}
+        used = set(re.findall(r"\b[A-Z]\w*", " ".join(sigs)))
+        imports = []
+        for ln in ptext.split("\n"):
+            m = re.match(r"\s*import\s+(?!static)([\w.]+?)(\.\*)?\s*;", ln)
+            if not m:
+                continue
+            if m.group(2):                                  # wildcard: keep, it may provide a used name
+                imports.append(ln.strip())
+            elif m.group(1).rsplit(".", 1)[-1] in used:     # only types the signatures name
+                imports.append(ln.strip())
+        imports += [f"import {ppkg}.{n};" for n in sorted(used & same_pkg) if ppkg != pkg]
+        imports = [i for i in dict.fromkeys(imports) if not i.startswith(f"import {pkg}.{simple};")]
+        body = [f"package {pkg};", ""] + imports + ([""] if imports else []) + [
+                f"/** Operations of {op['provider'].rsplit('.', 1)[-1]} used by "
                 f"{op['client'].rsplit('.', 1)[-1]} (extracted to invert the dependency). */",
                 f"public interface {simple} {{"] + [f"    {s}" for s in sigs] + ["}", ""]
         self._write(repo / path, body)
@@ -246,11 +266,20 @@ class Rewriter:
                     lines[j] = lines[j].replace("{", f"implements {iface} {{", 1)
             self._write(p, lines)
             res.changed.add(provider_file)
-        # client uses the interface instead of the provider
+        # clients use the interface instead of the provider
+        for client in clients or [op["client"]]:
+            self._use_interface(repo, self.type_file[client], client, op, pname, simple, res)
+
+    def _use_interface(self, repo: Path, client_file: str, client: str, op: dict, pname: str, simple: str,
+                       res: ApplyResult) -> None:
         c = repo / client_file
         text = c.read_text(encoding="utf-8", errors="replace")
-        text = re.sub(r"^[ \t]*import\s+" + re.escape(op["provider"]) + r"[ \t]*;[ \t]*\n", "", text, flags=re.M)
         text = re.sub(r"(?<![\w.])(?<!new )" + re.escape(pname) + r"\b(?!\s*\.)", simple, text)
+        code = _strip_comments_and_strings(text)
+        if not re.search(r"(?<![\w.])" + re.escape(pname) + r"\b", code):      # no static uses left
+            text = re.sub(r"^[ \t]*import\s+" + re.escape(op["provider"]) + r"[ \t]*;[ \t]*\n", "", text, flags=re.M)
+        else:
+            res.notes.append(f"{client} still uses {op['provider']} statically; import kept")
         c.write_text(text, encoding="utf-8")
         res.changed.add(client_file)
 
@@ -279,9 +308,19 @@ class Rewriter:
                 self.widen(op["class"], edits)
         for file, fe in edits.items():
             self._apply_line_edits(repo, file, fe, res)
+        # one interface per provider and client package: merge the methods of all its clients
+        merged: dict[str, dict] = {}
+        clients: dict[str, list[str]] = defaultdict(list)
         for op in ops:
             if op["op"] == "extract_interface":
-                self._extract_interface(op, repo, res)
+                k = interface_name(op)
+                if k in merged:
+                    merged[k]["methods"] = sorted(set(merged[k]["methods"]) | set(op.get("methods", [])))
+                else:
+                    merged[k] = {**op, "methods": list(op.get("methods", []))}
+                clients[k].append(op["client"])
+        for k, op in merged.items():
+            self._extract_interface(op, repo, res, clients[k])
         moves = [o for o in ops if o["op"] == "move_class"]
         if moves:
             self._apply_moves(repo, moves, res)
@@ -336,13 +375,16 @@ class Rewriter:
             body = _strip_comments_and_strings(new)
             add = []
             for c, simple in moved_simple.items():
-                if old_pkg[c] in (pkg, orig_pkg) and rename[c].rsplit(".", 1)[0] != pkg and \
-                        re.search(r"(?<![\w.$])" + re.escape(simple) + r"\b", body) and not _imports(new, rename[c]):
+                wildcard = re.search(r"^\s*import\s+" + re.escape(old_pkg[c]) + r"\.\*\s*;", new, re.M)
+                if (old_pkg[c] in (pkg, orig_pkg) or wildcard) and rename[c].rsplit(".", 1)[0] != pkg and \
+                        re.search(r"(?<![\w.$])" + re.escape(simple) + r"\b", body) and not _imports(new, rename[c]) \
+                        and not _imports_simple(new, simple):
                     add.append(rename[c])
             for c, simple in moved_simple.items():
                 if file_pkg.get(current.get(self.type_file[c], ""), "") == pkg and f == current.get(self.type_file[c]):
                     for other in sorted(remaining.get(old_pkg[c], ())):
-                        if re.search(r"(?<![\w.$])" + re.escape(other) + r"\b", body) and pkg != old_pkg[c]:
+                        if re.search(r"(?<![\w.$])" + re.escape(other) + r"\b", body) and pkg != old_pkg[c] \
+                                and not _imports_simple(new, other):
                             name = f"{old_pkg[c]}.{other}"
                             if not _imports(new, name):
                                 add.append(name)
@@ -375,6 +417,23 @@ class Rewriter:
 
 def _imports(text: str, fqn: str) -> bool:
     return re.search(r"^\s*import\s+" + re.escape(fqn) + r"\s*;", text, re.M) is not None
+
+
+def _drop_unused_imports(lines: list[str]) -> list[str]:
+    """Remove single-type imports whose simple name is no longer used in the code."""
+    code = _strip_comments_and_strings("\n".join(lines))
+    out = []
+    for ln in lines:
+        m = re.match(r"\s*import\s+(?!static\b)[\w.]+\.(\w+)\s*;\s*$", ln)
+        if m and not re.search(r"(?<![\w$])" + re.escape(m.group(1)) + r"\b", code):
+            continue
+        out.append(ln)
+    return out
+
+
+def _imports_simple(text: str, simple: str) -> bool:
+    """The file already imports a type with this simple name (that import shadows same-package types)."""
+    return re.search(r"^\s*import\s+(?!static\b)[\w.]+\." + re.escape(simple) + r"\s*;", text, re.M) is not None
 
 
 def _add_imports(text: str, names: list[str]) -> str:

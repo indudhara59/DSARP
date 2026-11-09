@@ -34,6 +34,11 @@ SYSTEM = ("You are a software architect. You remove architectural smells from Ja
           "small, safe refactorings. Answer only with JSON.")
 
 
+def state_key(ops: dict[str, dict]) -> frozenset:
+    """Identity of a state: operation keys and, for moves, the target package."""
+    return frozenset((k, str(v.get("to_package", ""))) for k, v in ops.items())
+
+
 @dataclass
 class Node:
     ops: dict[str, dict]
@@ -94,7 +99,7 @@ class Search:
     # ------------------------------------------------------------- evaluation
 
     def evaluate(self, ops: dict[str, dict]) -> float:
-        key = frozenset(ops)
+        key = state_key(ops)
         if key in self.cache:
             return self.cache[key][0]
         if not ops:
@@ -166,7 +171,7 @@ class Search:
             lines.append("Current plan:")
             lines += [f"  - {op_key(o)}" + (f" -> {o.get('to_package')}" if o["op"] == "move_class" else "")
                       for o in st_ops]
-            _, sim = self.cache.get(frozenset(ops), (None, None))
+            _, sim = self.cache.get(state_key(ops), (None, None))
             if sim is not None:
                 lines.append(f"Result: target before {sim.target_before}, after {sim.target_after}; "
                              f"new smells {sim.new_smells[:5]}")
@@ -219,7 +224,7 @@ class Search:
             ops = {op_key(o): o for o in seed}
             v = self.evaluate(ops)
             trace.append({"event": "seed", "operations": len(ops), "score": v})
-        seeded = [(self.cache[frozenset(op_key(o) for o in sd)][0], sd) for sd in seeds or [] if sd]
+        seeded = [(self.cache[state_key({op_key(o): o for o in sd})][0], sd) for sd in seeds or [] if sd]
         start_ops = {op_key(o): o for o in max(seeded, key=lambda x: x[0])[1]} if seeded else {}
         if start_ops:
             self.root = Node(dict(start_ops))           # repair the best seed

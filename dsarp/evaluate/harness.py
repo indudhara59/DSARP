@@ -109,14 +109,14 @@ class Harness:
                          ("random", lambda ev: random_search(ev, n_eval, seed=self.seed,
                                                              time_limit=self.kw["search_time"] * 3))):
             t0 = time.time()
-            ev = Evaluator(p.rf, gf, p.sim)
+            ev = Evaluator(p.rf, gf, p.sim, checker=p.checker)
             plan, extra = fn(ev)
             sim, sc = self._scored(gf, plan) if plan else (None, {})
             rows.append(_row(group, name, plan, sim, sc, time.time() - t0,
                              {"evaluations": len(ev.cache), **{k: v for k, v in extra.items() if k != "skipped"}}))
         if self.llm is not None and getattr(self.llm, "name", "none") != "none":
             t0 = time.time()
-            plan, extra = llm_only(Evaluator(p.rf, gf, p.sim), self.llm)
+            plan, extra = llm_only(Evaluator(p.rf, gf, p.sim, checker=p.checker), self.llm)
             sim, sc = self._scored(gf, plan) if plan else (None, {})
             rows.append(_row(group, "llm_only", plan, sim, sc, time.time() - t0, extra))
         return rows

@@ -60,6 +60,7 @@ class Verifier:
         self.rf = RepoFacts.build(self.model)
         self.sim = Simulator(self.rf)
         self._baseline: cmp.CompileResult | None = None
+        self.packages = set(self.model.types["package"].dropna())
         self.symbols = {t.rsplit(".", 1)[-1].split("$")[-1] for t in self.model.types["type"]} | \
             set(self.model.members["name"]) | {t.rsplit(".", 1)[-1] for t in self.model.types["package"].dropna()}
 
@@ -68,8 +69,10 @@ class Verifier:
     def baseline(self) -> cmp.CompileResult:
         if self._baseline is None:
             t0 = time.time()
-            self._baseline = cmp.compile_tree(self.repo, self.rw.java_files, self.roots,
-                                              self.results / "verify" / "baseline", self.classpath, self.memory)
+            # compile a clean copy at the analysed commit (the checkout itself may have local changes)
+            with Workspace(self.repo, self.workdir / "baseline", self.meta.get("commit")) as ws:
+                self._baseline = cmp.compile_tree(ws.path, self.rw.java_files, self.roots,
+                                                  self.results / "verify" / "baseline", self.classpath, self.memory)
             self.log(f"baseline compile: {len(self._baseline.errors)} errors (missing libraries) "
                      f"in {time.time() - t0:.0f} s")
         return self._baseline
@@ -84,7 +87,8 @@ class Verifier:
         renamed = {o["class"]: f"{o['to_package']}.{o['class'].rsplit('.', 1)[-1]}"
                    for o in ops if o["op"] == "move_class"}
         new = cmp.new_errors(self.baseline().errors, comp.errors, res.moved, renamed,
-                             self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types})
+                             self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
+                             set(renamed.values()) | set(res.created_types), self.packages)
         return new.empty, res, comp, new
 
     def _production_after(self, res, ops) -> set[str]:
@@ -187,12 +191,18 @@ class Verifier:
         for g in todo[:groups] if groups else todo:
             plan = next(p for p in g["plans"] if p["name"] == g["recommended"])
             rec = self.verify_plan(g, plan)
+            yn = {True: "yes", False: "no", None: "-"}
             self.log(f"{g['group_id']}: {rec['kept']}/{rec['operations']} operations compile "
-                     f"({rec['reduction']}, {rec['compile_runs']} compiles); target removed: "
-                     f"{rec.get('target_removed')}, as predicted: {rec.get('prediction_matches')}"
+                     f"({rec['reduction']}, {rec['compile_runs']} compiles); smell removed: "
+                     f"{yn[rec.get('target_removed')]}; result equals simulation: {yn[rec.get('prediction_matches')]}"
                      + (f"; build {'ok' if rec['build']['ok'] else 'FAILED'}" if "build" in rec else "")
                      + f" [{rec['seconds']:.0f} s]")
             out.append(rec)
+        # keep earlier results of groups that were not verified in this run
+        prev_file = self.results / "verify" / "verification.json"
+        if only and prev_file.exists():
+            done = {r["group_id"] for r in out}
+            out = [r for r in json.loads(prev_file.read_text()) if r["group_id"] not in done] + out
         summary = self.results / "verify" / "summary.csv"
         pd.DataFrame([{k: v for k, v in r.items() if not isinstance(v, (dict, list))} for r in out]).to_csv(
             summary, index=False)
