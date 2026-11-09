@@ -6,6 +6,8 @@ Examples::
     dsarp ingest configs/tika.yaml --data-root /path/to/data --out results/tika
     dsarp ingest configs/*.yaml --data-root /path/to/data --out results
     dsarp summary results/tika
+    dsarp checkout configs/tika.yaml --workdir work
+    dsarp model configs/tika.yaml --repo work/tika --out results/tika/model
 """
 
 from __future__ import annotations
@@ -18,8 +20,11 @@ from pathlib import Path
 import pandas as pd
 
 from . import __version__
+from .checkout import CheckoutError, checkout
 from .config import ConfigError, load_config
+from .extractor import ExtractorError
 from .ingest import ingest, write
+from .program import build_model
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -83,6 +88,56 @@ def _cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_checkout(args: argparse.Namespace) -> int:
+    status = 0
+    for path in args.configs:
+        try:
+            cfg = load_config(path, args.data_root)
+            dest = checkout(cfg, args.workdir, full_history=not args.shallow)
+            print(f"{cfg.name}: {dest} @ {cfg.commit}")
+        except (ConfigError, CheckoutError) as exc:
+            print(f"ERROR {path}: {exc}", file=sys.stderr)
+            status = 1
+    return status
+
+
+def _cmd_model(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(args.config, args.data_root)
+    except ConfigError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+    repo = Path(args.repo) if args.repo else Path(args.workdir) / cfg.name
+    out = Path(args.out) if args.out else Path("results") / cfg.name / "model"
+    try:
+        res = build_model(cfg, repo, out, include_tests=not args.no_tests, classpath=args.classpath or "",
+                          memory=args.memory, history_commits=args.history, ingest_dir=args.ingest,
+                          keep_raw=not args.drop_raw)
+    except (ExtractorError, RuntimeError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+    m = res.manifest
+    c = m["counts"]
+    print(f"\n{m['repo']} @ {m['commit']}  ->  {res.out}")
+    print(f"  files: {c['analysed_files']} analysed of {c['java_files']} (excluded: {c['excluded_files']})")
+    print(f"  types: {c['types']}, members: {c['members']}, dependencies: {c['dependencies']}, packages: {c['packages']}")
+    print(f"  build: {m['build_system']}, {c['build_modules']} modules, {c['module_dependencies']} module dependencies")
+    print(f"  API types: {c['api_types']}, wiring references: {c['wiring_refs_in_repo']} {m['wiring_by_kind']}")
+    ex = m["extractor"]
+    print(f"  extractor: {ex.get('seconds')} s, compiler errors {ex.get('compiler_errors')}, "
+          f"unresolved type uses {ex.get('unresolved_type_uses')}")
+    if m.get("history"):
+        h = m["history"]
+        print(f"  history: {h['commits_used']} commits, {h['cochange_pairs']} co-change pairs")
+    for tool, cv in m.get("coverage", {}).items():
+        if isinstance(cv, dict) and "fraction" in cv:
+            print(f"  {tool} classes found: {cv['found']}/{cv['classes']} ({cv['fraction']:.1%}); "
+                  f"in files not at this commit: {cv['file_not_at_commit']}, other: {cv['not_found_other']}")
+    for w in m["warnings"]:
+        print(f"  warning: {w}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dsarp", description="Architectural smell refactoring planner")
     p.add_argument("--version", action="version", version=f"dsarp {__version__}")
@@ -98,6 +153,27 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--data-root", help="folder that detector paths are relative to (default: $DSARP_DATA)")
     i.add_argument("--out", help="output folder (one sub-folder per repo when several configs are given)")
     i.set_defaults(func=_cmd_ingest)
+
+    co = sub.add_parser("checkout", help="clone repositories and check out the configured commits")
+    co.add_argument("configs", nargs="+")
+    co.add_argument("--workdir", default="work", help="folder for the clones (default: work)")
+    co.add_argument("--shallow", action="store_true", help="fetch only the commit (no co-change history)")
+    co.add_argument("--data-root", help=argparse.SUPPRESS)
+    co.set_defaults(func=_cmd_checkout)
+
+    mo = sub.add_parser("model", help="stage 2: build the program model of a checked-out repository")
+    mo.add_argument("config")
+    mo.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
+    mo.add_argument("--workdir", default="work")
+    mo.add_argument("--out", help="output folder (default: results/<name>/model)")
+    mo.add_argument("--ingest", help="stage 1 output folder, to report coverage of detector classes")
+    mo.add_argument("--classpath", help="jars of external libraries (optional, improves type resolution)")
+    mo.add_argument("--memory", default="4g", help="Java heap for the extractor (default: 4g)")
+    mo.add_argument("--history", type=int, default=3000, help="commits of history for co-change (0 = off)")
+    mo.add_argument("--no-tests", action="store_true", help="leave test code out")
+    mo.add_argument("--drop-raw", action="store_true", help="delete the extractor's raw TSV output")
+    mo.add_argument("--data-root", help=argparse.SUPPRESS)
+    mo.set_defaults(func=_cmd_model)
 
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")
