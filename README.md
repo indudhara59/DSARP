@@ -10,11 +10,12 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: phase 5 of 6.** Stages 0-7 are implemented and tested: detector
-> import, program model, triage, learned affinity, constraint plans, tree
-> search with an optional language model, simulation, checks, ranking and
-> step-by-step reports. Verification on the real code and the evaluation
-> harness (stages 8-9) follow in phase 6. See [Roadmap](#roadmap).
+> **Status: all six phases implemented (version 0.6.0).** Stages 0-9:
+> detector import, program model, triage, learned affinity, constraint plans,
+> tree search with an optional language model, simulation and checks,
+> step-by-step reports, verification on the real code (apply, compile, delta
+> debugging, re-detection, optional build and tests) and the evaluation
+> against baselines (NSGA-II, random search, solver only, search only).
 
 ## Pipeline
 
@@ -28,8 +29,8 @@ re-analysed on the real code.
 | 5 Generate plans | Constraint solver (CP-SAT or HiGHS); tree search with optional language model | done |
 | 6 Filter and rank | Graph simulation, preconditions, smell re-detection, ranking | done |
 | 7 Explain | Step-by-step report from facts; optional model summary, checked by a reviewer | done |
-| 8 Verify | Apply, build, test, re-run detectors (once per run) | phase 6 |
-| 9 Report | Ranked roadmap for users; evaluation for research | phase 6 |
+| 8 Verify | Apply to a copy of the code, compile, delta debugging, detect again; optional build, tests, Arcan/Designite | done |
+| 9 Report | HTML report for users; evaluation against baselines for research | done |
 
 ## Installation
 
@@ -266,6 +267,82 @@ with HiGHS in this time, so none is recommended and the candidates are listed.
 Use CP-SAT (installed in the container) and longer time limits on the cluster
 for large groups.
 
+### 7. Verification on the code
+
+```bash
+dsarp verify results/tika --workdir work                  # compile check, delta debugging, re-detection, patches
+dsarp verify results/tika --workdir work --build auto     # also Maven/Gradle build + selected tests (offline)
+dsarp verify results/tika --arcan-cmd "java -jar arcan.jar -i {repo} -o {out}"   # also re-run a detector
+```
+
+Every recommended plan is applied to a clean copy of the checkout (git
+worktree): files moved and their `package` line changed, imports and fully
+qualified names rewritten in all Java and wiring files, imports added where
+classes of the old package used the moved class (and the other way round),
+members widened as listed by the checks (overriding methods too), deprecated
+members deleted with their Javadoc and annotations, unused imports removed,
+interfaces created and implemented. Then **all Java files are compiled** with
+the JDK compiler; errors that were not there before are caused by the plan
+(errors about library symbols the repository does not define are ignored).
+If there are new errors, **delta debugging** finds the steps that cause them
+and the plan is reduced to the steps that compile. The smells are then
+**detected again on the compiled code** and compared with the original code
+and with the prediction of the simulation. With `--build`, the affected
+modules are built and the tests that use a changed class are run (download
+the dependencies once on a login node; the build runs offline).
+
+| File in `verify/<group>/` | Content |
+|---|---|
+| `plan.patch` | the change as a git patch (apply with `git apply`) |
+| `rewrite.yml` | OpenRewrite recipe for the moves (`org.openrewrite.java.ChangeType`) |
+| `operations.json` | steps kept and dropped |
+| `new_errors.csv`, `new_errors_full_plan.csv` | compiler errors caused by the plan |
+| `verification.json` | result: compiles, kept/dropped, smell before/after, prediction, build |
+
+Results (compile check, no build):
+
+| Repository, group | Steps | Compile | Smell after (verified) | Simulation predicted |
+|---|---|---|---|---|
+| Karaf, 4 cycles | 1 each | all | removed (4/4) | same |
+| Tika, unstable `metadata` | 2 | all | removed | same |
+| Tika, OneNote cycle | 9 | all | 4 packages, 1 dependency to cut (from 8, 7) | same |
+| Tika, tika-core cycle | 25 | 22 (3 dropped) | 13 packages, 10 to cut (from 17, 22) | 12, 8 |
+
+The three dropped Tika steps moved `AutoDetectParser` and `ServiceLoader` and
+deleted a deprecated method that tests still call; the patch touches 623 files
+(most for the `ParseContext` move).
+
+### 8. Report and evaluation
+
+```bash
+dsarp report results/tika                       # results/tika/report.html (self-contained)
+dsarp evaluate results/struts --groups 5 --ablation
+```
+
+`report.html` combines triage, the step-by-step plans, the verification (with
+the patch) and the evaluation. `dsarp evaluate` runs all generators on the
+same groups with the same candidate operations, simulation and score:
+`solver` (constraint plans only), `search_only` (tree search from an empty
+plan), `hybrid` (DSARP), `nsga2` (multi-objective genetic algorithm with at
+least the same number of evaluations), `random`, `llm_only` (with `--llm`) and
+`hybrid_fixed_affinity` (ablation). It also reports how stable the
+recommendation is when each score weight is halved or increased by half.
+
+Struts, top 5 plannable groups (30 s solver, 60 s search per group):
+
+| approach | mean score | mean benefit | best in group | mean steps |
+|---|---|---|---|---|
+| hybrid | **0.52** | 0.60 | 2 | 11.6 |
+| hybrid, fixed affinity | 0.49 | 0.54 | 1 | 7.6 |
+| search only | 0.46 | 0.50 | 2 | 3.2 |
+| NSGA-II | 0.44 | 0.55 | 0 | 4.0 |
+| random | 0.30 | 0.43 | 0 | 5.0 |
+| solver only | 0.19 | 0.60 | 0 | 9.8 |
+
+The solver alone removes as much of the smells as the hybrid but creates new
+smells and visibility changes; the search repairs those plans. Run the full
+evaluation on the cluster (`slurm/evaluate_array.sbatch`).
+
 ### Supported detector output
 
 * **Arcan**: `smell-characteristics.csv`, `smell-affects.csv`, `component-metrics.csv`.
@@ -308,6 +385,8 @@ sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/ingest_array.sbatch
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch   # stages 0-3
 apptainer exec dsarp.sif dsarp learn results/* --workdir $DSARP_WORK                 # login node (history)
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/plan_array.sbatch    # plans (CP-SAT) + report
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/verify_array.sbatch  # verify + report.html
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/evaluate_array.sbatch  # evaluation
 DSARP_REPO=tika DSARP_LLM_MODEL=<model> VLLM_SIF=<vllm.sif> \
   sbatch -A <project> slurm/plan_llm.sbatch                                      # with a language model (A100)
 
@@ -342,7 +421,12 @@ Detector output of the study repositories is not stored in this repository.
 3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization, scope and quick fixes; detection rules calibrated against Arcan and Designite. Done.
 4. **Constraint plan generator** (stages 5a, 6): mixed-integer model (CP-SAT or HiGHS), trade-off plans, whole-repository simulation and re-detection, precondition checks, ranking. Done.
 5. **Learning, search and explanations** (stages 4, 5b, 7): learned affinity from code and history moves, tree search with optional language model, step-by-step reports with a reviewed summary. Done.
-6. **Verification, report and evaluation** (stages 8-9): OpenRewrite, builds, delta debugging, reports, evaluation against baselines.
+6. **Verification, report and evaluation** (stages 8-9): apply plans to the code, compile, delta debugging, re-detection on the compiled code, optional build/tests/detectors, patches and OpenRewrite recipes, HTML report, evaluation against NSGA-II, random, solver-only and search-only with ablation and weight sensitivity. Done.
+
+Known limitations: the compile check compiles the whole repository at once,
+so it does not see build-module boundaries (use `--build`); history moves are
+described by the code at the analysed commit; class-level smells (class
+cycles, god classes) are triaged but not yet planned.
 
 ## Project layout
 
@@ -378,6 +462,18 @@ dsarp/            Python package
     mcts.py       Monte Carlo tree search (PUCT), language-model proposals and repair
     llm.py        language-model clients (none, OpenAI-compatible)
   explain.py      stage 7: step-by-step report
+  verify/         stage 8
+    workspace.py  clean working copies (git worktree)
+    rewrite.py    apply a plan to the sources; OpenRewrite recipe
+    compile.py    compile, compare errors, detect again on the compiled code
+    debug.py      delta debugging (ddmin) and reduction to the passing steps
+    build.py      Maven/Gradle build of affected modules, test selection
+    detectors.py  re-run Arcan/Designite
+    run.py        orchestration, patches, results
+  evaluate/       stage 9 (research)
+    baselines.py  NSGA-II, random search, language model only
+    harness.py    all approaches on the same groups, summary, weight sensitivity
+  report.py       stage 9 (users): HTML report
   cli.py          command-line interface
 java-helpers/
   extractor/      program-model extractor (JDK compiler API, no dependencies)

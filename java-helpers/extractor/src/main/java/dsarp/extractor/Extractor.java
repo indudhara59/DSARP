@@ -110,6 +110,8 @@ final class Extractor {
     private final Stats stats = new Stats();
     private final Map<String, Integer> diagnosticCodes = new HashMap<>();
     private final List<String> diagnosticSamples = new ArrayList<>();
+    /** Every compiler error: file, line, code, message (used to compare builds before and after a plan). */
+    private final List<String[]> errors = new ArrayList<>();
     private final Map<String, Integer> unresolvedNames = new HashMap<>();
     private final Map<TypeElement, Boolean> sourceCache = new HashMap<>();
     /** key "src\tdst\tkind" -> {count, first line}. */
@@ -231,6 +233,22 @@ final class Extractor {
                 row(w, "sample", s, 1);
             }
         }
+        Path cwd = Path.of("").toAbsolutePath().normalize();
+        try (BufferedWriter w = open(out, "errors.tsv", "file\tline\tcode\tmessage")) {
+            for (String[] e : errors) {
+                String file = e[0];
+                if (!file.isEmpty()) {
+                    Path p = Path.of(file).toAbsolutePath().normalize();
+                    file = p.startsWith(cwd) ? cwd.relativize(p).toString().replace('\\', '/') : p.toString();
+                }
+                w.write(clean(file) + "\t" + e[1] + "\t" + clean(e[2]) + "\t" + clean(e[3]));
+                w.newLine();
+            }
+        }
+    }
+
+    private static String clean(String s) {
+        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
     }
 
     private void onDiagnostic(Diagnostic<? extends JavaFileObject> d) {
@@ -239,6 +257,8 @@ final class Extractor {
         }
         stats.errors++;
         diagnosticCodes.merge(d.getCode(), 1, Integer::sum);
+        String file = d.getSource() == null ? "" : Path.of(d.getSource().toUri()).toString();
+        errors.add(new String[] {file, Long.toString(d.getLineNumber()), d.getCode(), d.getMessage(null)});
         if (diagnosticSamples.size() < 50) {
             String src = d.getSource() == null ? "" : d.getSource().getName();
             diagnosticSamples.add(src + ":" + d.getLineNumber() + " " + d.getMessage(null));
