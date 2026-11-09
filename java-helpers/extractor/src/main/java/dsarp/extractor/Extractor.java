@@ -507,6 +507,31 @@ final class Extractor {
             return null;
         }
 
+        /** True if {@code ee} overrides or implements a method of a supertype (with or without {@code @Override}). */
+        private boolean overridesInherited(ExecutableElement ee) {
+            if (ee.getKind() != ElementKind.METHOD || ee.getModifiers().contains(Modifier.STATIC)) {
+                return false;
+            }
+            TypeElement type = owner(ee);
+            Deque<TypeMirror> todo = new ArrayDeque<>(types.directSupertypes(type.asType()));
+            Set<String> seen = new HashSet<>();
+            while (!todo.isEmpty()) {
+                TypeMirror t = todo.pop();
+                Element se = types.asElement(t);
+                if (!(se instanceof TypeElement st) || !seen.add(st.getQualifiedName().toString())) {
+                    continue;
+                }
+                for (Element m : st.getEnclosedElements()) {
+                    if (m instanceof ExecutableElement other && other.getSimpleName().equals(ee.getSimpleName())
+                            && elements.overrides(ee, other, type)) {
+                        return true;
+                    }
+                }
+                todo.addAll(types.directSupertypes(t));
+            }
+            return false;
+        }
+
         private boolean recordedOwner(Element member) {
             TypeElement o = owner(member);
             return named(o) && !typeStack.isEmpty() && typeStack.peek().equals(o);
@@ -521,7 +546,8 @@ final class Extractor {
             String id = memberId(ee);
             Set<Modifier> mods = ee.getModifiers();
             boolean override = ee.getAnnotationMirrors().stream()
-                    .anyMatch(a -> a.getAnnotationType().toString().equals("java.lang.Override"));
+                    .anyMatch(a -> a.getAnnotationType().toString().equals("java.lang.Override"))
+                    || overridesInherited(ee);
             row(membersOut, id, ee.getKind() == ElementKind.CONSTRUCTOR ? "constructor" : "method",
                     owner(ee).getQualifiedName(), ee.getSimpleName(), visibility(ee),
                     flag(mods.contains(Modifier.STATIC)), flag(mods.contains(Modifier.ABSTRACT)),

@@ -68,6 +68,9 @@ def apply(rf: RepoFacts, ops: list[dict], state: State | None = None) -> State:
             st.edges.discard((o["client"], o["provider"]))
             st.edges.add((o["client"], iface))
             st.edges.add((o["provider"], iface))
+            for t in rf.signature_types(o.get("methods", [])):     # the interface names these types
+                if t != o["provider"]:
+                    st.edges.add((iface, t))
     if deleted:
         for k in list(st.edges):
             e = rf.edges.get(k)

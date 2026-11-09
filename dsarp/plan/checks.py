@@ -63,6 +63,7 @@ class Checker:
         self.test_types = set(t.loc[t["is_test"].astype(bool), "top_level"])
         self.files = dict(zip(t["type"], t["file"]))
         self.type_pkg = dict(zip(t["type"], t["package"]))
+        self.type_vis = dict(zip(t["type"], t["visibility"]))
         w = rf.model.wiring
         self.wiring: dict[str, list[dict]] = defaultdict(list)
         if len(w):
@@ -76,7 +77,7 @@ class Checker:
         if "#" in element:
             info = self.rf.member_info.get(element)
             return str(info["visibility"]) if info else "public"
-        return str(self.rf.visibility.get(element, "public"))
+        return str(self.type_vis.get(element, "public"))
 
     def _limit(self, items) -> list:
         items = sorted(set(items))

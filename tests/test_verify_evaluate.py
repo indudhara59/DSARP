@@ -193,3 +193,31 @@ def test_markdown_subset():
 
 def test_git_available():
     assert subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+
+
+def test_new_errors_filters_duplicates_and_library_packages():
+    before = pd.DataFrame(columns=["file", "line", "code", "message"])
+    after = pd.DataFrame([
+        {"file": "t/A.java", "line": "1", "code": "compiler.err.duplicate.class", "message": "duplicate class: x.ATest"},
+        {"file": "m/B.java", "line": "2", "code": "compiler.err.duplicate.class", "message": "duplicate class: p.Moved"},
+        {"file": "m/C.java", "line": "3", "code": "compiler.err.doesnt.exist",
+         "message": "package com.fasterxml.jackson.databind does not exist"},
+        {"file": "m/C.java", "line": "4", "code": "compiler.err.doesnt.exist", "message": "package p.old does not exist"}])
+    new = cmp.new_errors(before, after, plan_types={"p.Moved"}, repo_packages={"p", "p.old"})
+    assert list(new["line"]) == ["2", "4"]
+
+
+def test_imports_simple_detects_shadowing_imports():
+    from dsarp.verify.rewrite import _add_imports, _imports_simple
+    text = "package a;\n\nimport org.w3c.dom.Element;\nimport static x.Y.Element;\n\nclass Z {}\n"
+    assert _imports_simple(text, "Element") and not _imports_simple(text, "Node")
+    out = _add_imports(text, ["b.Node"])
+    assert "import b.Node;" in out and out.index("import b.Node;") > out.index("import org.w3c.dom.Element;")
+
+
+def test_drop_unused_imports_after_deletion():
+    from dsarp.verify.rewrite import _drop_unused_imports
+    lines = ["package a;", "import b.Tika;", "import b.Used;", "import static c.D.x;", "",
+             "class M { /** {@link Tika} */ Used u; }"]
+    out = _drop_unused_imports(lines)
+    assert "import b.Tika;" not in out and "import b.Used;" in out and "import static c.D.x;" in out

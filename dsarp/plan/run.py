@@ -125,7 +125,8 @@ class Planner:
         self.scopes = json.loads((triage_dir / "scopes.json").read_text())
         self.backend, self.time_limit = backend, time_limit
         self.log(f"facts ready in {time.time() - t0:.1f} s: {len(self.rf.prod)} production classes, "
-                 f"{len(self.rf.edges)} class dependencies, baseline smells {dict(self.sim.base['type'].value_counts())}")
+                 f"{len(self.rf.edges)} class dependencies, baseline smells "
+                 f"{ {k: int(v) for k, v in self.sim.base['type'].value_counts().items()} }")
 
     def _backend(self) -> str:
         if self.backend != "auto":
@@ -146,7 +147,8 @@ class Planner:
         if t == "unstable_dependency":
             worse = unstable_targets(self.rf, central)
             if not worse:
-                return None, "not an unstable dependency in the production dependency graph"
+                return None, ("no dependency on a less stable package in the production code at this commit "
+                              "(the detector's view differs, e.g. it includes sub-packages, libraries or tests)")
             return {"focus_pairs": {(central, w) for w in worse}, "central": central}, ""
         if t == "hub_like_dependency":
             h = hub_data(self.rf, central)

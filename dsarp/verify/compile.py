@@ -63,14 +63,18 @@ _SYMBOL = re.compile(r"symbol:\s+(?:class|interface|enum|variable|method|static)
 
 
 def new_errors(before: pd.DataFrame, after: pd.DataFrame, moved_files: dict[str, str] | None = None,
-               renamed: dict[str, str] | None = None, repo_symbols: set[str] | None = None) -> pd.DataFrame:
+               renamed: dict[str, str] | None = None, repo_symbols: set[str] | None = None,
+               plan_types: set[str] | None = None, repo_packages: set[str] | None = None) -> pd.DataFrame:
     """Errors in ``after`` that are not in ``before`` (as a multiset).
 
     With ``repo_symbols`` (simple names of the repository's types and members),
     unresolved symbols that the repository does not define are ignored: they
     come from missing libraries, and javac's error recovery may report them a
     different number of times after an edit. Duplicate-class errors already
-    reported before (tests copied between modules) are ignored as well."""
+    reported before are ignored as well; with ``plan_types`` (moved and created
+    types, new names) only duplicate-class errors naming one of them count:
+    other duplicates come from compiling all modules together (tests copied
+    between modules) and depend on the order javac reads the files."""
     back_file = {v: k for k, v in (moved_files or {}).items()}
     back_name = {v: k for k, v in (renamed or {}).items()}
     key_b = Counter(zip(before["file"], before["code"], before["message"]))
@@ -78,8 +82,15 @@ def new_errors(before: pd.DataFrame, after: pd.DataFrame, moved_files: dict[str,
     seen: Counter = Counter()
     dup_before = set(before.loc[before["code"] == "compiler.err.duplicate.class", "message"])
     for r in after.itertuples(index=False):
-        if r.code == "compiler.err.duplicate.class" and _normalise(r.message, back_name) in dup_before:
-            continue
+        if r.code == "compiler.err.duplicate.class":
+            if _normalise(r.message, back_name) in dup_before:
+                continue
+            if plan_types is not None and not any(t in r.message for t in plan_types):
+                continue
+        if repo_packages is not None and r.code == "compiler.err.doesnt.exist":
+            m = re.search(r"package\s+([\w.]+)\s+does not exist", r.message)
+            if m and m.group(1) not in repo_packages:
+                continue                  # a library package (e.g. an import copied into a new interface)
         if repo_symbols is not None and r.code.startswith("compiler.err.cant.resolve"):
             m = _SYMBOL.search(r.message)
             if m and m.group(1) not in repo_symbols:

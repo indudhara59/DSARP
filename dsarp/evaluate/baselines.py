@@ -32,8 +32,10 @@ from ..search.mcts import SYSTEM
 class Evaluator:
     """Shared, cached evaluation of operation sets."""
 
-    def __init__(self, rf: RepoFacts, gf: GroupFacts, sim: Simulator):
+    def __init__(self, rf: RepoFacts, gf: GroupFacts, sim: Simulator, checker=None):
         self.rf, self.gf, self.sim = rf, gf, sim
+        self.checker = checker
+        self._public: dict[str, int] = {}
         self.space = ActionSpace(rf, gf, max_actions=60)
         self.central = gf.smell.get("central", "") if gf.smell_type != "cyclic_dependency" else ""
         self.cache: dict[frozenset, dict] = {}
@@ -61,10 +63,25 @@ class Evaluator:
         else:
             sim = self.sim.run(list(ops.values()), self.gf.smell_type, self.gf.core, self.central)
             cost = sum(self.space.cost(o) for o in ops.values())
-            sc = plan_score(SimpleNamespace(change_cost=cost), sim, {"made_public": 0}, self.gf.smell_type)
+            sc = plan_score(SimpleNamespace(change_cost=cost), sim, {"made_public": self.made_public(ops)},
+                            self.gf.smell_type)
             r = {"score": sc["score"], "benefit": sc["benefit"], "new_smells": sc["new_smells"], "cost": cost}
         self.cache[key] = r
         return r
+
+    def made_public(self, ops: dict[str, dict]) -> int:
+        """Elements that must become public (same estimate as the tree search)."""
+        if self.checker is None:
+            return 0
+        from ..plan.checks import summarise
+        total = 0
+        for k, o in ops.items():
+            ck = k + ">" + str(o.get("to_package", ""))
+            if ck not in self._public:
+                after = {o["class"]: o["to_package"]} if o["op"] == "move_class" else {}
+                self._public[ck] = summarise(self.checker.check([o], after))["made_public"]
+            total += self._public[ck]
+        return total
 
     @staticmethod
     def decode(genome: list[int], acts: list[Action]) -> dict[str, dict]:
