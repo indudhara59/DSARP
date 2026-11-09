@@ -10,7 +10,9 @@ Examples::
     dsarp model configs/tika.yaml --repo work/tika --out results/tika/model
     dsarp triage results/tika
     dsarp calibrate results/tika
+    dsarp learn results/tika results/struts --workdir work
     dsarp plan results/tika --groups 10 --time-limit 60
+    dsarp explain results/tika
 """
 
 from __future__ import annotations
@@ -183,6 +185,81 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_learn(args: argparse.Namespace) -> int:
+    import json
+
+    import pandas as pd
+
+    from .learn import affinity as af
+    from .learn import moves as mv
+    from .plan.facts import RepoFacts
+    from .program import ProgramModel
+    frames = []
+    for d in map(Path, args.results):
+        model_dir = d / "model"
+        if not (model_dir / "model.json").exists():
+            print(f"ERROR {d}: no program model (run dsarp model)", file=sys.stderr)
+            return 1
+        meta = json.loads((model_dir / "model.json").read_text())
+        out = d / "learn"
+        out.mkdir(parents=True, exist_ok=True)
+        moves_file = out / "moves.csv"
+        repo = Path(args.workdir) / meta["repo"]
+        if moves_file.exists() and not args.remine:
+            moves = pd.read_csv(moves_file, keep_default_na=False)
+        elif (repo / ".git").exists():
+            moves = mv.mine(repo, meta.get("commit") or "HEAD", args.max_commits)
+            moves.to_csv(moves_file, index=False)
+        else:
+            print(f"  {d.name}: no checkout at {repo}; learning from the current placement only")
+            moves = None
+        rf = RepoFacts.build(ProgramModel(model_dir))
+        df = af.build_dataset(rf, moves, repo=meta["repo"], max_classes=args.max_classes)
+        df.to_csv(out / "dataset.csv", index=False)
+        frames.append(df)
+        model = af.fit(df)
+        model.evaluation = af.evaluate(df)
+        model.save(out / "affinity.json")
+        ev = model.evaluation
+        print(f"{d.name}: {0 if moves is None else len(moves)} moves in history, {df['query'].nunique()} examples; "
+              f"top-1 learned {ev['learned']['top1']} vs fixed weights {ev['fixed_weights']['top1']} "
+              f"(moves: {ev['learned'].get('move_top1')} vs {ev['fixed_weights'].get('move_top1')})")
+        print(f"  written: {out / 'affinity.json'}")
+    if len(frames) > 1:
+        allf = pd.concat(frames, ignore_index=True)
+        pooled = af.fit(allf)
+        pooled.evaluation = {"leave_one_repository_out": af.evaluate_leave_one_repo_out(allf)}
+        out = Path(args.pooled_out)
+        pooled.save(out)
+        for repo, ev in pooled.evaluation["leave_one_repository_out"].items():
+            print(f"  unseen {repo}: top-1 learned {ev['learned']['top1']} vs fixed {ev['fixed_weights']['top1']}")
+        print(f"  pooled model: {out}")
+    return 0
+
+
+def _llm(name: str | None):
+    from .search.llm import from_env
+    return from_env(name)
+
+
+def _cmd_explain(args: argparse.Namespace) -> int:
+    import json
+
+    from .explain import explain, write
+    from .plan.facts import RepoFacts
+    from .program import ProgramModel
+    for d in map(Path, args.results):
+        plans = d / "plans" / "plans.json"
+        if not plans.exists():
+            print(f"ERROR {d}: no plans (run dsarp plan)", file=sys.stderr)
+            return 1
+        result = json.loads(plans.read_text())
+        rf = RepoFacts.build(ProgramModel(d / "model"))
+        rep = explain(result, rf, _llm(args.llm))
+        print(f"{d.name}: written {write(rep, d / 'plans')}")
+    return 0
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .plan.run import Planner, write
     status = 0
@@ -196,12 +273,25 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             status = 1
             continue
         print(f"\n{d.name}:")
-        planner = Planner(model, triage_dir, backend=args.backend, time_limit=args.time_limit)
+        affinity = args.affinity
+        if affinity is None and (d / "learn" / "affinity.json").exists():
+            affinity = d / "learn" / "affinity.json"
+        if affinity == "none":
+            affinity = None
+        llm = _llm(args.llm)
+        planner = Planner(model, triage_dir, backend=args.backend, time_limit=args.time_limit,
+                          affinity=affinity, search=args.search, search_time=args.search_time, llm=llm)
+        if affinity:
+            print(f"  learned affinity: {affinity}")
         types = set(args.types.split(",")) if args.types else None
         result = planner.run(args.groups, types)
         result["repo"] = d.name
         paths = write(result, Path(args.out) if args.out else d / "plans")
         print("  written: " + ", ".join(str(p) for p in paths.values()))
+        if args.explain:
+            from .explain import explain
+            from .explain import write as write_report
+            print("  written: " + str(write_report(explain(result, planner.rf, llm), paths["plans"].parent)))
     return status
 
 
@@ -263,7 +353,29 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--time-limit", type=float, default=60.0, help="solver seconds per plan (default: 60)")
     pl.add_argument("--backend", default="auto", choices=["auto", "cpsat", "highs"],
                     help="solver (auto: CP-SAT if installed, else HiGHS)")
+    pl.add_argument("--affinity", help="learned affinity model (default: <results>/learn/affinity.json if it "
+                                       "exists; 'none' for the fixed weights)")
+    pl.add_argument("--search", default="auto", choices=["auto", "always", "never"],
+                    help="tree search after the solver (auto: when no good plan was found)")
+    pl.add_argument("--search-time", type=float, default=120.0, help="seconds of tree search per group")
+    pl.add_argument("--llm", choices=["none", "openai"], help="language model client (default: $DSARP_LLM or none)")
+    pl.add_argument("--explain", action="store_true", help="also write plans/report.md")
     pl.set_defaults(func=_cmd_plan)
+
+    le = sub.add_parser("learn", help="stage 4: learn where classes belong (current code and history moves)")
+    le.add_argument("results", nargs="+", help="result folders with model/")
+    le.add_argument("--workdir", default="work", help="folder with the checkouts (for the history)")
+    le.add_argument("--max-commits", type=int, default=20000)
+    le.add_argument("--max-classes", type=int, default=3000, help="classes sampled per repository")
+    le.add_argument("--remine", action="store_true", help="mine the history again even if moves.csv exists")
+    le.add_argument("--pooled-out", default="results/pooled/affinity.json",
+                    help="pooled model when several repositories are given")
+    le.set_defaults(func=_cmd_learn)
+
+    ex = sub.add_parser("explain", help="stage 7: step-by-step report of the recommended plans")
+    ex.add_argument("results", nargs="+")
+    ex.add_argument("--llm", choices=["none", "openai"], help="language model for the summary (default: none)")
+    ex.set_defaults(func=_cmd_explain)
 
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")

@@ -2,22 +2,18 @@
 
 import json
 import shutil
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from dsarp.config import parse_config
 from dsarp.plan import solver as slv
 from dsarp.plan.checks import Checker, summarise
 from dsarp.plan.facts import RepoFacts, cycle_context, group_facts
 from dsarp.plan.generator import PlanModel
 from dsarp.plan.run import Planner, write
 from dsarp.plan.simulate import Simulator, apply, initial_state
-from dsarp.program import ProgramModel, build_model
-from dsarp.triage import triage
+from dsarp.program import ProgramModel
 
-PROJECT = Path(__file__).parent / "fixtures" / "javaproj"
 needs_jdk = pytest.mark.skipif(not shutil.which("javac"), reason="needs a JDK (javac)")
 
 
@@ -60,21 +56,6 @@ def test_integer_variable_and_bounds():
 
 
 # ---------------------------------------------------------------- fixture project
-
-@pytest.fixture(scope="module")
-def project(tmp_path_factory):
-    root = tmp_path_factory.mktemp("plan")
-    cfg = parse_config({"name": "javaproj", "repo_url": "x", "build": "maven",
-                        "detectors": [{"tool": "arcan", "path": "x"}]}, Path("."))
-    build_model(cfg, PROJECT, root / "model", history_commits=0)
-    smells = pd.DataFrame([{
-        "smell_id": "arcan:1", "tool": "arcan", "type": "cyclic_dependency", "level": "package",
-        "members": json.dumps(["com.acme.core", "com.acme.util"]), "severity": 6.0, "matched_with": "",
-        "confirmed_by": "", "external_members": 0, "generated_only": False, "central": "", "size": 2}])
-    smells.to_csv(root / "smells.csv", index=False)
-    triage(root, root / "model", root / "triage", repo="javaproj")
-    return root
-
 
 @needs_jdk
 def test_facts_and_context(project):

@@ -160,23 +160,64 @@ class RepoFacts:
 
     # ------------------------------------------------------------ affinity
 
-    def affinity(self, c: str, pkg: str) -> float:
+    def features(self, c: str, pkg: str) -> dict[str, float]:
+        """Evidence that class ``c`` belongs in package ``pkg`` (``c`` itself excluded from ``pkg``).
+
+        structural_out / structural_in: share of the class's outgoing / incoming
+        dependency weight that connects it to classes of ``pkg``;
+        cochange: share of its co-changes with files of ``pkg``;
+        semantic: name-token overlap with ``pkg`` and its classes;
+        package_name: overlap with the package name only;
+        log_size: size of ``pkg`` (large packages attract classes)."""
         others = self.pkg_classes.get(pkg, set()) - {c}
-        total = sum(self.edges[k].weight for k in self.out_edges.get(c, []) + self.in_edges.get(c, []))
-        to_pkg = sum(self.edges[k].weight for k in self.out_edges.get(c, []) if k[1] in others) + \
-            sum(self.edges[k].weight for k in self.in_edges.get(c, []) if k[0] in others)
-        structural = to_pkg / total if total else 0.0
+        outs, ins = self.out_edges.get(c, []), self.in_edges.get(c, [])
+        w_out = sum(self.edges[k].weight for k in outs)
+        w_in = sum(self.edges[k].weight for k in ins)
+        o_pkg = sum(self.edges[k].weight for k in outs if k[1] in others)
+        i_pkg = sum(self.edges[k].weight for k in ins if k[0] in others)
         mine = self.cochange.get(self.file.get(c, ""), {})
         co_total = sum(mine.values())
-        co_pkg = sum(n for f, n in mine.items() if f in {self.file.get(o) for o in others})
-        cochange = co_pkg / co_total if co_total else 0.0
+        files = {self.file.get(o) for o in others}
+        co_pkg = sum(n for f, n in mine.items() if f in files)
         mine_t = tokens(c[len(self.package[c]) + 1:])
-        pkg_t = tokens(pkg.rsplit(".", 1)[-1])
-        for o in list(others)[:60]:
+        name_t = tokens(pkg.rsplit(".", 1)[-1])
+        pkg_t = set(name_t)
+        for o in sorted(others)[:60]:
             pkg_t |= tokens(o[len(pkg) + 1:])
-        semantic = len(mine_t & pkg_t) / len(mine_t | pkg_t) if mine_t | pkg_t else 0.0
-        w = AFFINITY_WEIGHTS
-        return round(w["structural"] * structural + w["cochange"] * cochange + w["semantic"] * semantic, 4)
+        import math
+        return {
+            "structural_out": o_pkg / w_out if w_out else 0.0,
+            "structural_in": i_pkg / w_in if w_in else 0.0,
+            "structural": (o_pkg + i_pkg) / (w_out + w_in) if w_out + w_in else 0.0,
+            "cochange": co_pkg / co_total if co_total else 0.0,
+            "semantic": len(mine_t & pkg_t) / len(mine_t | pkg_t) if mine_t | pkg_t else 0.0,
+            "package_name": len(mine_t & name_t) / len(mine_t) if mine_t else 0.0,
+            "log_size": math.log1p(len(others)),
+        }
+
+    def affinity(self, c: str, pkg: str) -> float:
+        """How well class ``c`` fits package ``pkg`` (0..1).
+
+        Uses the learned model when one is attached (``self.affinity_model``,
+        see :mod:`dsarp.learn.affinity`), otherwise fixed weights."""
+        key = (c, pkg)
+        cache = self.__dict__.setdefault("_aff_cache", {})
+        if key in cache:
+            return cache[key]
+        f = self.features(c, pkg)
+        model = self.__dict__.get("affinity_model")
+        if model is not None:
+            val = round(float(model.score(f)), 4)
+        else:
+            w = AFFINITY_WEIGHTS
+            val = round(w["structural"] * f["structural"] + w["cochange"] * f["cochange"]
+                        + w["semantic"] * f["semantic"], 4)
+        cache[key] = val
+        return val
+
+    def use_affinity_model(self, model) -> None:
+        self.__dict__["affinity_model"] = model
+        self.__dict__["_aff_cache"] = {}
 
     # ------------------------------------------------------------ edge properties
 

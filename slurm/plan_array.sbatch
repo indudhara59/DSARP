@@ -33,5 +33,5 @@ module load tools Apptainer
 
 echo "[$(date -Is)] plan $NAME on $(hostname) with $SLURM_CPUS_PER_TASK CPUs"
 apptainer exec "$SIF" dsarp plan "$RESULTS/$NAME" \
-    --groups "${DSARP_GROUPS:-20}" --time-limit "${DSARP_TIME_LIMIT:-300}" --backend "${DSARP_BACKEND:-auto}"
+    --groups "${DSARP_GROUPS:-20}" --time-limit "${DSARP_TIME_LIMIT:-300}" --backend "${DSARP_BACKEND:-auto}" --explain
 echo "[$(date -Is)] done"

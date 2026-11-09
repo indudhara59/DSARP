@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsarp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Architectural smell refactoring planner: turns Arcan and Designite results into verified refactoring plans for any Java repository and commit."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,9 @@ dependencies = [
     "pandas>=2.0",
     "pyyaml>=6.0",
     "networkx>=3.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
 ]
 
 [project.optional-dependencies]

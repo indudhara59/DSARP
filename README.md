@@ -10,10 +10,11 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: phase 4 of 6.** Detector import (stages 0-1), program model
-> (stage 2), triage with in-memory smell detection (stage 3) and the
-> constraint plan generator with simulation, checks and ranking (stages 5a, 6)
-> are implemented and tested. See [Roadmap](#roadmap).
+> **Status: phase 5 of 6.** Stages 0-7 are implemented and tested: detector
+> import, program model, triage, learned affinity, constraint plans, tree
+> search with an optional language model, simulation, checks, ranking and
+> step-by-step reports. Verification on the real code and the evaluation
+> harness (stages 8-9) follow in phase 6. See [Roadmap](#roadmap).
 
 ## Pipeline
 
@@ -23,10 +24,10 @@ re-analysed on the real code.
 | 1 Normalize | One smell table and one component table for all tools | done |
 | 2 Program model | Classes, methods, fields, typed dependencies, modules, API, history | done |
 | 3 Triage | Drop false smells, group into components, prioritize, set scope | done |
-| 4 Learned priors | Affinity of elements to places, learned from refactoring history | phase 5 |
-| 5 Generate plans | Constraint solver (CP-SAT or HiGHS); LLM + tree search as fallback | 5a done, 5b phase 5 |
+| 4 Learned priors | Affinity of classes to packages, learned from the code and the history of class moves | done |
+| 5 Generate plans | Constraint solver (CP-SAT or HiGHS); tree search with optional language model | done |
 | 6 Filter and rank | Graph simulation, preconditions, smell re-detection, ranking | done |
-| 7 Explain | LLM agents write exact edit steps | phase 5 |
+| 7 Explain | Step-by-step report from facts; optional model summary, checked by a reviewer | done |
 | 8 Verify | Apply, build, test, re-run detectors (once per run) | phase 6 |
 | 9 Report | Ranked roadmap for users; evaluation for research | phase 6 |
 
@@ -159,7 +160,38 @@ g = m.package_graph()            # production code; include_tests=True to add te
 m.callers("org.apache.tika.mime.MimeTypes#getMimeType(java.io.File)")
 ```
 
-### 5. Refactoring plans
+### 5. Learned affinity (where does a class belong?)
+
+```bash
+dsarp learn results/tika results/struts results/karaf --workdir work   # per repository + pooled model
+```
+
+Training examples come from the repository itself: the **current package**
+of a sample of classes (positive) against nearby packages of the same module
+(negatives), and the **class moves in the git history** (a class moved from P
+to Q: Q positive, P a hard negative, weighted 3×). Features are computed with
+the class itself removed: share of dependencies (outgoing, incoming) and
+co-changes with the package, name similarity, package size. The model is a
+standardised logistic regression (one weight per feature, in
+`learn/affinity.json`). `dsarp plan` uses it automatically when it exists.
+Mine the history on a login node: the clones download file contents on demand.
+
+Cross-validation grouped by package, top-1 = correct package ranked first
+among the candidates (fixed weights of phase 4 in brackets):
+
+| | Tika | Struts | Karaf |
+|---|---|---|---|
+| all examples | **0.75** (0.68) | **0.63** (0.51) | **0.58** (0.44) |
+| developer moves only | **0.64** (0.55) | **0.75** (0.47) | **0.46** (0.32) |
+| trained on the other two repositories | **0.76** (0.68) | **0.60** (0.51) | **0.57** (0.44) |
+
+| File in `learn/` | Content |
+|---|---|
+| `moves.csv` | class moves (package changes) in the history up to the commit |
+| `dataset.csv` | training examples with features |
+| `affinity.json` | model weights and evaluation |
+
+### 6. Refactoring plans
 
 ```bash
 dsarp plan results/tika --groups 10 --time-limit 60          # needs model/ and triage/
@@ -197,6 +229,28 @@ public, imports and tests to update, wiring files, API warnings, blocked
 operations) and the plans are **ranked** (benefit − new smells − cost; the
 weights are in `dsarp/plan/run.py`). A plan is recommended only if it is not
 blocked and has a positive score.
+
+**Tree search (stage 5b).** When the solver finds no good plan (no positive
+score, new smells, or a large optimality gap), a Monte Carlo tree search
+(PUCT) works directly on the whole-repository simulation. It starts from the
+best solver plan and may add operations suggested by the problem
+dependencies that are left (priors: dependency weight × learned affinity) or
+drop operations that cause new smells. With `--llm openai` a language model
+(any OpenAI-compatible server, e.g. vLLM with an open model on a Noctua GPU
+node; `DSARP_LLM_URL`, `DSARP_LLM_MODEL`) proposes actions from the candidate
+list at the start and repairs the best plan after seeing its simulation
+result; its suggestions are only kept if they are valid candidates and score
+better. On the 41-package Struts cycle the search turns solver plans with
+negative scores (new smells, many visibility changes) into a plan with 19
+steps and no new smells.
+
+**Report (stage 7).** `--explain` (or `dsarp explain results/<repo>`) writes
+`plans/report.md`: for each group the effect of the recommended plan, then
+every step with what (element, from, to), why (package dependencies it
+removes or adds, evidence for the target package) and how (package
+declaration and file, imports, members to make public, tests, wiring), and
+the alternatives. With a language model, a short summary is added if the
+reviewer finds no class or package name in it that is not part of the plan.
 
 | File in `plans/` | Content |
 |---|---|
@@ -252,7 +306,10 @@ apptainer exec dsarp.sif dsarp checkout configs/*.yaml --workdir $DSARP_WORK
 ls configs/*.yaml > configs.list
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/ingest_array.sbatch
 sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch   # stages 0-3
-sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/plan_array.sbatch    # plans (CP-SAT)
+apptainer exec dsarp.sif dsarp learn results/* --workdir $DSARP_WORK                 # login node (history)
+sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/plan_array.sbatch    # plans (CP-SAT) + report
+DSARP_REPO=tika DSARP_LLM_MODEL=<model> VLLM_SIF=<vllm.sif> \
+  sbatch -A <project> slurm/plan_llm.sbatch                                      # with a language model (A100)
 
 # Test suite on a compute node
 sbatch -A <project> slurm/run_tests.sbatch
@@ -284,7 +341,7 @@ Detector output of the study repositories is not stored in this repository.
 2. **Program model** (stage 2): extraction with the JDK compiler API of elements, typed dependencies, modules, framework wiring, public API and co-change history. Done.
 3. **Triage and in-memory smell detection** (stage 3): false-smell removal, grouping, prioritization, scope and quick fixes; detection rules calibrated against Arcan and Designite. Done.
 4. **Constraint plan generator** (stages 5a, 6): mixed-integer model (CP-SAT or HiGHS), trade-off plans, whole-repository simulation and re-detection, precondition checks, ranking. Done.
-5. **Learning and LLM parts** (stages 4, 5b, 7): learned affinity and ranking, LLM with tree search, explanation agents.
+5. **Learning, search and explanations** (stages 4, 5b, 7): learned affinity from code and history moves, tree search with optional language model, step-by-step reports with a reviewed summary. Done.
 6. **Verification, report and evaluation** (stages 8-9): OpenRewrite, builds, delta debugging, reports, evaluation against baselines.
 
 ## Project layout
@@ -313,6 +370,14 @@ dsarp/            Python package
     simulate.py   apply a plan in memory and detect again (L1, L3)
     checks.py     Java preconditions and follow-up edits (L2)
     run.py        plan the top groups, score, rank, write results
+  learn/          stage 4
+    moves.py      class moves in the git history
+    affinity.py   learned affinity: dataset, model, evaluation
+  search/         stage 5b
+    actions.py    candidate operations for a state
+    mcts.py       Monte Carlo tree search (PUCT), language-model proposals and repair
+    llm.py        language-model clients (none, OpenAI-compatible)
+  explain.py      stage 7: step-by-step report
   cli.py          command-line interface
 java-helpers/
   extractor/      program-model extractor (JDK compiler API, no dependencies)

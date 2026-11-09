@@ -16,7 +16,9 @@ Scoring (explicit weights; phase 5 replaces them with learned ones)::
     score = benefit                      # share of the target smell removed (0..1)
           - 0.25 * new smells            # cycles / hubs / unstable deps introduced elsewhere
           + 0.05 * other smells removed
-          - 0.30 * cost / (cost + 20)    # change cost, saturating
+          - 0.30 * cost / (cost + 20 * (1 + size / 5))   # change cost, saturating;
+                                         # size = dependencies to cut (cycles) or
+                                         # to less stable packages (unstable)
           - 0.01 * elements made public
 
 A plan is recommended only if it is not blocked by the checks, removes part
@@ -76,13 +78,24 @@ def _benefit(sim, smell_type: str) -> float:
     return 0.0
 
 
+def _size(sim, smell_type: str) -> float:
+    """Size of the target smell before the plan (dependencies to cut / remove)."""
+    b = sim.target_before
+    if smell_type == "cyclic_dependency":
+        return float(b.get("dependencies_to_cut", 1))
+    if smell_type == "unstable_dependency":
+        return float(len(b.get("less_stable", [])))
+    return 1.0
+
+
 def score(plan: Plan, sim, check_summary: dict, smell_type: str) -> dict:
     w = WEIGHTS
     benefit = _benefit(sim, smell_type)
     new = sum(1.0 if s["type"] != "cyclic_dependency" else min(1.0 + s["size"] / 10, 3.0)
               for s in sim.new_smells)
     side = max(len(sim.removed_smells) - (1 if benefit == 1.0 else 0), 0)
-    cost_n = plan.change_cost / (plan.change_cost + w["cost_scale"]) if plan.change_cost else 0.0
+    scale = w["cost_scale"] * (1.0 + _size(sim, smell_type) / 5.0)   # bigger smells justify more change
+    cost_n = plan.change_cost / (plan.change_cost + scale) if plan.change_cost else 0.0
     total = (benefit - w["new_smell"] * new + w["side_removed"] * side - w["cost"] * cost_n
              - w["made_public"] * check_summary.get("made_public", 0))
     return {"score": round(total, 4), "benefit": round(benefit, 4), "new_smells": round(new, 3),
@@ -91,11 +104,20 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str) -> dict:
 
 class Planner:
     def __init__(self, model_dir: str | Path, triage_dir: str | Path, backend: str = "auto",
-                 time_limit: float = 60.0, log=print):
+                 time_limit: float = 60.0, log=print, affinity: str | Path | None = None,
+                 search: str = "auto", search_time: float = 120.0, llm=None):
         self.log = log
         t0 = time.time()
         self.model = ProgramModel(model_dir)
         self.rf = RepoFacts.build(self.model)
+        self.affinity = None
+        if affinity:
+            from ..learn.affinity import AffinityModel
+            self.rf.use_affinity_model(AffinityModel.load(affinity))
+            self.affinity = str(affinity)
+        if search not in ("auto", "always", "never"):
+            raise ValueError("search must be auto, always or never")
+        self.search, self.search_time, self.llm = search, search_time, llm
         self.sim = Simulator(self.rf)
         self.checker = Checker(self.rf)
         triage_dir = Path(triage_dir)
@@ -186,8 +208,41 @@ class Planner:
             if summ["status"] != "blocked" and sc["benefit"] > 0 and sc["score"] > 0 \
                     and (best is None or sc["score"] > best[0]):
                 best = (sc["score"], p.name)
+        need_search = self.search == "always" or (
+            self.search == "auto" and (best is None or any(
+                p.get("new_smells") or (p.get("gap") or 0) > 0.1 for p in out["plans"] if p["name"] == best[1])))
+        if need_search:
+            entry, out["search"] = self._search(gf, plans, t, central)
+            if entry is not None:
+                out["plans"].append(entry)
+                sc = entry
+                if sc["checks"]["status"] != "blocked" and sc["benefit"] > 0 and sc["score"] > 0 \
+                        and (best is None or sc["score"] > best[0]):
+                    best = (sc["score"], "search")
         out["recommended"] = best[1] if best else None
         return out
+
+    def _search(self, gf, plans: list[Plan], t: str, central: str) -> tuple[dict | None, dict]:
+        from ..search.mcts import Search
+        seeds = [p.operations for p in plans if p.operations]
+        s = Search(self.rf, gf, self.sim, llm=self.llm, checker=self.checker)
+        r = s.run(time_limit=self.search_time, seeds=seeds)
+        info = {"evaluations": r.evaluations, "iterations": r.iterations, "seconds": r.seconds,
+                "best_score": r.best_score, "llm_calls": r.llm_calls, "llm_accepted": r.llm_accepted,
+                "trace": r.trace}
+        if r.plan is None or any(_same_ops(r.plan.operations, p.operations) for p in plans):
+            return None, info
+        p = r.plan
+        sim = self.sim.run(p.operations, t, gf.core, central)
+        after = {o["class"]: o["to_package"] for o in p.operations if o["op"] == "move_class"}
+        checks = self.checker.check(p.operations, after)
+        summ = summarise(checks)
+        entry = {k: v for k, v in asdict(p).items() if k not in ("operations", "size")}
+        entry["model_size"] = p.size
+        entry.update({"simulation": sim.as_dict(), "checks": summ, **score(p, sim, summ, t)})
+        entry["operations"] = [{**o, "check": {"status": c.status, "notes": c.notes, "edits": c.edits}}
+                               for o, c in zip(p.operations, checks)]
+        return entry, info
 
     def run(self, n: int = 10, types: set[str] | None = None) -> dict:
         sel = self.select(n, types)
@@ -204,7 +259,14 @@ class Planner:
                      + f" [{time.time() - t0:.0f} s]")
             results.append(r)
         return {"groups": results, "backends": slv.available_backends(), "weights": WEIGHTS,
+                "affinity_model": self.affinity, "search": self.search,
+                "llm": getattr(self.llm, "name", "none") if self.llm else "none",
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}
+
+
+def _same_ops(a: list[dict], b: list[dict]) -> bool:
+    key = lambda ops: sorted(str(sorted(o.items())) for o in ops)  # noqa: E731
+    return key(a) == key(b)
 
 
 def write(result: dict, out_dir: str | Path) -> dict[str, Path]:
