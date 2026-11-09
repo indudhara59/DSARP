@@ -13,6 +13,9 @@ Examples::
     dsarp learn results/tika results/struts --workdir work
     dsarp plan results/tika --groups 10 --time-limit 60
     dsarp explain results/tika
+    dsarp verify results/tika --workdir work
+    dsarp evaluate results/tika --groups 10
+    dsarp report results/tika
 """
 
 from __future__ import annotations
@@ -260,6 +263,59 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    import json
+
+    from .verify.run import Verifier
+    for d in map(Path, args.results):
+        if not (d / "plans" / "plans.json").exists():
+            print(f"ERROR {d}: no plans (run dsarp plan)", file=sys.stderr)
+            return 1
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        if not repo.exists():
+            print(f"ERROR {d}: no checkout at {repo} (run dsarp checkout)", file=sys.stderr)
+            return 1
+        cmds = {k: v for k, v in (("arcan", args.arcan_cmd), ("designite", args.designite_cmd)) if v}
+        print(f"\n{d.name}:")
+        v = Verifier(d, repo, memory=args.memory, classpath=args.classpath, build_tool=args.build,
+                     run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
+        v.run(args.groups, set(args.group) if args.group else None)
+        print(f"  written: {d / 'verify'}")
+    return 0
+
+
+def _cmd_evaluate(args: argparse.Namespace) -> int:
+    import json
+
+    from .evaluate.harness import Harness, sensitivity, write
+    for d in map(Path, args.results):
+        affinity = args.affinity
+        if affinity is None and (d / "learn" / "affinity.json").exists():
+            affinity = str(d / "learn" / "affinity.json")
+        if affinity == "none":
+            affinity = None
+        print(f"\n{d.name}:")
+        h = Harness(d, backend=args.backend, time_limit=args.time_limit, search_time=args.search_time,
+                    budget=args.budget, llm=_llm(args.llm), affinity=affinity, ablation=args.ablation, seed=args.seed)
+        df = h.run(args.groups)
+        extra = {}
+        if (d / "plans" / "plans.json").exists():
+            extra["weight_sensitivity"] = sensitivity(json.loads((d / "plans" / "plans.json").read_text()))
+        paths = write(df, d, extra)
+        from .evaluate.harness import summarise
+        print(summarise(df).to_string(index=False))
+        print("  written: " + ", ".join(str(p) for p in paths.values()))
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    from .report import write
+    for d in map(Path, args.results):
+        print(f"{d.name}: written {write(d)}")
+    return 0
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .plan.run import Planner, write
     status = 0
@@ -376,6 +432,39 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("results", nargs="+")
     ex.add_argument("--llm", choices=["none", "openai"], help="language model for the summary (default: none)")
     ex.set_defaults(func=_cmd_explain)
+
+    ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
+    ve.add_argument("results", nargs="+")
+    ve.add_argument("--workdir", default="work", help="folder with the checkouts")
+    ve.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
+    ve.add_argument("--groups", type=int, help="verify only the first N groups with a plan")
+    ve.add_argument("--group", action="append", help="verify this group id (repeatable)")
+    ve.add_argument("--build", default="none", choices=["none", "auto", "maven", "gradle"],
+                    help="also build the affected modules and run the selected tests (offline)")
+    ve.add_argument("--no-tests", action="store_true", help="with --build: compile only")
+    ve.add_argument("--max-compiles", type=int, default=30, help="compiler runs for delta debugging per plan")
+    ve.add_argument("--memory", default="4g")
+    ve.add_argument("--classpath", default="", help="jars of the external libraries (fewer baseline errors)")
+    ve.add_argument("--arcan-cmd", help="command to run Arcan on the result ({repo}, {out})")
+    ve.add_argument("--designite-cmd", help="command to run Designite on the result ({repo}, {out})")
+    ve.set_defaults(func=_cmd_verify)
+
+    ev = sub.add_parser("evaluate", help="stage 9: compare solver, search, hybrid, NSGA-II, random (and LLM)")
+    ev.add_argument("results", nargs="+")
+    ev.add_argument("--groups", type=int, default=10)
+    ev.add_argument("--time-limit", type=float, default=60.0)
+    ev.add_argument("--search-time", type=float, default=120.0)
+    ev.add_argument("--budget", type=int, default=600, help="minimum evaluations for NSGA-II and random search")
+    ev.add_argument("--backend", default="auto", choices=["auto", "cpsat", "highs"])
+    ev.add_argument("--affinity")
+    ev.add_argument("--llm", choices=["none", "openai"])
+    ev.add_argument("--ablation", action="store_true", help="also run the hybrid with the fixed affinity weights")
+    ev.add_argument("--seed", type=int, default=0)
+    ev.set_defaults(func=_cmd_evaluate)
+
+    rp = sub.add_parser("report", help="stage 9: self-contained HTML report (triage, plans, verification)")
+    rp.add_argument("results", nargs="+")
+    rp.set_defaults(func=_cmd_report)
 
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")

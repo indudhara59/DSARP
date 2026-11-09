@@ -361,7 +361,7 @@ def move_cost(rf: RepoFacts, c: str, target: str, aff: float) -> float:
     ``1`` per move, up to ``4`` for a poor fit (low affinity to the target),
     ``0.2`` per class that uses it (each needs its imports changed, tests
     included), ``5`` if it is public API and ``2`` per framework wiring entry.
-    The per-user term makes widely used classes (the ``ParseContext``\ s of a
+    The per-user term makes widely used classes (like ``ParseContext`` in a
     code base) expensive to move: in practice they are the last to move."""
     users = rf.users.get(c, len(rf.dependents(c)))
     cost = 1.0 + 4.0 * (1.0 - aff) + 0.2 * users

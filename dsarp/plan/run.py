@@ -43,7 +43,7 @@ import pandas as pd
 from ..program import ProgramModel
 from . import solver as slv
 from .checks import Checker, summarise
-from .facts import RepoFacts, group_facts
+from .facts import GroupFacts, RepoFacts, group_facts
 from .generator import Plan, PlanModel
 from .simulate import Simulator, hub_data, unstable_targets
 
@@ -88,8 +88,8 @@ def _size(sim, smell_type: str) -> float:
     return 1.0
 
 
-def score(plan: Plan, sim, check_summary: dict, smell_type: str) -> dict:
-    w = WEIGHTS
+def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict | None = None) -> dict:
+    w = {**WEIGHTS, **(weights or {})}
     benefit = _benefit(sim, smell_type)
     new = sum(1.0 if s["type"] != "cyclic_dependency" else min(1.0 + s["size"] / 10, 3.0)
               for s in sim.new_smells)
@@ -156,16 +156,13 @@ class Planner:
             return {**h, "focus_pairs": pairs, "central": central}, ""
         return {}, ""
 
-    def plan_group(self, row) -> dict:
+    def prepare(self, row) -> tuple[GroupFacts | None, dict]:
+        """Group facts for one group row, or ``None`` with the reason it cannot be planned."""
         gid, t = row["group_id"], row["type"]
         scope = self.scopes.get(gid, {})
-        out = {"group_id": gid, "type": t, "level": row["level"], "central": row["central"],
-               "rank": int(row["rank"]), "priority": float(row["priority"] or 0), "core": scope.get("core", []),
-               "quick_fixes": scope.get("quick_fixes", []), "plans": [], "recommended": None}
         smell, reason = self._smell_data(row)
         if smell is None:
-            out["skipped"] = reason
-            return out
+            return None, {"skipped": reason}
         if t == "hub_like_dependency":
             scope = {**scope, "core": [row["central"]],
                      "neighbours": sorted(set(scope.get("neighbours", [])) | {p for pr in smell["focus_pairs"] for p in pr})}
@@ -177,11 +174,23 @@ class Planner:
             S = set(gf.packages)
             smell["fixed_out"] = sum(1 for s in smell["successors"] if s not in S)
             smell["fixed_in"] = sum(1 for p in smell["predecessors"] if p not in S)
-        out["model"] = {"reduced_for_highs": bool(limits), "movable_classes": sum(len(v) > 1 for v in gf.movable.values()),
-                        "packages": len(gf.packages), "class_edges": len(gf.edges),
-                        "deletable_members": len(gf.deletable)}
+        info = {"model": {"reduced_for_highs": bool(limits),
+                          "movable_classes": sum(len(v) > 1 for v in gf.movable.values()),
+                          "packages": len(gf.packages), "class_edges": len(gf.edges),
+                          "deletable_members": len(gf.deletable)}}
         if not gf.edges:
-            out["skipped"] = "no dependencies that the plan model can change"
+            return None, {**info, "skipped": "no dependencies that the plan model can change"}
+        return gf, info
+
+    def plan_group(self, row) -> dict:
+        gid, t = row["group_id"], row["type"]
+        scope = self.scopes.get(gid, {})
+        out = {"group_id": gid, "type": t, "level": row["level"], "central": row["central"],
+               "rank": int(row["rank"]), "priority": float(row["priority"] or 0), "core": scope.get("core", []),
+               "quick_fixes": scope.get("quick_fixes", []), "plans": [], "recommended": None}
+        gf, info = self.prepare(row)
+        out.update(info)
+        if gf is None:
             return out
         pm = PlanModel(self.rf, gf)
         t0 = time.time()
