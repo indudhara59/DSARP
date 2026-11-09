@@ -48,3 +48,20 @@ def test_other_repositories_build(repo, tmp_path):
     m = _model(repo, tmp_path)
     assert len(m.types) > 1000
     assert m.manifest["counts"]["build_modules"] > 10
+
+
+def test_tika_triage_groups_and_quick_fixes(tmp_path):
+    from dsarp.ingest import ingest, write
+    from dsarp.triage import triage
+    if not (Path(WORK) / "tika" / ".git").exists():
+        pytest.skip("no tika checkout")
+    cfg = load_config(CONFIGS / "tika.yaml", DATA)
+    write(ingest(cfg), tmp_path / "tika")
+    build_model(cfg, Path(WORK) / "tika", tmp_path / "tika" / "model", memory="5g", history_commits=500)
+    res = triage(tmp_path / "tika", tmp_path / "tika" / "model", tmp_path / "tika" / "triage")
+    top = res.groups.iloc[0]
+    assert top["type"] == "cyclic_dependency" and top["level"] == "package" and top["size"] == 17
+    fixes = {(f["from"], f["to"], f["fix"]) for f in res.scopes[top["group_id"]]["quick_fixes"]}
+    assert ("org.apache.tika.io", "org.apache.tika.parser", "remove_unused_import") in fixes
+    assert ("org.apache.tika.mime", "org.apache.tika", "only_used_by_deprecated_code") in fixes
+    assert (res.smells["reason"] == "cycle exists only through test code").sum() >= 5

@@ -8,6 +8,8 @@ Examples::
     dsarp summary results/tika
     dsarp checkout configs/tika.yaml --workdir work
     dsarp model configs/tika.yaml --repo work/tika --out results/tika/model
+    dsarp triage results/tika
+    dsarp calibrate results/tika
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from .checkout import CheckoutError, checkout
 from .config import ConfigError, load_config
 from .extractor import ExtractorError
 from .ingest import ingest, write
-from .program import build_model
+from .program import ProgramModel, build_model
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -138,6 +140,48 @@ def _cmd_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_triage(args: argparse.Namespace) -> int:
+    from .triage import triage
+    status = 0
+    for d in args.results:
+        d = Path(d)
+        model = Path(args.model) if args.model else d / "model"
+        if not (d / "smells.csv").exists() or not (model / "model.json").exists():
+            print(f"ERROR {d}: needs smells.csv (dsarp ingest) and {model}/model.json (dsarp model)", file=sys.stderr)
+            status = 1
+            continue
+        res = triage(d, model, Path(args.out) if args.out else d / "triage", repo=d.name)
+        m = res.manifest
+        print(f"\n{d.name}: {m['smells']} smells -> {m['decisions']}; {m['groups']} groups, {m['quick_fixes']} quick fixes")
+        for r in m["by_reason"]:
+            if r["decision"] != "keep":
+                print(f"  {r['decision']:11s} {r['tool']:9s} {r['n']:4d}  {r['reason']}")
+        print("  top groups:")
+        for g in m["top_groups"][:args.top]:
+            print(f"    {g['rank']:3d}. {g['group_id']}  {g['type']}:{g['level']}  size {g['size']}  "
+                  f"priority {g['priority']:.3f}  ({g['tools']})")
+    return status
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from .calibrate import calibrate
+    for d in args.results:
+        d = Path(d)
+        model = ProgramModel(Path(args.model) if args.model else d / "model")
+        smells = pd.read_csv(d / "smells.csv", low_memory=False)
+        report = calibrate(model, smells)
+        (d / "calibration.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        print(f"\n{d.name}:  recall / precision of in-memory detection vs. each detector "
+              f"(published rules | pipeline thresholds)")
+        for tool, rep in report.items():
+            for key, a in rep["agreement"].items():
+                b = rep["agreement_pipeline_thresholds"].get(key, {})
+                print(f"  {tool:9s} {key:30s} {a.get('recall')} / {a.get('precision')}  |  "
+                      f"{b.get('recall')} / {b.get('precision')}")
+            print(f"  {tool:9s} best thresholds: {rep['best']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dsarp", description="Architectural smell refactoring planner")
     p.add_argument("--version", action="version", version=f"dsarp {__version__}")
@@ -174,6 +218,18 @@ def build_parser() -> argparse.ArgumentParser:
     mo.add_argument("--drop-raw", action="store_true", help="delete the extractor's raw TSV output")
     mo.add_argument("--data-root", help=argparse.SUPPRESS)
     mo.set_defaults(func=_cmd_model)
+
+    tr = sub.add_parser("triage", help="stage 3: drop false smells, group, prioritise, set scope")
+    tr.add_argument("results", nargs="+", help="result folders with smells.csv and model/")
+    tr.add_argument("--model", help="program model folder (default: <results>/model)")
+    tr.add_argument("--out", help="output folder (default: <results>/triage)")
+    tr.add_argument("--top", type=int, default=10, help="number of top groups to print")
+    tr.set_defaults(func=_cmd_triage)
+
+    ca = sub.add_parser("calibrate", help="agreement of in-memory detection with the detectors, threshold search")
+    ca.add_argument("results", nargs="+")
+    ca.add_argument("--model", help="program model folder (default: <results>/model)")
+    ca.set_defaults(func=_cmd_calibrate)
 
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")

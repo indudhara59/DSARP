@@ -1,5 +1,7 @@
 #!/bin/bash
-# Stage 2 (program model) for many repositories: one array task per config.
+# Stages 0-3 (import, program model, triage) for many repositories: one array
+# task per config. Set DSARP_CALIBRATE=1 to also compare the in-memory
+# detection with the detectors (slower).
 # The checkouts must exist already: run `dsarp checkout` on a login node
 # (compute nodes may have no internet access).
 #
@@ -8,7 +10,7 @@
 #   ls configs/*.yaml > configs.list
 #   sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/model_array.sbatch
 
-#SBATCH -J dsarp-model
+#SBATCH -J dsarp-stages0-3
 #SBATCH -p normal
 #SBATCH -t 02:00:00
 #SBATCH -N 1
@@ -37,5 +39,7 @@ echo "[$(date -Is)] model $CONFIG on $(hostname)"
 apptainer exec --bind "$DSARP_DATA" --bind "$DSARP_WORK" "$SIF" bash -c "
   dsarp ingest '$CONFIG' --data-root '$DSARP_DATA' --out '$RESULTS/$NAME' &&
   dsarp model '$CONFIG' --data-root '$DSARP_DATA' --workdir '$DSARP_WORK' \
-        --out '$RESULTS/$NAME/model' --ingest '$RESULTS/$NAME' --memory '$HEAP'"
+        --out '$RESULTS/$NAME/model' --ingest '$RESULTS/$NAME' --memory '$HEAP' &&
+  dsarp triage '$RESULTS/$NAME' &&
+  if [ '${DSARP_CALIBRATE:-0}' = 1 ]; then dsarp calibrate '$RESULTS/$NAME'; fi"
 echo "[$(date -Is)] done"

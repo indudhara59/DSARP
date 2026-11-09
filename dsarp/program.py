@@ -270,17 +270,24 @@ class ProgramModel:
         return set(t.loc[keep, "type"])
 
     def type_graph(self, include_tests: bool = False, include_generated: bool = False,
-                   kinds: set[str] | None = None) -> nx.DiGraph:
+                   kinds: set[str] | None = None, collapse_nested: bool = False) -> nx.DiGraph:
         """Class-level dependency graph.
 
-        Edge attributes: ``weight`` (sum of reference counts), ``refs`` (number
-        of distinct member/type-level dependencies) and ``kinds``.
+        With ``collapse_nested`` nested types are merged into their top-level
+        type (as Arcan analyses classes). Edge attributes: ``weight`` (sum of
+        reference counts), ``refs`` (number of distinct member/type-level
+        dependencies) and ``kinds``.
         """
         allowed = self._type_filter(include_tests, include_generated)
         d = self.deps
         if kinds:
             d = d[d["kind"].isin(kinds)]
-        d = d[(d["source_type"] != d["target_type"]) & d["source_type"].isin(allowed) & d["target_type"].isin(allowed)]
+        d = d[d["source_type"].isin(allowed) & d["target_type"].isin(allowed)]
+        if collapse_nested:
+            top = dict(zip(self.types["type"], self.types["top_level"]))
+            d = d.assign(source_type=d["source_type"].map(top), target_type=d["target_type"].map(top))
+            allowed = {top[t] for t in allowed} & allowed
+        d = d[d["source_type"] != d["target_type"]]
         g = nx.DiGraph()
         info = self.types.set_index("type")
         for t in allowed:
