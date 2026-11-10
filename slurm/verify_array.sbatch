@@ -34,6 +34,8 @@ mkdir -p logs "$HOME/.m2"
 
 module reset >/dev/null 2>&1 || true
 module load tools Apptainer
+# make the parallel file system (data, checkouts, results) visible inside the container
+export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}"
 
 ARGS=(--workdir "$DSARP_WORK" --build "${DSARP_BUILD:-none}" --max-compiles "${DSARP_MAX_COMPILES:-30}"
       --memory "${DSARP_HEAP:-8g}")
@@ -41,6 +43,6 @@ ARGS=(--workdir "$DSARP_WORK" --build "${DSARP_BUILD:-none}" --max-compiles "${D
 [ -n "${DSARP_DESIGNITE_CMD:-}" ] && ARGS+=(--designite-cmd "$DSARP_DESIGNITE_CMD")
 
 echo "[$(date -Is)] verify $NAME on $(hostname)"
-apptainer exec --bind "$DSARP_WORK" --bind "$HOME/.m2" "$SIF" bash -c "
+apptainer exec --bind "$HOME/.m2" "$SIF" bash -c "
   dsarp verify '$RESULTS/$NAME' ${ARGS[*]@Q} && dsarp report '$RESULTS/$NAME'"
 echo "[$(date -Is)] done"

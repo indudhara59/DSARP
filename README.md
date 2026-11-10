@@ -376,6 +376,7 @@ Docker is not available on the PC2 clusters; use Apptainer.
 # On a login node (downloads happen here)
 git clone https://github.com/indudhara59/dsarp && cd dsarp
 module load tools Apptainer
+export APPTAINER_BIND=/scratch          # the container must see the parallel file system
 export APPTAINER_CACHEDIR=$PC2PFS/<project>/apptainer-cache
 export APPTAINER_TMPDIR=$PC2PFS/<project>/apptainer-tmp
 apptainer build dsarp.sif containers/pipeline.def

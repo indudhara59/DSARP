@@ -33,6 +33,8 @@ mkdir -p logs
 
 module reset >/dev/null 2>&1 || true
 module load tools Apptainer
+# make the parallel file system (data, checkouts, results) visible inside the container
+export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}"
 export HF_HUB_OFFLINE=1
 
 apptainer exec --nv "$VLLM_SIF" vllm serve "$DSARP_LLM_MODEL" --port "$PORT" --max-model-len 16384 \
