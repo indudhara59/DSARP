@@ -355,17 +355,6 @@ async function viewResults(name) {
     <div class="card"><h2>Benefit vs change cost</h2>${scatter(rows.map(r => ({x: r.cost || 0, y: r.benefit || 0, r: 4 + Math.min(10, r.operations), color: (r.new_smells || 0) > 0 ? "var(--c3)" : "var(--c2)", title: `${r.group_id}: benefit ${num(r.benefit)}, cost ${num(r.cost, 1)}, ${r.operations} operations, new smells ${r.new_smells}`})), {xlabel: "change cost", ylabel: "benefit (1 = smell gone)"})}
     ${legend([["no new smells", "var(--c2)"], ["creates new smells", "var(--c3)"]])}<div class="small muted">Dot size = number of operations.</div></div></div>`;
   }
-  if (A.evaluate) {
-    const E = ov.evaluation, sm = E.summary || [];
-    h += `<div class="grid g2 sec"><div class="card"><h2>Evaluation: mean score per approach</h2>${bars(sm.map(r => ({label: r.approach.replace(/_/g, " "), value: r.mean_score, color: APPROACH[r.approach] || "var(--c7)"})), {fmt: v => num(v, 3), lw: 170})}</div>
-    <div class="card"><h2>New smells per plan and groups won</h2>${bars(sm.map(r => ({label: r.approach.replace(/_/g, " "), value: r.mean_new_smells || 0, color: "var(--c3)"})), {fmt: v => num(v, 2), lw: 170})}
-    <div class="small muted" style="margin-top:8px">Best score on most groups: ${sm.map(r => `${esc(r.approach)} ${int(r.best)}`).join(" · ")}</div></div></div>`;
-    const gids = [...new Set((E.per_group || []).map(r => r.group_id))], aps = sm.map(r => r.approach);
-    if (gids.length) {
-      const cell = v => { if (v == null) return `<td class="faint">–</td>`; const a = Math.max(0, Math.min(1, v)); return `<td style="background:color-mix(in srgb, var(--t) ${Math.round(a * 55)}%, transparent)">${num(v, 2)}</td>`; };
-      h += `<div class="card sec"><h2>Score per group and approach</h2><div style="overflow:auto"><table class="heat"><tr><th>group</th>${aps.map(a => `<th>${esc(a.replace(/_/g, " "))}</th>`).join("")}</tr>${gids.map(g => `<tr><td class="mono" style="text-align:left"><a href="#/p/${n}/group/${esc(g)}">${esc(g)}</a></td>${aps.map(a => cell((E.per_group.find(r => r.group_id === g && r.approach === a) || {}).score)).join("")}</tr>`).join("")}</table></div></div>`;
-    }
-  }
   if (A.plan) {
     const vb = Object.fromEntries(ver.map(v => [v.group_id, v]));
     h += `<div class="card sec"><h2>All groups <small>click a row for the step-by-step recommendation</small></h2><div style="overflow:auto"><table><tr><th>rank</th><th>group</th><th>type</th><th>priority</th><th>recommended</th><th>steps</th><th>score</th><th>new smells</th><th>verified</th></tr>
@@ -377,7 +366,45 @@ async function viewResults(name) {
     h += `<div class="grid g2 sec"><div class="card"><h2>Verification: size of each patch</h2>${bars(ver.map(v => ({html: `<a class="mono" href="#/p/${n}/group/${esc(v.group_id)}">${esc(v.group_id)}</a>`, value: v.patch_lines || 0, color: v.compiles ? "var(--c2)" : "var(--c3)"})), {lw: 150})}<div class="small muted">Patch lines; green = compiles.</div></div>
     <div class="card"><h2>Verification: steps kept by delta debugging</h2>${bars(ver.map(v => ({html: `<span class="mono">${esc(v.group_id)}</span>`, value: v.operations || 0, total: `${v.kept}/${v.operations}`, segs: [{value: v.kept || 0, color: "var(--c2)", label: "kept"}, {value: (v.operations || 0) - (v.kept || 0), color: "var(--c3)", label: "dropped"}]})), {lw: 150, fmt: v => v})}${legend([["kept", "var(--c2)"], ["dropped", "var(--c3)"]])}</div></div>`;
   }
+  h += compareSection(ov, n);
   $("#view").innerHTML = h;
+}
+
+
+/* ---------- optional comparison with other approaches (hidden by default) ---------- */
+const OWN = "hybrid";
+const ALABEL = {hybrid: "DSARP (hybrid)", solver: "solver only", search_only: "search only", nsga2: "NSGA-II", random: "random search",
+  llm_only: "LLM only", hybrid_fixed_affinity: "DSARP, fixed affinity (ablation)"};
+const store = {get(k, d) { try { const v = localStorage.getItem("dsarp." + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("dsarp." + k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } }};
+S.compare = store.get("compare", false);
+S.cmpSel = store.get("cmpSel", null);
+function compareSection(ov, n) {
+  if (!ov.available?.evaluate) return "";
+  const E = ov.evaluation, all = (E.summary || []).map(r => r.approach).filter(a => a !== OWN);
+  if (!S.compare) {
+    return `<div class="card sec row"><div><h2 style="margin:0">Compare with other approaches</h2><div class="small muted">Results of the same groups with ${all.map(a => esc(ALABEL[a] || a)).join(", ")}. Hidden so the page shows only DSARP's recommendations.</div></div><span class="sp"></span><button data-act="cmp">Show comparison</button></div>`;
+  }
+  const sel = new Set(S.cmpSel || all);
+  const aps = [OWN, ...all.filter(a => sel.has(a))];
+  const sm = aps.map(a => (E.summary || []).find(r => r.approach === a)).filter(Boolean);
+  const lab = a => ALABEL[a] || a.replace(/_/g, " ");
+  let h = `<div class="sec"><div class="row"><h2 style="margin:0">Comparison with other approaches</h2><span class="sp"></span><button data-act="cmp">Hide comparison</button></div>
+  <div class="row" style="margin:10px 0"><span class="small muted">Compare DSARP with:</span>${all.map(a => `<label class="chip" style="cursor:pointer"><input type="checkbox" data-act="cmpap" data-ap="${esc(a)}"${sel.has(a) ? " checked" : ""}> ${esc(lab(a))}</label>`).join("")}</div>
+  <div class="small muted" style="margin-bottom:10px">Same groups, same whole-repo simulation, same score. Only DSARP (hybrid) produces the recommendations above; the others are baselines for the evaluation.</div>`;
+  h += `<div class="grid g2"><div class="card"><h2>Mean score per approach</h2>${bars(sm.map(r => ({label: lab(r.approach), value: r.mean_score, color: r.approach === OWN ? "var(--c1)" : "var(--c7)"})), {fmt: v => num(v, 3), lw: 210})}</div>
+  <div class="card"><h2>New smells per plan <small class="muted">lower is better</small></h2>${bars(sm.map(r => ({label: lab(r.approach), value: r.mean_new_smells || 0, color: r.approach === OWN ? "var(--c1)" : "var(--c3)"})), {fmt: v => num(v, 2), lw: 210})}</div></div>`;
+  const gids = [...new Set((E.per_group || []).map(r => r.group_id))];
+  if (gids.length) {
+    const sc = (g, a) => (E.per_group.find(r => r.group_id === g && r.approach === a) || {}).score;
+    const cell = (v, own) => { if (v == null) return `<td class="faint">–</td>`; const a = Math.max(0, Math.min(1, v)); return `<td style="background:color-mix(in srgb, var(--t) ${Math.round(a * 55)}%, transparent)${own ? ";font-weight:600" : ""}">${num(v, 2)}</td>`; };
+    const vs = a => { let w = 0, l = 0; gids.forEach(g => { const d = (sc(g, OWN) ?? 0) - (sc(g, a) ?? 0); if (d > 1e-3) w++; else if (d < -1e-3) l++; }); return [w, l, gids.length - w - l]; };
+    h += `<div class="card sec"><h2>DSARP against each approach <small>groups where DSARP scores higher / lower / equal</small></h2>${bars(all.filter(a => sel.has(a)).map(a => { const [w, l, t] = vs(a);
+      return {label: "vs " + lab(a), value: 0, total: `${w} / ${l} / ${t}`, segs: [{value: w, color: "var(--c2)", label: "DSARP better"}, {value: t, color: "var(--c7)", label: "equal"}, {value: l, color: "var(--c3)", label: "DSARP worse"}]}; }), {lw: 230, fmt: v => v})}
+      ${legend([["DSARP better", "var(--c2)"], ["equal", "var(--c7)"], ["DSARP worse", "var(--c3)"]])}</div>`;
+    h += `<div class="card sec"><h2>Score per group</h2><div style="overflow:auto"><table class="heat"><tr><th>group</th>${aps.map(a => `<th>${esc(lab(a))}</th>`).join("")}</tr>${gids.map(g => `<tr><td class="mono" style="text-align:left"><a href="#/p/${n}/group/${esc(g)}">${esc(g)}</a></td>${aps.map(a => cell(sc(g, a), a === OWN)).join("")}</tr>`).join("")}</table></div></div>`;
+  }
+  return h + `</div>`;
 }
 
 /* ---------- group detail ---------- */
@@ -507,6 +534,8 @@ document.addEventListener("click", async e => {
   if (act === "sel") { e.preventDefault(); S.sel = el.dataset.stage; S.log.id = null; stopLog(); drawPipeline(true); return; }
   if (act === "go") { if (e.target.closest("a,button")) return; location.hash = el.dataset.href; return; }
   if (act === "cancel") { e.stopPropagation(); try { await api(`/api/jobs/${encodeURIComponent(el.dataset.job)}/cancel`, {method: "POST", body: {}}); toast("Cancelled"); route(); } catch (er) { toast(er.message, true); } return; }
+  if (act === "cmp") { S.compare = !S.compare; store.set("compare", S.compare); route(); return; }
+  if (act === "cmpap") { const sel = new Set($$("[data-act=cmpap]").filter(c => c.checked).map(c => c.dataset.ap)); S.cmpSel = [...sel]; store.set("cmpSel", S.cmpSel); route(); return; }
   if (act === "adddet") { S.addDet(); return; }
   if (act === "rmdet") { el.closest(".det").remove(); return; }
   if (act === "runall") { S.runAll = !S.runAll; renderRunAll(); return; }
