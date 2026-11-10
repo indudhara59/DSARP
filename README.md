@@ -406,8 +406,9 @@ the server stops.
 open it on your laptop through an SSH tunnel:
 
 ```bash
-# on the login node, in the dsarp folder
+# on the login node, in the dsarp folder (the system python3 is too old: load Python 3.10+)
 module load tools Apptainer
+module load lang/Python/<3.10 or newer>   # see: module avail lang/Python
 export DSARP_DATA=$PC2PFS/<project>/dsarp-data
 python3 -m dsarp.web --mode slurm --account <project> --sif $PWD/dsarp.sif
 #   open: http://localhost:8765/?token=...
