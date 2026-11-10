@@ -88,7 +88,7 @@ class Verifier:
                    for o in ops if o["op"] == "move_class"}
         new = cmp.new_errors(self.baseline().errors, comp.errors, res.moved, renamed,
                              self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
-                             set(renamed.values()) | set(res.created_types), self.packages)
+                             set(renamed.values()) | set(res.created_types), self.packages, ws.path)
         return new.empty, res, comp, new
 
     def _production_after(self, res, ops) -> set[str]:

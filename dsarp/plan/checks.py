@@ -110,6 +110,8 @@ class Checker:
             chk.block(f"a class with the same name already exists in {new_pkg}")
         if rf.module.get(c) not in rf.pkg_modules.get(new_pkg, set()):
             chk.block(f"{new_pkg} is in another build module")
+        if not rf.visible_after_move(c, new_pkg):
+            chk.block(f"{new_pkg} is not exported, but other modules use the class (OSGi/module visibility)")
         # used by others: package-private elements of c used from another package
         widen = set()
         importers, same_pkg_users, test_users = set(), set(), set()

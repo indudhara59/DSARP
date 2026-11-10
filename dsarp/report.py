@@ -117,7 +117,7 @@ def build(results: str | Path) -> str:
              f"DSARP {html.escape(str(model.get('dsarp_version', '')))}.</p>"]
     groups = plans.get("groups", [])
     rec = sum(1 for g in groups if g.get("recommended"))
-    compiled = sum(1 for v in verify if v.get("compiles"))
+    compiled = sum(1 for v in verify if v.get("compiles") and v.get("kept", 0) > 0)
     removed = sum(1 for v in verify if v.get("target_removed"))
     decisions = triage.get("decisions", {}) if isinstance(triage, dict) else {}
     cards = [("smells reported", triage.get("smells", "") if isinstance(triage, dict) else ""),
@@ -135,7 +135,8 @@ def build(results: str | Path) -> str:
         ov.append({"rank": g["rank"], "group": g["group_id"], "smell": g["type"], "packages": len(g.get("core", [])),
                    "plan": g.get("recommended") or g.get("skipped") or "none",
                    "steps": len(p["operations"]) if p else 0, "score": p.get("score") if p else "",
-                   "compiles": ("yes" if v.get("compiles") else "no") if v else "-",
+                   "compiles": (("yes" if v.get("kept", 0) else "no: all steps dropped")
+                                if v.get("compiles") else "no") if v else "-",
                    "kept steps": f"{v['kept']}/{v['operations']}" if v else "-",
                    "smell after (verified)": json.dumps(v.get("target_after", "")) if v else "-"})
     parts.append(_table(pd.DataFrame(ov)))
@@ -149,9 +150,11 @@ def build(results: str | Path) -> str:
                      "compiler errors were found by delta debugging and dropped; the smells were then detected "
                      "again on the compiled result and compared with the prediction of the simulation.</p>")
         for v in verify:
+            ok = bool(v.get("compiles") and v.get("kept", 0))
             parts.append(f"<h3>{html.escape(v['group_id'])}</h3><ul>"
-                         f"<li>compiles: <span class='{'ok' if v.get('compiles') else 'bad'}'>"
-                         f"{'yes' if v.get('compiles') else 'no'}</span>, kept {v['kept']} of {v['operations']} steps "
+                         f"<li>compiles: <span class='{'ok' if ok else 'bad'}'>"
+                         f"{'yes' if ok else 'no: every step broke the build and was dropped' if v.get('compiles') else 'no'}"
+                         f"</span>, kept {v['kept']} of {v['operations']} steps "
                          f"({html.escape(str(v.get('reduction')))}, {v.get('compile_runs')} compiler runs)</li>"
                          f"<li>smell before: <code>{html.escape(json.dumps(v.get('target_before')))}</code>, after: "
                          f"<code>{html.escape(json.dumps(v.get('target_after')))}</code>; simulation predicted "
