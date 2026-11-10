@@ -309,6 +309,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .web.server import main as serve_main
+    return serve_main(args.rest)
+
+
 def _cmd_report(args: argparse.Namespace) -> int:
     from .report import write
     for d in map(Path, args.results):
@@ -466,6 +471,11 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("results", nargs="+")
     rp.set_defaults(func=_cmd_report)
 
+    w = sub.add_parser("serve", help="web interface: run stages, follow them on a flowchart, browse results",
+                       add_help=False)
+    w.add_argument("rest", nargs=argparse.REMAINDER)
+    w.set_defaults(func=_cmd_serve)
+
     s = sub.add_parser("summary", help="print the summary of ingested results")
     s.add_argument("results", nargs="+")
     s.add_argument("--detail", action="store_true", help="also print counts per tool, type and level")
@@ -474,6 +484,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["serve"]:          # the web server has its own options (and needs only the standard library)
+        from .web.server import main as serve_main
+        return serve_main(argv[1:])
     args = build_parser().parse_args(argv)
     return args.func(args)
 

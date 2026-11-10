@@ -10,12 +10,13 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: all six phases implemented (version 0.6.2).** Stages 0-9:
-> detector import, program model, triage, learned affinity, constraint plans,
-> tree search with an optional language model, simulation and checks,
-> step-by-step reports, verification on the real code (apply, compile, delta
-> debugging, re-detection, optional build and tests) and the evaluation
-> against baselines (NSGA-II, random search, solver only, search only).
+> **Status: all six phases implemented, plus a web interface (version 0.7.0).**
+> Stages 0-9: detector import, program model, triage, learned affinity,
+> constraint plans, tree search with an optional language model, simulation and
+> checks, step-by-step reports, verification on the real code (apply, compile,
+> delta debugging, re-detection, optional build and tests) and the evaluation
+> against baselines (NSGA-II, random search, solver only, search only). The
+> whole pipeline can be run and inspected from the browser (`dsarp serve`).
 
 ## Pipeline
 
@@ -368,6 +369,60 @@ Any Java project layout works: the source root of each file is derived from
 its package, so Maven, Gradle and custom layouts (e.g. Cassandra's `src/java`)
 are handled the same way.
 
+## Web interface
+
+Everything the command line does can also be started from the browser:
+
+```bash
+python3 -m dsarp.web            # or: dsarp serve      (in the folder that holds configs/)
+```
+
+* **Projects**: one card per config in `configs/`, with the progress of every
+  stage. New projects (repository, commit, detector folders) are created with a
+  form that writes the YAML config.
+* **Pipeline**: a live flowchart of stages 0-9. Click a stage to see what it
+  needs and writes, set its options (the exact `dsarp` command is shown), run
+  it, and follow its log. *Run pipeline* starts several stages as a chain: each
+  waits for the previous one (`--dependency=afterok` in Slurm).
+* **Results**: charts and tables from the result files: funnel, smells by
+  tool and type, triage decisions, program model, learned affinity, plan
+  scores, benefit vs cost, verification, the evaluation per approach and per
+  group. Each group has a page with the compared plans, the score breakdown,
+  the step-by-step moves (from/to, edits, warnings), the tree search, the
+  verification, the patch, the OpenRewrite recipe and its report text.
+* **Jobs**: all runs with status, log, Slurm script and *Cancel*.
+
+Stages run in one of three modes (Settings page or `--mode`): `local` (the
+`dsarp` command on this machine), `container` (`apptainer exec` on this
+machine) or `slurm` (one `sbatch` job per stage, with the CPUs, memory and time
+of each stage editable in the form).
+
+The server needs only the Python standard library, listens on `127.0.0.1` and
+asks for a token that it prints at start. Jobs and logs are kept in
+`.dsarp-web/` so the job list survives a restart; Slurm jobs keep running when
+the server stops.
+
+**On Noctua 2**: run the server on the login node (it only submits jobs) and
+open it on your laptop through an SSH tunnel:
+
+```bash
+# on the login node, in the dsarp folder
+module load tools Apptainer
+export DSARP_DATA=$PC2PFS/<project>/dsarp-data
+python3 -m dsarp.web --mode slurm --account <project> --sif $PWD/dsarp.sif
+#   open: http://localhost:8765/?token=...
+
+# on your laptop
+ssh -L 8765:localhost:8765 <user>@<login node>
+# then open the printed URL in the browser
+```
+
+Set *Checkouts* and *Results* on the Settings page to the folders used on the
+cluster (for example `$PC2PFS/<project>/work`). Checkout and learn need git
+history from the internet, so on clusters where compute nodes are offline run
+those two in `container` mode on the login node (they are light) and the rest
+in `slurm` mode.
+
 ## Running on Noctua 2 (PC2)
 
 Docker is not available on the PC2 clusters; use Apptainer.
@@ -431,6 +486,7 @@ Detector output of the study repositories is not stored in this repository.
 4. **Constraint plan generator** (stages 5a, 6): mixed-integer model (CP-SAT or HiGHS), trade-off plans, whole-repository simulation and re-detection, precondition checks, ranking. Done.
 5. **Learning, search and explanations** (stages 4, 5b, 7): learned affinity from code and history moves, tree search with optional language model, step-by-step reports with a reviewed summary. Done.
 6. **Verification, report and evaluation** (stages 8-9): apply plans to the code, compile, delta debugging, re-detection on the compiled code, optional build/tests/detectors, patches and OpenRewrite recipes, HTML report, evaluation against NSGA-II, random, solver-only and search-only with ablation and weight sensitivity. Done.
+7. **Web interface**: run stages locally, in the container or as Slurm jobs, live flowchart and logs, results dashboard and group pages. Done.
 
 Known limitations: the compile check compiles the whole repository at once,
 so it does not see build-module boundaries (use `--build`); history moves are
@@ -458,6 +514,7 @@ dsarp/            Python package
   program.py      stage 2: program model, class and package graphs
   detect.py       in-memory smell detection (cycles, hubs, unstable, god components)
   calibrate.py    agreement with Arcan/Designite, threshold search
+  web/            web interface (standard library only): server, stages, jobs, results, static/
   triage.py       stage 3: decisions, groups, priority, scope, quick fixes
   plan/           stages 5a and 6
     solver.py     linear model, HiGHS and CP-SAT backends
