@@ -379,7 +379,7 @@ module load tools Apptainer
 export APPTAINER_BIND=/scratch          # the container must see the parallel file system
 export APPTAINER_CACHEDIR=$PC2PFS/<project>/apptainer-cache
 export APPTAINER_TMPDIR=$PC2PFS/<project>/apptainer-tmp
-apptainer build dsarp.sif containers/pipeline.def
+APPTAINER_BIND= apptainer build dsarp.sif containers/pipeline.def   # no bind mounts while building
 
 # Detector output on the parallel file system, not in $HOME
 export DSARP_DATA=$PC2PFS/<project>/dsarp-data
