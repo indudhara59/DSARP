@@ -147,3 +147,11 @@ def test_cli_plan(project, capsys):
     assert main(["plan", str(project), "--groups", "2", "--time-limit", "10", "--backend", "highs"]) == 0
     assert (project / "plans" / "plans.json").exists()
     assert "recommended" in capsys.readouterr().out
+
+
+def test_moves_respect_exported_packages(project):
+    rf = RepoFacts.build(ProgramModel(project / "model"))
+    # com.acme.core.internal is not exported; Engine is used by the web module
+    assert not rf.is_exported("com.acme.core.internal") and rf.is_exported("com.acme.core")
+    assert not rf.visible_after_move("com.acme.core.Engine", "com.acme.core.internal")
+    assert rf.visible_after_move("com.acme.core.Engine", "com.acme.util")

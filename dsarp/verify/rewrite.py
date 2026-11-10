@@ -100,12 +100,11 @@ class Rewriter:
 
     @staticmethod
     def _read(path: Path) -> list[str]:
-        return path.read_text(encoding="utf-8", errors="replace").split("\n")
+        return _read_text(path).split("\n")
 
     @staticmethod
     def _write(path: Path, lines: list[str]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines), encoding="utf-8")
+        _write_text(path, "\n".join(lines))
 
     def new_file(self, cls: str, new_pkg: str) -> str:
         old = self.type_file[cls]
@@ -226,7 +225,7 @@ class Rewriter:
         path = posixpath.join(root, pkg.replace(".", "/"), simple + ".java")
         # imports: those of the provider (unused ones are harmless) and classes of the provider's
         # package named in the signatures (these keep a dependency; re-detection will show it)
-        ptext = (repo / provider_file).read_text(encoding="utf-8", errors="replace")
+        ptext = _read_text(repo / provider_file)
         ppkg = op["provider"].rsplit(".", 1)[0]
         same_pkg = {t.rsplit(".", 1)[-1] for t, q in self.type_pkg.items() if q == ppkg and self.top.get(t) == t}
         used = set(re.findall(r"\b[A-Z]\w*", " ".join(sigs)))
@@ -273,14 +272,14 @@ class Rewriter:
     def _use_interface(self, repo: Path, client_file: str, client: str, op: dict, pname: str, simple: str,
                        res: ApplyResult) -> None:
         c = repo / client_file
-        text = c.read_text(encoding="utf-8", errors="replace")
+        text = _read_text(c)
         text = re.sub(r"(?<![\w.])(?<!new )" + re.escape(pname) + r"\b(?!\s*\.)", simple, text)
         code = _strip_comments_and_strings(text)
         if not re.search(r"(?<![\w.])" + re.escape(pname) + r"\b", code):      # no static uses left
             text = re.sub(r"^[ \t]*import\s+" + re.escape(op["provider"]) + r"[ \t]*;[ \t]*\n", "", text, flags=re.M)
         else:
             res.notes.append(f"{client} still uses {op['provider']} statically; import kept")
-        c.write_text(text, encoding="utf-8")
+        _write_text(c, text)
         res.changed.add(client_file)
 
     # ------------------------------------------------------------------ apply
@@ -343,11 +342,11 @@ class Rewriter:
             if not sp.exists():
                 res.notes.append(f"file not found: {src}")
                 continue
-            text = sp.read_text(encoding="utf-8", errors="replace")
+            text = _read_text(sp)
             text = re.sub(r"^(\s*package\s+)" + re.escape(o["from_package"]) + r"(\s*;)",
                           r"\g<1>" + o["to_package"] + r"\g<2>", text, count=1, flags=re.M)
             dp.parent.mkdir(parents=True, exist_ok=True)
-            dp.write_text(text, encoding="utf-8")
+            _write_text(dp, text)
             sp.unlink()
             res.moved[src] = dst
             current[src] = dst
@@ -368,7 +367,7 @@ class Rewriter:
             path = repo / f
             if not path.exists():
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = _read_text(path)
             new = fq_re.sub(lambda m: rename[m.group(1)], text)
             pkg = file_pkg.get(f, "")
             orig_pkg = self.file_pkg.get(back.get(f, f), pkg)
@@ -391,17 +390,17 @@ class Rewriter:
             if add:
                 new = _add_imports(new, sorted(set(add)))
             if new != text:
-                path.write_text(new, encoding="utf-8")
+                _write_text(path, new)
                 res.changed.add(f)
         # 3. wiring files (service registrations, Spring, XML)
         for wf in self.wiring_files:
             p = repo / wf
             if not p.exists():
                 continue
-            text = p.read_text(encoding="utf-8", errors="replace")
+            text = _read_text(p)
             new = fq_re.sub(lambda m: rename[m.group(1)], text)
             if new != text:
-                p.write_text(new, encoding="utf-8")
+                _write_text(p, new)
                 res.changed.add(wf)
             base = p.name
             if "/META-INF/services/" in "/" + wf and base in rename:     # service interface file name
@@ -417,6 +416,20 @@ class Rewriter:
 
 def _imports(text: str, fqn: str) -> bool:
     return re.search(r"^\s*import\s+" + re.escape(fqn) + r"\s*;", text, re.M) is not None
+
+
+def _read_text(path: Path) -> str:
+    """File content with its line endings unchanged (CRLF files stay CRLF)."""
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        return f.read()
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if "\r\n" in text:                       # keep CRLF files consistent (new lines are added with \n)
+        text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
 
 
 def _drop_unused_imports(lines: list[str]) -> list[str]:

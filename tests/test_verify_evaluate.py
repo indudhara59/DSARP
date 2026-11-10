@@ -221,3 +221,36 @@ def test_drop_unused_imports_after_deletion():
              "class M { /** {@link Tika} */ Used u; }"]
     out = _drop_unused_imports(lines)
     assert "import b.Tika;" not in out and "import b.Used;" in out and "import static c.D.x;" in out
+
+
+def test_line_endings_are_preserved(tmp_path):
+    from dsarp.verify.rewrite import _add_imports, _read_text, _write_text
+    f = tmp_path / "A.java"
+    f.write_bytes(b"package a;\r\n\r\nimport b.C;\r\n\r\nclass A {}\r\n")
+    text = _read_text(f)
+    assert "\r\n" in text
+    _write_text(f, _add_imports(text.replace("package a;", "package z;"), ["b.D"]))
+    raw = f.read_bytes()
+    assert b"package z;\r\n" in raw and b"import b.D;\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_report_counts_plans_without_kept_steps_as_not_compiling(project):
+    from dsarp.report import build
+    vdir = project / "verify"
+    vdir.mkdir(exist_ok=True)
+    (vdir / "verification.json").write_text(json.dumps([
+        {"group_id": "G1", "compiles": True, "kept": 0, "operations": 1, "reduction": "ddmin", "compile_runs": 2,
+         "dropped_operations": [{"op": "move_class", "class": "a.B", "to_package": "c"}]}]))
+    page = build(project)
+    assert "0/1</b>plans that compile" in page and "every step broke the build" in page
+    (vdir / "verification.json").unlink()
+
+
+def test_new_errors_ignores_names_imported_from_libraries(tmp_path):
+    (tmp_path / "A.java").write_text("package p.q;\nimport org.osgi.service.event.Event;\nclass A {}\n")
+    before = pd.DataFrame(columns=["file", "line", "code", "message"])
+    after = pd.DataFrame([{"file": "A.java", "line": "9", "code": "compiler.err.cant.resolve.location",
+                           "message": "cannot find symbol symbol: class Event location: class p.q.A"}])
+    assert len(cmp.new_errors(before, after, repo_symbols={"Event"}, repo_packages={"p", "p.q"})) == 1
+    assert cmp.new_errors(before, after, repo_symbols={"Event"}, repo_packages={"p", "p.q"},
+                          root=tmp_path).empty

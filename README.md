@@ -10,7 +10,7 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: all six phases implemented (version 0.6.1).** Stages 0-9:
+> **Status: all six phases implemented (version 0.6.2).** Stages 0-9:
 > detector import, program model, triage, learned affinity, constraint plans,
 > tree search with an optional language model, simulation and checks,
 > step-by-step reports, verification on the real code (apply, compile, delta

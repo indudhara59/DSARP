@@ -64,7 +64,8 @@ _SYMBOL = re.compile(r"symbol:\s+(?:class|interface|enum|variable|method|static)
 
 def new_errors(before: pd.DataFrame, after: pd.DataFrame, moved_files: dict[str, str] | None = None,
                renamed: dict[str, str] | None = None, repo_symbols: set[str] | None = None,
-               plan_types: set[str] | None = None, repo_packages: set[str] | None = None) -> pd.DataFrame:
+               plan_types: set[str] | None = None, repo_packages: set[str] | None = None,
+               root: str | Path | None = None) -> pd.DataFrame:
     """Errors in ``after`` that are not in ``before`` (as a multiset).
 
     With ``repo_symbols`` (simple names of the repository's types and members),
@@ -74,7 +75,29 @@ def new_errors(before: pd.DataFrame, after: pd.DataFrame, moved_files: dict[str,
     reported before are ignored as well; with ``plan_types`` (moved and created
     types, new names) only duplicate-class errors naming one of them count:
     other duplicates come from compiling all modules together (tests copied
-    between modules) and depend on the order javac reads the files."""
+    between modules) and depend on the order javac reads the files.
+
+    With ``root`` (the compiled working copy) and ``repo_packages``, an
+    unresolved name that the file imports from a library package is ignored
+    too: without the library javac may have resolved the name to a class of
+    the same package before the move, and cannot after it."""
+    lib_imports: dict[str, set[str]] = {}
+
+    def library_import(file: str, name: str) -> bool:
+        if root is None or repo_packages is None:
+            return False
+        if file not in lib_imports:
+            names = set()
+            try:
+                text = (Path(root) / file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            for m in re.finditer(r"^\s*import\s+(?!static\b)([\w.]+)\.(\w+)\s*;", text, re.M):
+                if m.group(1) not in repo_packages:
+                    names.add(m.group(2))
+            lib_imports[file] = names
+        return name in lib_imports[file]
+
     back_file = {v: k for k, v in (moved_files or {}).items()}
     back_name = {v: k for k, v in (renamed or {}).items()}
     key_b = Counter(zip(before["file"], before["code"], before["message"]))
@@ -93,7 +116,7 @@ def new_errors(before: pd.DataFrame, after: pd.DataFrame, moved_files: dict[str,
                 continue                  # a library package (e.g. an import copied into a new interface)
         if repo_symbols is not None and r.code.startswith("compiler.err.cant.resolve"):
             m = _SYMBOL.search(r.message)
-            if m and m.group(1) not in repo_symbols:
+            if m and (m.group(1) not in repo_symbols or library_import(r.file, m.group(1))):
                 continue
         k = (back_file.get(r.file, r.file), r.code, _normalise(r.message, back_name))
         seen[k] += 1

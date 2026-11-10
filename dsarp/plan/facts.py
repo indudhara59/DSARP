@@ -301,6 +301,25 @@ class RepoFacts:
             methods.append(m)
         return sorted(methods) if methods else None
 
+    def is_exported(self, pkg: str) -> bool:
+        """Package exported by its module (OSGi Export-Package, or not an internal/impl package)."""
+        if "_exported" not in self.__dict__:
+            t = self.model.types
+            self.__dict__["_exported"] = dict(zip(t["package"], t["exported_package"].astype(str).str.lower()
+                                                   .isin(["true", "1"])))
+        return self.__dict__["_exported"].get(pkg, True)
+
+    def visible_after_move(self, c: str, target: str) -> bool:
+        """A class used by other build modules may only move to a package its module exports.
+
+        In OSGi bundles (and Java modules) only exported packages are visible to
+        other modules: moving such a class into an internal package compiles
+        but fails at run time."""
+        if self.is_exported(target):
+            return True
+        mod = self.module.get(c)
+        return not any(self.module.get(u) != mod for u in self.dependents(c))
+
     def signature_types(self, methods: list[str]) -> set[str]:
         """Production classes named in the signatures of ``methods`` (return, parameter, throws types).
 
@@ -376,7 +395,7 @@ def group_facts(rf: RepoFacts, group_id: str, smell_type: str, scope: dict, max_
             other = k[1] if k[0] == c else k[0]
             q = rf.package[other]
             if q != cur and q in allowed_pkgs and rf.module[c] in rf.pkg_modules.get(q, set()) \
-                    and simple not in rf.simple_names.get(q, set()):
+                    and simple not in rf.simple_names.get(q, set()) and rf.visible_after_move(c, q):
                 cands.add(q)
         scored = sorted(((q, rf.affinity(c, q)) for q in cands), key=lambda x: (-x[1], x[0]))[:max_targets]
         movable[c] = [(cur, rf.affinity(c, cur))] + scored
@@ -428,13 +447,17 @@ def move_cost(rf: RepoFacts, c: str, target: str, aff: float) -> float:
 
     ``1`` per move, up to ``4`` for a poor fit (low affinity to the target),
     ``0.2`` per class that uses it (each needs its imports changed, tests
-    included), ``5`` if it is public API and ``2`` per framework wiring entry.
+    included), ``5`` if it is public API, ``3`` if an internal class moves into
+    an exported package (it would become public API) and ``2`` per framework
+    wiring entry.
     The per-user term makes widely used classes (like ``ParseContext`` in a
     code base) expensive to move: in practice they are the last to move."""
     users = rf.users.get(c, len(rf.dependents(c)))
     cost = 1.0 + 4.0 * (1.0 - aff) + 0.2 * users
     if rf.api.get(c):
         cost += 5.0
+    elif rf.is_exported(target) and not rf.is_exported(rf.package[c]):
+        cost += 3.0
     cost += 2.0 * rf.wiring.get(c, 0)
     return round(cost, 3)
 
