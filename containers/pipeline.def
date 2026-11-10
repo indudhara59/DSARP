@@ -7,7 +7,7 @@ From: ubuntu:24.04
 #   module load tools Apptainer
 #   export APPTAINER_CACHEDIR=$PC2PFS/<project>/apptainer-cache
 #   export APPTAINER_TMPDIR=$PC2PFS/<project>/apptainer-tmp
-#   apptainer build dsarp.sif containers/pipeline.def
+#   APPTAINER_BIND= apptainer build dsarp.sif containers/pipeline.def   (no bind mounts while building)
 #
 # Run:
 #   apptainer exec dsarp.sif dsarp --version
