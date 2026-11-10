@@ -20,8 +20,11 @@ mkdir -p logs
 module reset >/dev/null 2>&1 || true
 module load tools Apptainer
 # make the parallel file system (data, checkouts, results) visible inside the container
-export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}"
+case ",${APPTAINER_BIND:-}," in
+  *",${DSARP_BIND:-/scratch},"*) ;;
+  *) export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}" ;;
+esac
 
-BIND=""
-if [ -n "${DSARP_DATA:-}" ]; then BIND="--bind $DSARP_DATA"; fi
+BIND=""  # /scratch is bound above
+:
 apptainer exec $BIND "$SIF" python3 -m pytest -q

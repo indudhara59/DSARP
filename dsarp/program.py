@@ -99,7 +99,8 @@ def build_model(cfg: RepoConfig, repo: str | Path, out: str | Path, *, include_t
     types["exported_package"] = [
         _exported(pkg, exported_by_module.get(bm)) for pkg, bm in zip(types["package"], types["build_module"])]
     vis_public = types["visibility"] == "public"
-    outer_public = types["outer"].map(dict(zip(types["type"], vis_public))).fillna(True)
+    outer_vis = dict(zip(types["type"], vis_public))
+    outer_public = pd.Series([bool(outer_vis.get(o, True)) for o in types["outer"]], index=types.index)
     types["api"] = vis_public & outer_public & types["exported_package"] & ~types["is_test"] & ~types["is_generated"]
     types["protected"] = [_protected(n, cfg.protected_api) for n in types["type"]]
 

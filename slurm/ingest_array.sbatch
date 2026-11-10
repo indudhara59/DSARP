@@ -31,9 +31,12 @@ mkdir -p logs "$RESULTS"
 module reset >/dev/null 2>&1 || true
 module load tools Apptainer
 # make the parallel file system (data, checkouts, results) visible inside the container
-export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}"
+case ",${APPTAINER_BIND:-}," in
+  *",${DSARP_BIND:-/scratch},"*) ;;
+  *) export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}" ;;
+esac
 
 echo "[$(date -Is)] ingest $CONFIG on $(hostname)"
-apptainer exec --bind "$DSARP_DATA" "$SIF" \
+apptainer exec "$SIF" \
     dsarp ingest "$CONFIG" --data-root "$DSARP_DATA" --out "$RESULTS/$NAME"
 echo "[$(date -Is)] done"

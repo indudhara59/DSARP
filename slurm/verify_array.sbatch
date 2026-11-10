@@ -35,7 +35,10 @@ mkdir -p logs "$HOME/.m2"
 module reset >/dev/null 2>&1 || true
 module load tools Apptainer
 # make the parallel file system (data, checkouts, results) visible inside the container
-export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}"
+case ",${APPTAINER_BIND:-}," in
+  *",${DSARP_BIND:-/scratch},"*) ;;
+  *) export APPTAINER_BIND="${APPTAINER_BIND:+$APPTAINER_BIND,}${DSARP_BIND:-/scratch}" ;;
+esac
 
 ARGS=(--workdir "$DSARP_WORK" --build "${DSARP_BUILD:-none}" --max-compiles "${DSARP_MAX_COMPILES:-30}"
       --memory "${DSARP_HEAP:-8g}")
