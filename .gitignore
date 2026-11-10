@@ -27,3 +27,6 @@ logs/
 # Secrets
 .env
 *.key
+
+# web interface state (jobs, logs, settings)
+.dsarp-web/
