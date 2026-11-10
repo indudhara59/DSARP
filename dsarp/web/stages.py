@@ -113,7 +113,8 @@ STAGES: tuple[Stage, ...] = (
                    Option("max_compiles", "--max-compiles", "int", 30, "compiler runs for delta debugging", minimum=1),
                    Option("memory", "--memory", "text", "4g", "Java heap")),
           resources=Resources(8, "32G", "12:00:00")),
-    Stage("evaluate", "Evaluate", "9", "Compare hybrid, solver, search, NSGA-II, random (+ ablation)",
+    Stage("evaluate", "Compare", "9", "Optional, for the thesis: run baselines (solver only, search only, "
+          "NSGA-II, random, fixed affinity) on the same groups to compare with DSARP",
           outputs=("evaluation/summary.csv",), requires=("triage",), optional_requires=("learn",),
           options=(Option("groups", "--groups", "int", 20, "groups to compare", minimum=1),
                    Option("time_limit", "--time-limit", "float", 300.0, "solver seconds", minimum=1),
