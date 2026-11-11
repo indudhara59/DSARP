@@ -217,19 +217,78 @@ class Simulator:
                     "fan_out": int(d.loc[central, "fan_out"])}
         return self.target_status(df, smell_type, core, central)
 
-    def run(self, ops: list[dict], smell_type: str, core: list[str], central: str = "") -> Simulation:
+    # ------------------------------------------------------------------ extra smell types
+
+    def extra_measure(self, snap, kind: str, core: list[str], central: str, ctx: dict | None) -> dict:
+        """Target measure for god components, feature concentration, scattered functionality and
+        class-level cycles and hubs (see :mod:`.extra`), on a snapshot of the code."""
+        from . import extra as ex
+        ctx = ctx or {}
+        if kind == "god_component":
+            return ex.god_size(snap, central)
+        if kind == "feature_concentration":
+            return ex.lcc(snap, central)
+        if kind == "scattered_functionality":
+            return ex.scattered(snap, ctx.get("methods", []), set(ctx.get("concern_classes", [])))
+        if kind == "cyclic_dependency:class":
+            return ex.class_cycle(snap, core)
+        if kind == "hub_like_dependency:class":
+            return ex.class_hub(snap, central)
+        raise ValueError(f"no measure for {kind}")
+
+    def _extra_new_smells(self, snap, base_snap, ops: list[dict], kind: str) -> list[dict]:
+        """Feature concentration in packages a restructuring plan touches (new or worse than before)."""
+        from . import extra as ex
+        if kind not in EXTRA_KINDS:
+            return []
+        out = []
+        touched = {o.get("to_package") for o in ops if o["op"] == "move_class"} | \
+                  {o.get("from_package") for o in ops if o["op"] == "move_class"}
+        for p in sorted(touched - {None}):
+            a = ex.lcc(snap, p)
+            if not a["present"]:
+                continue
+            b = ex.lcc(base_snap, p)
+            if not b["present"] or a["lcc"] > b["lcc"] + 1e-9:
+                if kind == "feature_concentration" and p == (ops[0].get("from_package") if ops else None):
+                    continue                      # the target itself is measured as the target
+                out.append({"type": "feature_concentration", "central": p,
+                            "metrics": {"lcc": a["lcc"], "before": b["lcc"] if b["classes"] else None}})
+        return out
+
+    def base_snapshot(self):
+        if getattr(self, "_base_snap", None) is None:
+            from .extra import extra
+            self._base_snap = extra(self.rf).snapshot(self.base_state, [])
+        return self._base_snap
+
+    def run(self, ops: list[dict], smell_type: str, core: list[str], central: str = "",
+            ctx: dict | None = None) -> Simulation:
         st = apply(self.rf, ops, self.base_state)
         g_after = st.package_graph()
         after = det.detect(g_after, None, class_counts(self.rf, st), None, self.th)
-        before_t = self.target_measure(self.base_graph, self.base, smell_type, core, central)
-        after_t = self.target_measure(g_after, after, smell_type, core, central)
+        extra_new: list[dict] = []
+        if smell_type in EXTRA_KINDS:
+            from .extra import extra
+            snap = extra(self.rf).snapshot(st, ops)
+            base_snap = self.base_snapshot()
+            before_t = self.extra_measure(base_snap, smell_type, core, central, ctx)
+            after_t = self.extra_measure(snap, smell_type, core, central, ctx)
+            extra_new = self._extra_new_smells(snap, base_snap, ops, smell_type)
+        else:
+            before_t = self.target_measure(self.base_graph, self.base, smell_type, core, central)
+            after_t = self.target_measure(g_after, after, smell_type, core, central)
         after_keys = {_key(r): r for _, r in after.iterrows()}
+        # a new sub-package created by a split counts as the package it was split from
+        alias = {o["to_package"]: o["from_package"] for o in ops if o["op"] == "move_class" and o.get("new_package")}
         new = []
         for k, r in after_keys.items():
             if k in self.base_keys:
                 continue
             if k[0] == "cyclic_dependency":
-                mem = sorted(r["members"])
+                mem = sorted({alias.get(p, p) for p in r["members"]})
+                if len(mem) < 2 or ("cyclic_dependency", frozenset(mem)) in self.base_keys:
+                    continue
                 pairs = {frozenset((a, b)) for i, a in enumerate(mem) for b in mem[i + 1:]}
                 fresh = pairs - self.base_pairs
                 if not fresh:
@@ -249,8 +308,18 @@ class Simulator:
                 removed.append({"type": k[0], "size": len(r["members"]), "largest_part_left": left})
             else:
                 removed.append({"type": k[0], "central": k[1]})
+        if smell_type in EXTRA_KINDS:
+            # the target smell's own type is measured as the target, not as a side effect
+            own = smell_type.split(":")[0]
+            new = [n for n in new if not (n["type"] == own and n.get("central") == central)]
+            removed = [r for r in removed if not (r["type"] == own and r.get("central") == central)]
+        new += extra_new
         return Simulation(not after_t["present"], before_t, after_t, new, removed,
                           dict(Counter(self.base["type"])), dict(Counter(after["type"])))
+
+
+EXTRA_KINDS = {"god_component", "feature_concentration", "scattered_functionality",
+               "cyclic_dependency:class", "hub_like_dependency:class"}
 
 
 def unstable_targets(rf: RepoFacts, central: str, th: det.Thresholds = det.PIPELINE) -> list[str]:

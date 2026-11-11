@@ -122,7 +122,7 @@ class Harness:
         return rows
 
     def run(self, groups: int = 10) -> pd.DataFrame:
-        sel = self.planner.select(groups * 5)
+        sel = self.planner.select(groups * 5, original_only=True)
         rows = []
         done = 0
         used = []
