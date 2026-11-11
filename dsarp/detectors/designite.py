@@ -182,6 +182,7 @@ def load(inp: DetectorInput) -> DetectorResult:
                                     related=related, attributes=attrs, source=str(arch_file), description=desc))
             elif stype is SmellType.SCATTERED_FUNCTIONALITY:
                 members = _list_after("scattered", desc) or [pkg]
+                attrs["reported_by"] = [pkg]          # the package whose methods use the members together
                 smells.append(Smell(new_id(), TOOL, stype, Level.PACKAGE, members, attributes=attrs,
                                     source=str(arch_file), description=desc))
             elif stype is SmellType.FEATURE_CONCENTRATION:

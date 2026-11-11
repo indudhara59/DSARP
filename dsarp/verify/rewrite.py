@@ -321,6 +321,11 @@ class Rewriter:
         for k, op in merged.items():
             self._extract_interface(op, repo, res, clients[k])
         moves = [o for o in ops if o["op"] == "move_class"]
+        for o in list(moves):                  # test classes move with the class they test
+            for t in o.get("tests", []):
+                if t in self.type_file and self.type_pkg.get(t) == o["from_package"]:
+                    moves.append({"op": "move_class", "class": t, "from_package": o["from_package"],
+                                  "to_package": o["to_package"]})
         if moves:
             self._apply_moves(repo, moves, res)
         return res

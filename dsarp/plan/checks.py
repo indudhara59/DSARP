@@ -104,13 +104,23 @@ class Checker:
     def _move_class(self, o: dict, chk: OpCheck, after: dict[str, str]) -> None:
         rf, c = self.rf, o["class"]
         new_pkg, old_pkg = o["to_package"], o["from_package"]
+        new = bool(o.get("new_package"))
         if rf.protected.get(c):
             chk.block("class is protected by the configuration")
         if c[len(old_pkg) + 1:] in rf.simple_names.get(new_pkg, set()):
             chk.block(f"a class with the same name already exists in {new_pkg}")
-        if rf.module.get(c) not in rf.pkg_modules.get(new_pkg, set()):
+        if not new and rf.module.get(c) not in rf.pkg_modules.get(new_pkg, set()):
             chk.block(f"{new_pkg} is in another build module")
-        if not rf.visible_after_move(c, new_pkg):
+        if new:
+            if new_pkg in rf.pkg_classes:
+                chk.block(f"{new_pkg} already exists")
+            other_modules = any(rf.module.get(u) != rf.module.get(c) for u in rf.dependents(c))
+            exported = rf.is_exported(old_pkg)
+            chk.edits.append({"edit": "create_package", "package": new_pkg, "module": rf.module.get(c, "")})
+            if other_modules and exported:
+                chk.warn(f"other modules use the class: export the new package {new_pkg} "
+                         "(OSGi Export-Package or module-info) like its parent package")
+        elif not rf.visible_after_move(c, new_pkg):
             chk.block(f"{new_pkg} is not exported, but other modules use the class (OSGi/module visibility)")
         # used by others: package-private elements of c used from another package
         widen = set()
@@ -151,6 +161,25 @@ class Checker:
         if same_pkg_users:
             chk.edits.append({"edit": "add_import", "count": len(same_pkg_users),
                               "classes": self._limit(same_pkg_users)})
+        moved_tests = set(o.get("tests", []))
+        test_users -= moved_tests
+        if moved_tests:
+            chk.edits.append({"edit": "move_tests", "count": len(moved_tests), "classes": self._limit(moved_tests),
+                              "package": new_pkg})
+            moving = {c} | moved_tests | {x for x, p in after.items() if p == new_pkg}
+            tw = set()
+            for t in moved_tests:
+                h2 = self.by_source.get(t)
+                if h2 is None:
+                    continue
+                for tgt_t, target in zip(h2["tt"], h2["target"]):
+                    if tgt_t in moving or self.type_pkg.get(tgt_t) != old_pkg or self._pkg(tgt_t, after) != old_pkg:
+                        continue
+                    if self._vis(target) in NON_PUBLIC:
+                        tw.add(target)
+            if tw:
+                chk.warn(f"the moved tests use {len(tw)} non-public elements of {old_pkg}")
+                chk.edits.append({"edit": "make_public", "elements": self._limit(tw)})
         if test_users:
             chk.edits.append({"edit": "update_tests", "count": len(test_users), "classes": self._limit(test_users)})
         wiring = self.wiring.get(c, [])

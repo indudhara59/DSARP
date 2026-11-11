@@ -28,6 +28,11 @@ TITLES = {
     "cyclic_dependency": "Cyclic dependency",
     "unstable_dependency": "Unstable dependency",
     "hub_like_dependency": "Hub-like dependency",
+    "god_component": "God component",
+    "feature_concentration": "Feature concentration",
+    "scattered_functionality": "Scattered functionality",
+    "cyclic_dependency:class": "Cyclic dependency between classes",
+    "hub_like_dependency:class": "Hub-like class",
 }
 EXPLAINER = ("You explain refactoring plans to Java developers. Be concrete and brief. Use only the facts given; "
              "do not invent classes, packages or numbers.")
@@ -65,11 +70,28 @@ def _step_text(rf: RepoFacts, i: int, op: dict, eff: dict) -> list[str]:
     o = op["op"]
     chk = op.get("check", {})
     lines = []
-    if o == "move_class":
+    if o == "move_class" and op.get("new_package"):
+        lines.append(f"### Step {i}: Move class `{op['class']}` to the new package `{op['to_package']}`")
+        lines.append(f"- **From** `{op['from_package']}` **to** `{op['to_package']}` (new, module "
+                     f"`{op.get('module', '')}`)")
+        if op.get("reason"):
+            lines.append(f"- **Why:** {op['reason']}")
+        if op.get("tests"):
+            lines.append(f"- **Tests moved with it:** {_names(op['tests'])}")
+    elif o == "move_class":
         lines.append(f"### Step {i}: Move class `{op['class']}`")
         lines.append(f"- **From** `{op['from_package']}` **to** `{op['to_package']}` "
-                     f"(module `{op.get('module', '')}`, affinity {op.get('affinity', 0):.2f})")
+                     f"(module `{op.get('module', '')}`, affinity {op.get('affinity') or 0:.2f})")
+        if op.get("reason"):
+            lines.append(f"- **Why:** {op['reason']}")
         lines.append(f"- **Evidence:** {evidence(rf, op['class'], op['from_package'], op['to_package'])}")
+        if op.get("tests"):
+            lines.append(f"- **Tests moved with it:** {_names(op['tests'])}")
+    elif o == "move_member":
+        lines.append(f"### Step {i}: Move static member `{op['member']}`")
+        lines.append(f"- **From** class `{op['from_class']}` **to** class `{op['to_class']}`")
+        if op.get("reason"):
+            lines.append(f"- **Why:** {op['reason']}")
     elif o == "delete_member":
         lines.append(f"### Step {i}: Delete deprecated member `{op['member']}`")
         lines.append("- It is deprecated and has no callers in production code.")
@@ -131,10 +153,32 @@ def _edit_text(e: dict) -> str:
         return f"`{e['class']}` implements `{e['interface']}` (`{e['file']}`)"
     if k == "replace_type_uses":
         return f"in `{e['class']}` replace uses of `{e['from']}` by `{e['to']}`"
+    if k == "create_package":
+        return f"create the package `{e['package']}` (module `{e.get('module', '')}`)"
+    if k == "move_tests":
+        return f"move {e['count']} test classes to `{e['package']}` too: {_names(e['classes'])}"
+    if k == "move_member_text":
+        return f"cut `{e['member']}` from `{e['from_file']}` and paste it into `{e['to_file']}`"
+    if k == "update_references":
+        return f"call it as `{e['to']}` in {e['count']} classes: {_names(e['classes'])}"
     return str(e)
 
 
 def _target_text(t: str, before: dict, after: dict) -> str:
+    done = " (**removed**)" if not after.get("present") else ""
+    if t == "god_component":
+        return f"{before.get('classes')} classes (limit {before.get('limit')}) -> {after.get('classes')}{done}"
+    if t == "feature_concentration":
+        return (f"{before.get('sets')} unrelated sets in {before.get('classes')} classes, LCC {before.get('lcc')} -> "
+                f"{after.get('sets')} sets in {after.get('classes')} classes, LCC {after.get('lcc')} "
+                f"(limit 0.2){done}")
+    if t == "scattered_functionality":
+        return (f"{before.get('methods')} methods use the concern spread over several packages -> "
+                f"{after.get('methods')}{done}")
+    if t == "cyclic_dependency:class":
+        return (f"{before.get('core_classes_on_cycle')} classes on the cycle, {before.get('dependencies_to_cut')} "
+                f"dependencies to cut -> {after.get('core_classes_on_cycle')} classes, "
+                f"{after.get('dependencies_to_cut')} to cut{done}")
     if t == "cyclic_dependency":
         return (f"{before.get('core_packages_on_cycle')} packages on the cycle, "
                 f"{before.get('dependencies_to_cut')} dependencies to cut -> "
@@ -182,10 +226,11 @@ def review(text: str, allowed: set[str]) -> list[str]:
 def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
     out = {"group_id": group["group_id"], "markdown": "", "summary": None, "summary_rejected": []}
     t = group["type"]
-    lines = [f"## {group['rank']}. {TITLES.get(t, t)}: {group['group_id']}", ""]
-    lines.append(f"- **Packages:** {_names(group.get('core', []), 12)}")
+    kind = group.get("kind", t)
+    lines = [f"## {group['rank']}. {TITLES.get(kind, t)}: {group['group_id']}", ""]
+    lines.append(f"- **{'Classes' if kind.endswith(':class') else 'Packages'}:** {_names(group.get('core', []), 12)}")
     if group.get("central"):
-        lines.append(f"- **Central package:** `{group['central']}`")
+        lines.append(f"- **Central {'class' if kind.endswith(':class') else 'package'}:** `{group['central']}`")
     if group.get("skipped"):
         lines += [f"- **Not planned:** {group['skipped']}", ""]
     plan = next((p for p in group.get("plans", []) if p["name"] == group.get("recommended")), None)
@@ -200,7 +245,7 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
     sim = plan["simulation"]
     lines.append(f"- **Recommended plan:** `{plan['name']}` with {len(plan['operations'])} steps, "
                  f"score {plan['score']}, change cost {plan['change_cost']}")
-    lines.append(f"- **Effect:** {_target_text(t, sim['target_before'], sim['target_after'])}")
+    lines.append(f"- **Effect:** {_target_text(group.get('kind', t), sim['target_before'], sim['target_after'])}")
     if sim["new_smells"]:
         lines.append("- **Side effects (new):** " + "; ".join(
             f"{s['type']} {s.get('central') or ', '.join(s.get('packages', [])[:4])}" for s in sim["new_smells"]))
