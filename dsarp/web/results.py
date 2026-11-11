@@ -86,14 +86,23 @@ def overview(res: Path) -> dict:
         rows = []
         for g in gs:
             rec = next((p for p in g.get("plans", []) if p.get("name") == g.get("recommended")), None)
-            rows.append({"group_id": g.get("group_id"), "type": g.get("type"), "rank": g.get("rank"),
+            rows.append({"group_id": g.get("group_id"), "type": g.get("type"), "kind": g.get("kind") or g.get("type"),
+                         "rank": g.get("rank"),
                          "priority": g.get("priority"), "recommended": g.get("recommended"),
                          "score": rec.get("score") if rec else None, "benefit": rec.get("benefit") if rec else None,
                          "cost": rec.get("change_cost") if rec else None,
                          "new_smells": rec.get("new_smells") if rec else None,
                          "operations": len(rec.get("operations", [])) if rec else 0,
                          "skipped": g.get("skipped")})
-        out["plans"] = {"groups": rows, "planned": sum(1 for r in rows if r["recommended"]),
+        by_kind: dict = {}
+        for r in rows:
+            k = by_kind.setdefault(r["kind"], {"groups": 0, "full": 0, "partial": 0, "none": 0})
+            k["groups"] += 1
+            if r["recommended"]:
+                k["full" if (r["benefit"] or 0) >= 1 else "partial"] += 1
+            else:
+                k["none"] += 1
+        out["plans"] = {"groups": rows, "planned": sum(1 for r in rows if r["recommended"]), "by_kind": by_kind,
                         "backends": plans.get("backends"), "weights": plans.get("weights"),
                         "by_plan": dict(Counter(r["recommended"] for r in rows if r["recommended"]))}
     ver = _csv(res / "verify" / "summary.csv")

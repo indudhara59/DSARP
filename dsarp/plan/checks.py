@@ -225,6 +225,40 @@ class Checker:
             chk.warn("client is public API: changing parameter or return types is an API change")
 
 
+def _move_member_check(self, o: dict, chk: OpCheck, after: dict[str, str]) -> None:
+    rf = self.rf
+    src, dst = o["from_class"], o["to_class"]
+    members = o.get("members", [o["member"]])
+    if rf.protected.get(src) or rf.protected.get(dst):
+        chk.block("class is protected by the configuration")
+    if rf.kind.get(dst) != "class":
+        chk.block(f"{dst} is not a class")
+    for m in members:
+        info = rf.member_info.get(m)
+        if info is None or not info["static"]:
+            chk.block(f"{m} is not a static member")
+            continue
+        if info["api"]:
+            chk.warn(f"{m.split('#')[1]} is public API: keep a deprecated delegate in {src} for one release")
+    if rf.package.get(src) != rf.package.get(dst) and any(
+            rf.member_info.get(m, {}).get("visibility") != "public" for m in members):
+        chk.edits.append({"edit": "make_public", "elements": self._limit(
+            [m for m in members if rf.member_info.get(m, {}).get("visibility") != "public"])})
+    for m in members:
+        chk.edits.append({"edit": "move_member_text", "member": m, "from_file": self.files.get(src, ""),
+                          "to_file": self.files.get(dst, "")})
+    users = set(o.get("callers", []))
+    g = self.by_target.get(src)
+    if g is not None:
+        users |= {s for s, t in zip(g["st"], g["target"]) if t in set(members) and s != src}
+    if users:
+        chk.edits.append({"edit": "update_references", "count": len(users), "classes": self._limit(users),
+                          "to": dst.rsplit(".", 1)[-1]})
+
+
+Checker._move_member = _move_member_check
+
+
 def summarise(checks: list[OpCheck]) -> dict:
     status = "ok"
     if any(c.status == "blocked" for c in checks):

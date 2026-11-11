@@ -235,7 +235,9 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
         lines += [f"- **Not planned:** {group['skipped']}", ""]
     plan = next((p for p in group.get("plans", []) if p["name"] == group.get("recommended")), None)
     if plan is None:
-        if not group.get("skipped"):
+        if group.get("no_plan_reason"):
+            lines.append(f"- **No plan recommended:** {group['no_plan_reason']}")
+        elif not group.get("skipped"):
             lines.append("- **No plan recommended:** no candidate removed part of the smell without causing "
                          "more harm (new smells, cost) than benefit. Candidates are listed in `summary.csv`.")
         if group.get("quick_fixes"):

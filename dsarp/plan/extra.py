@@ -60,14 +60,17 @@ class Snapshot:
     method_targets: dict[str, set[str]]       # production method -> top-level classes it accesses
     method_owner: dict[str, str]              # production method -> top-level owner (after the plan)
     generated: set[str] = field(default_factory=set)
+    test_edges: set[tuple[str, str]] = field(default_factory=set)   # test top-level class -> production class
 
     def package_types(self, pkg: str) -> list[str]:
         return [t for t, p in self.type_pkg.items() if p == pkg and t not in self.generated]
 
-    def class_graph(self) -> nx.DiGraph:
+    def class_graph(self, with_tests: bool = False) -> nx.DiGraph:
         g = nx.DiGraph()
         g.add_nodes_from(self.prod_top)
         g.add_edges_from((s, t) for s, t in self.class_edges if s != t)
+        if with_tests:
+            g.add_edges_from((s, t) for s, t in self.test_edges if s != t)
         return g
 
 
@@ -101,6 +104,15 @@ class ExtraFacts:
                 owner[src] = s_top
         self.method_targets = dict(mt)
         self.method_owner = owner
+        # dependencies of test classes on production classes (Arcan counts them for hub-like classes)
+        self.test_rows: dict[str, list[tuple[str, str, str]]] = defaultdict(list)   # prod top -> [(test, target, kind)]
+        te = set()
+        for st, tt, tgt, kind in zip(d["source_type"], d["target_type"], d["target"], d["kind"]):
+            a, b = self.top.get(st), self.top.get(tt)
+            if a in self.tests and self.top.get(a) == a and b in rf.prod:
+                te.add((a, b))
+                self.test_rows[b].append((a, tgt, kind))
+        self.test_edges = te
         # which test classes test which production class (same package, by name or by exclusive use)
         self._tests_of: dict[str, list[str]] | None = None
 
@@ -153,12 +165,24 @@ class ExtraFacts:
         for iface, p in st.interfaces.items():
             type_pkg[iface] = p
         owner = dict(self.method_owner)
+        moves = {}
         for o in ops or []:
             if o["op"] == "move_member":
-                owner[o["member"]] = o["to_class"]
+                for m in o.get("members", [o["member"]]):
+                    owner[m] = o["to_class"]
+                    moves[m] = o["to_class"]
+        test_edges = self.test_edges
+        if moves:
+            olds = {self.top.get(m.split("#")[0], m.split("#")[0]) for m in moves}
+            test_edges = {e for e in test_edges if e[1] not in olds}
+            for c in olds:
+                for t, tgt, kind in self.test_rows.get(c, []):
+                    b = moves.get(tgt, c)
+                    if kind != "import" or b == c:
+                        test_edges.add((t, b))
         return Snapshot(type_pkg, {**self.top, **{i: i for i in st.interfaces}}, self.tests,
                         set(st.package) | set(st.interfaces), set(st.edges), self.rel_pairs,
-                        self.method_targets, owner, self.generated)
+                        self.method_targets, owner, self.generated, test_edges)
 
 
 def snapshot_from_compile(res, production_files: set[str]) -> Snapshot:
@@ -172,19 +196,21 @@ def snapshot_from_compile(res, production_files: set[str]) -> Snapshot:
     d = res.deps
     st = d["source"].str.split("#").str[0]
     tt = d["target"].str.split("#").str[0]
-    edges, rel, mt, owner = set(), set(), defaultdict(set), {}
+    edges, rel, mt, owner, te = set(), set(), defaultdict(set), {}, set()
     for src, s, tg, kind in zip(d["source"], st, tt, d["kind"]):
         a, b = top.get(s), top.get(tg)
         if a is None or b is None:
             continue
         if kind in REL_KINDS and s != tg and s in type_pkg and tg in type_pkg:
             rel.add(frozenset((s, tg)))
+        if a in tests and top.get(a) == a and b in prod_top:
+            te.add((a, b))
         if a in prod_top and b in prod_top and a != b:
             edges.add((a, b))
             if kind in ACCESS_KINDS and "#" in src:
                 mt[src].add(b)
                 owner[src] = a
-    return Snapshot(type_pkg, top, tests, prod_top, edges, rel, dict(mt), owner)
+    return Snapshot(type_pkg, top, tests, prod_top, edges, rel, dict(mt), owner, set(), te)
 
 
 # ---------------------------------------------------------------------- measures
@@ -238,12 +264,13 @@ def class_cycle(snap: Snapshot, core: list[str]) -> dict:
         n = len(comp & core_set)
         if n > best:
             best, members = n, sorted(comp & core_set)
-    return {"present": best >= 2, "core_classes_on_cycle": best, "classes": members,
+    return {"present": best >= 2, "core_classes_on_cycle": best, "on_cycle": members,
             "dependencies_to_cut": feedback_arcs(g, core_set)}
 
 
-def class_hub(snap: Snapshot, hub: str, th: det.Thresholds = det.PIPELINE) -> dict:
-    g = snap.class_graph()
+def class_hub(snap: Snapshot, hub: str, th: det.Thresholds = det.ARCAN_LIKE) -> dict:
+    """Arcan's hub-like class rule on the class graph with test classes as clients (as Arcan counts them)."""
+    g = snap.class_graph(with_tests=True)
     if hub not in g:
         return {"present": False, "note": "class no longer exists"}
     h = det.hubs(g, th)

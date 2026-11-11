@@ -348,6 +348,14 @@ async function viewResults(name) {
     <div class="card"><h2>Does learning help? <small>5-fold top-1 accuracy</small></h2>${bars(Object.entries(ev).map(([k, v], i) => ({label: names[k] || k, value: v.top1, color: i ? "var(--c7)" : "var(--c1)"})), {max: 1, fmt: v => num(v, 3), lw: 140})}
     <div class="small muted" style="margin-top:8px">On real historical moves only: ${Object.entries(ev).map(([k, v]) => `${names[k] || k} ${num(v.move_top1, 2)}`).join(" · ")}</div></div></div>`;
   }
+  if (A.plan && pl.by_kind) {
+    const kinds = Object.entries(pl.by_kind).sort((a, b) => b[1].groups - a[1].groups);
+    h += `<div class="card sec"><h2>Recommendations per smell type <small>groups planned in this run</small></h2>${bars(kinds.map(([k, v]) => ({
+      label: k.replace(/_/g, " ").replace(":class", " (class)"), value: 0, total: `${v.full + v.partial}/${v.groups}`,
+      segs: [{value: v.full, color: "var(--c2)", label: "smell removed"}, {value: v.partial, color: "var(--c5)", label: "partly removed"},
+             {value: v.none, color: "var(--c7)", label: "no safe plan"}]})), {lw: 230, fmt: v => v})}
+      ${legend([["smell removed", "var(--c2)"], ["partly removed", "var(--c5)"], ["no safe plan (reason on the group page)", "var(--c7)"]])}</div>`;
+  }
   if (A.plan) {
     const rows = (pl.groups || []).filter(r => r.recommended);
     const planNames = [...new Set(rows.map(r => r.recommended))], pc = Object.fromEntries(planNames.map((p, i) => [p, PAL[i % PAL.length]]));
@@ -358,7 +366,7 @@ async function viewResults(name) {
   if (A.plan) {
     const vb = Object.fromEntries(ver.map(v => [v.group_id, v]));
     h += `<div class="card sec"><h2>All groups <small>click a row for the step-by-step recommendation</small></h2><div style="overflow:auto"><table><tr><th>rank</th><th>group</th><th>type</th><th>priority</th><th>recommended</th><th>steps</th><th>score</th><th>new smells</th><th>verified</th></tr>
-    ${(pl.groups || []).map(r => { const v = vb[r.group_id]; return `<tr class="click" data-act="go" data-href="#/p/${n}/group/${esc(r.group_id)}"><td>${int(r.rank)}</td><td class="mono">${esc(r.group_id)}</td><td>${esc((r.type || "").replace(/_/g, " "))}</td><td>${num(r.priority, 3)}</td>
+    ${(pl.groups || []).map(r => { const v = vb[r.group_id]; return `<tr class="click" data-act="go" data-href="#/p/${n}/group/${esc(r.group_id)}"><td>${int(r.rank)}</td><td class="mono">${esc(r.group_id)}</td><td>${esc((r.kind || r.type || "").replace(/_/g, " ").replace(":class", " (class)"))}</td><td>${num(r.priority, 3)}</td>
       <td>${r.recommended ? `<span class="tag pu">${esc(r.recommended)}</span>` : `<span class="small muted" title="${esc(r.skipped || "")}">${esc(String(r.skipped || "no plan").slice(0, 70))}</span>`}</td><td>${r.recommended ? r.operations : ""}</td><td>${r.recommended ? num(r.score, 3) : ""}</td><td>${r.recommended ? num(r.new_smells, 0) : ""}</td>
       <td>${v ? (v.compiles ? `<span class="tag s-done">compiles</span>` : `<span class="tag s-failed">fails</span>`) + (v.target_removed ? ` <span class="tag s-done">removed</span>` : "") : ""}</td></tr>`; }).join("")}</table></div></div>`;
   }
@@ -408,6 +416,14 @@ function compareSection(ov, n) {
 }
 
 /* ---------- group detail ---------- */
+function targetText(t) {
+  const parts = [["core_packages_on_cycle", "packages on cycle"], ["core_classes_on_cycle", "classes on cycle"],
+    ["dependencies_to_cut", "dependencies to cut"], ["classes", "classes"], ["sets", "unrelated sets"], ["lcc", "LCC"],
+    ["methods", "scattered methods"], ["fan_in", "fan-in"], ["fan_out", "fan-out"]];
+  const out = parts.filter(([k]) => t && t[k] != null).map(([k, l]) => `<b>${esc(t[k])}</b> ${l}`);
+  if (t && t.less_stable) out.push(`<b>${t.less_stable.length}</b> less stable dependencies`);
+  return out.join(", ") || "–";
+}
 function md(text) {
   const lines = esc(text).split("\n"); let out = "", inList = false, inTable = false;
   const inline = s => s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -435,7 +451,8 @@ async function viewGroup(name, gid) {
   <div class="row" style="margin:6px 0 4px"><h1 class="mono" style="font-size:20px">${esc(gid)}</h1><span class="tag pu">${esc((P.type || T.type || "").replace(/_/g, " "))}</span>${P.rank ? `<span class="chip">rank <b>${P.rank}</b></span>` : ""}</div>
   <div class="small muted">${pk.map(x => `<code>${esc(x)}</code>`).join(" ")}</div>
   <div style="margin-top:10px">${[["severity", num(T.severity)], ["PageRank", num(T.pagerank, 3)], ["changes", T.changes], ["class edges", T.class_edges], ["smells merged", T.smells], ["tools", T.tools], ["priority", num(T.priority, 3)]].filter(x => x[1] != null && x[1] !== "–").map(([k, v]) => `<span class="chip">${k} <b>${esc(v)}</b></span>`).join("")}</div>`;
-  if (!plans.length) { h += `<div class="empty sec">No plan for this group. ${esc(P.skipped || "")}</div>`; $("#view").innerHTML = h; return; }
+  if (!plans.length || !plans.some(p => (p.operations || []).length)) { h += `<div class="empty sec">No plan for this group. ${esc(P.skipped || P.no_plan_reason || "")}</div>`; $("#view").innerHTML = h; return; }
+  if (!P.recommended && (P.no_plan_reason || P.skipped)) h += `<div class="card sec small"><b>No plan recommended.</b> ${esc(P.no_plan_reason || P.skipped)}</div>`;
   h += `<div class="grid g2 sec"><div class="card"><h2>Plans compared</h2><table><tr><th>plan</th><th>steps</th><th>cost</th><th>benefit</th><th>new</th><th>score</th></tr>${plans.map(p => `<tr${p.name === P.recommended ? ' style="background:var(--a-bg)"' : ""}><td>${esc(p.name)} ${p.name === P.recommended ? '<span class="tag pu">recommended</span>' : ""}</td><td>${(p.operations || []).length}</td><td>${num(p.change_cost, 1)}</td><td>${num(p.benefit)}</td><td>${num(p.new_smells, 0)}</td><td><b>${num(p.score, 3)}</b></td></tr>`).join("")}</table></div>
   <div class="card"><h2>Score breakdown</h2>${(() => { const w = S.info && P ? ({new_smell: .25, side_removed: .05, cost: .3}) : {}; return plans.filter(p => p.score != null).map(p => {
     const parts = [["benefit", p.benefit || 0, "var(--c2)"], ["other smells removed", w.side_removed * (p.other_smells_removed || 0), "var(--c4)"], ["new smells", -w.new_smell * (p.new_smells || 0), "var(--c3)"], ["cost", -w.cost * (p.cost_normalised || 0), "var(--c5)"]];
@@ -445,11 +462,15 @@ async function viewGroup(name, gid) {
   if (rec) {
     const sim = rec.simulation || {}, b = sim.target_before || {}, a = sim.target_after || {};
     h += `<div class="sec"><h2>Recommended steps <small>${esc(rec.name)} · ${(rec.operations || []).length} steps · ${esc(rec.backend || "")}</small></h2>
-    <div class="chips"><span class="chip">before: <b>${esc(b.core_packages_on_cycle ?? "–")}</b> packages on cycle, <b>${esc(b.dependencies_to_cut ?? "–")}</b> dependencies to cut</span><span class="chip">after: <b>${esc(a.core_packages_on_cycle ?? "–")}</b>, <b>${esc(a.dependencies_to_cut ?? "–")}</b> ${sim.target_removed ? '<span class="tag s-done">removed</span>' : ""}</span>
+    <div class="chips"><span class="chip">before: ${targetText(b)}</span><span class="chip">after: ${targetText(a)} ${sim.target_removed ? '<span class="tag s-done">removed</span>' : ""}</span>
     ${(sim.new_smells || []).map(s => `<span class="chip" style="background:var(--r-bg);color:var(--r-ink)">new: ${esc(s.type)} ${esc(short(s.central || ""))}</span>`).join("")}</div>
     ${(rec.operations || []).map((o, i) => { const ck = o.check || {}; return `<div class="step"><div class="row"><b>Step ${i + 1}</b><span class="tag pu">${esc((o.op || "").replace(/_/g, " "))}</span>${ck.status ? `<span class="tag ${ck.status === "ok" ? "s-done" : ck.status === "blocked" ? "s-failed" : "s-pending"}">${esc(ck.status)}</span>` : ""}${o.affinity != null ? `<span class="small muted">affinity ${num(o.affinity)}</span>` : ""}${o.module ? `<span class="small muted">module ${esc(o.module)}</span>` : ""}</div>
-      <div class="ft">${esc(o.class || o.member || o.element || o.provider || "")}</div>
-      ${o.from_package || o.to_package ? `<div class="ft"><span class="faint">from</span> ${esc(o.from_package || "")}<span class="arrow">→</span><span class="faint">to</span> <b>${esc(o.to_package || "")}</b></div>` : ""}
+      <div class="ft">${esc(o.class || (o.members ? o.members.map(x => x.split("#")[1]).join(", ") : "") || o.member || o.element || o.provider || o.client || "")}</div>
+      ${o.from_package || o.to_package ? `<div class="ft"><span class="faint">from</span> ${esc(o.from_package || "")}<span class="arrow">→</span><span class="faint">to</span> <b>${esc(o.to_package || "")}</b>${o.new_package ? ' <span class="tag s-pending">new package</span>' : ""}</div>` : ""}
+      ${o.from_class || o.to_class ? `<div class="ft"><span class="faint">from class</span> ${esc(o.from_class || "")}<span class="arrow">→</span><span class="faint">to class</span> <b>${esc(o.to_class || "")}</b></div>` : ""}
+      ${o.op === "extract_interface" ? `<div class="ft"><span class="faint">client</span> ${esc(o.client)}<span class="arrow">→</span><span class="faint">interface for</span> <b>${esc(o.provider)}</b></div>` : ""}
+      ${o.reason ? `<div class="small muted">${esc(o.reason)}</div>` : ""}
+      ${(o.tests || []).length ? `<div class="small muted">tests moved with it: ${o.tests.map(t => `<code>${esc(short(t))}</code>`).join(" ")}</div>` : ""}
       ${(ck.edits || []).length ? `<ul class="small" style="margin:6px 0 0;padding-left:18px">${ck.edits.map(e => `<li>${esc((e.edit || "").replace(/_/g, " "))}${e.count ? ` in ${e.count}` : ""}${e.new_file ? ` → <code>${esc(e.new_file)}</code>` : ""}${e.classes ? `<div class="small muted">${e.classes.map(c => `<code>${esc(short(c))}</code>`).join(" ")}</div>` : ""}</li>`).join("")}</ul>` : ""}
       ${(ck.notes || []).map(x => `<div class="small" style="color:var(--w);margin-top:4px">${esc(x)}</div>`).join("")}</div>`; }).join("")}</div>`;
   }

@@ -10,7 +10,7 @@ least change; an LLM is used only where new code is needed and to explain the
 result; every plan is checked in memory and then built, tested and
 re-analysed on the real code.
 
-> **Status: all six phases implemented, plus a web interface (version 0.7.0).**
+> **Status: all phases implemented, a web interface and plans for every smell type (version 0.8.0).**
 > Stages 0-9: detector import, program model, triage, learned affinity,
 > constraint plans, tree search with an optional language model, simulation and
 > checks, step-by-step reports, verification on the real code (apply, compile,
@@ -231,6 +231,46 @@ public, imports and tests to update, wiring files, API warnings, blocked
 operations) and the plans are **ranked** (benefit − new smells − cost; the
 weights are in `dsarp/plan/run.py`). A plan is recommended only if it is not
 blocked and has a positive score.
+
+**All smell types.** Every smell type the detectors report gets a model of
+its own; all of them share the simulation, the checks, the score and the
+verification:
+
+| Smell (detector) | Refactoring DSARP recommends | "Fixed" means (checked in the simulation and on the compiled code) |
+|---|---|---|
+| Cyclic dependency, packages (Arcan, Designite) | move classes, remove unused imports, delete dead code, extract interfaces | no cycle among the group's packages |
+| Unstable dependency (Arcan, Designite) | the same operations | no dependency on a less stable package |
+| Hub-like package (Arcan) | the same operations | fan-in or fan-out at the threshold |
+| God component (Designite) | **split the package**: whole sets of related classes (with nested classes and tests) move to related packages or new sub-packages; *strict* plans keep every new package cohesive, *relaxed* ones may not (shown as a side effect) | at most 30 classes |
+| Feature concentration (Designite) | **split the package by concern**: unrelated sets move to the package they are related to or to a new cohesive sub-package | Designite's LCC (sets of related classes / classes) at most 0.2 |
+| Scattered functionality (Designite) | **gather the concern**: the classes that the reporting packages use together move into one of the concern's packages (every target is tried) | no package has more than one method using the concern spread over packages |
+| Cyclic dependency, classes (Arcan) | remove unused imports, delete dead code, extract interfaces, **move static members** (pull the used static members into the caller, or push static members to the class they use) | no cycle among the group's classes |
+| Hub-like class (Arcan) | the same class-level operations | Arcan's rule (fan-in and fan-out above the median and balanced, test classes counted as clients) no longer holds |
+
+New sub-packages are named after the most frequent word of their classes'
+names (`org.apache.tika.sax.text`), test classes move with the class they
+test, and a split never closes a new package cycle (existing cycles may stay:
+the new sub-packages count as their parent when cycles are compared). Moved
+static members keep working: overloads move together, private helpers come
+along, callers (tests included, static imports, subclasses using inherited
+statics) are redirected and the imports the moved code needs are added.
+
+When no plan is safe, the report says why with numbers. For Tika's
+`AutoDetectParser` (hub-like class): *"by Arcan's rule the class stops being a
+hub if fan-in drops from 34 to 1, fan-out from 25 to 4, or the two differ by at
+least 25% of 59; the verifiable operations can remove at most 8 incoming and 1
+outgoing dependencies, which is not enough (the rest are uses of its type:
+fields, parameters, subclassing, construction)"*. Such smells need design
+changes (new shared abstractions, splitting a class's responsibilities) that
+DSARP cannot verify automatically.
+
+Feature concentration follows Designite's published rule (Sharma, Singh and
+Spinellis 2020): with field types, `extends` and `implements` as relations
+DSARP reproduces 336 of the 537 related sets Designite reports for Tika.
+Designite's exact filter for scattered functionality is not published (the
+published rule agrees poorly with its output), so DSARP measures the concern
+directly. Hub-like classes use Arcan's median rule with test classes as
+clients, which reproduces all 8 hub-like classes Arcan reports for Tika.
 
 **Tree search (stage 5b).** When the solver finds no good plan (no positive
 score, new smells, or a large optimality gap), a Monte Carlo tree search
@@ -488,14 +528,18 @@ Detector output of the study repositories is not stored in this repository.
 5. **Learning, search and explanations** (stages 4, 5b, 7): learned affinity from code and history moves, tree search with optional language model, step-by-step reports with a reviewed summary. Done.
 6. **Verification, report and evaluation** (stages 8-9): apply plans to the code, compile, delta debugging, re-detection on the compiled code, optional build/tests/detectors, patches and OpenRewrite recipes, HTML report, evaluation against NSGA-II, random, solver-only and search-only with ablation and weight sensitivity. Done.
 7. **Web interface**: run stages locally, in the container or as Slurm jobs, live flowchart and logs, results dashboard and group pages. Done.
+8. **All smell types**: god components and feature concentration (package splits), scattered functionality (gathering a concern), class cycles and hub-like classes (static member moves, interfaces, imports, dead code). Done.
 
 Known limitations: the compile check compiles the whole repository at once,
 so it does not see build-module boundaries (use `--build`); history moves are
-described by the code at the analysed commit; class-level smells (class
-cycles, god classes) are triaged but not yet planned; an extracted interface
-fails to compile when the client passes the object on as the concrete type
-(the verification drops such steps); only deprecated members that nothing
-calls any more (tests included) are deleted.
+described by the code at the analysed commit; an extracted interface fails to
+compile when the client passes the object on as the concrete type, and a
+moved static member fails when code reaches it in a way the rewriter does not
+see (reflection, generated code): the verification drops such steps; only
+deprecated members that nothing calls any more (tests included) are deleted;
+smells that need new abstractions or splitting a class's responsibilities get
+a reason instead of a plan; the evaluation baselines (NSGA-II, random, search
+only) cover the package cycle, unstable and hub-like types only.
 
 ## Project layout
 
@@ -515,6 +559,10 @@ dsarp/            Python package
   program.py      stage 2: program model, class and package graphs
   detect.py       in-memory smell detection (cycles, hubs, unstable, god components)
   calibrate.py    agreement with Arcan/Designite, threshold search
+  plan/extra.py   snapshots and measures for god components, feature concentration, scattered
+                  functionality, class cycles and hub-like classes
+  plan/restructure.py  package splits and gathering a scattered concern
+  plan/classlevel.py   class-level plans: static member moves, interfaces, imports, dead code
   web/            web interface (standard library only): server, stages, jobs, results, static/
   triage.py       stage 3: decisions, groups, priority, scope, quick fixes
   plan/           stages 5a and 6

@@ -364,6 +364,14 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
             ext_deps[(unit_of[t], "in", ps)] += 1
     info.update({"units": len(units), "movable_units": len(opts), "candidate_packages": targets,
                  "new_parts": len(new_parts)})
+    single = sum(1 for i, u in enumerate(units) if not u["fixed"] and 5 * u["sets"] > u["n"])
+    homeless = sum(1 for i, u in enumerate(units) if not u["fixed"] and not opts.get(i) and 5 * u["sets"] > u["n"])
+    info["why_none"] = (
+        f"{pkg} has {info['sets']} sets of related classes in {info['classes']} classes (LCC {info['lcc']}); "
+        f"{single} sets are too small to form a cohesive package of their own (Designite needs at most one set "
+        f"per 5 classes) and {homeless} of them have no related package to move to, so every placement would "
+        "give the receiving package the same smell; a fix needs new relations between the classes (shared "
+        "abstractions), which is a design change DSARP cannot verify")
 
     def options(i):
         if i not in opts:

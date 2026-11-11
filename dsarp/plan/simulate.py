@@ -56,6 +56,10 @@ def apply(rf: RepoFacts, ops: list[dict], state: State | None = None) -> State:
     """Apply plan operations to a copy of ``state`` (default: the current code)."""
     st = state or initial_state(rf)
     st = State(dict(st.package), set(st.edges), dict(st.interfaces))
+    moves = {m: o["to_class"] for o in ops if o["op"] == "move_member" for m in o.get("members", [o["member"]])}
+    if moves:
+        from .classlevel import apply_member_moves
+        st.edges = apply_member_moves(rf, st.edges, moves)
     deleted = {o["member"] for o in ops if o["op"] == "delete_member"}
     for o in ops:
         if o["op"] == "move_class":
@@ -241,6 +245,8 @@ class Simulator:
         from . import extra as ex
         if kind not in EXTRA_KINDS:
             return []
+        if kind.endswith(":class"):
+            return self._new_class_cycles(snap, ops)
         out = []
         touched = {o.get("to_package") for o in ops if o["op"] == "move_class"} | \
                   {o.get("from_package") for o in ops if o["op"] == "move_class"}
@@ -254,6 +260,33 @@ class Simulator:
                     continue                      # the target itself is measured as the target
                 out.append({"type": "feature_concentration", "central": p,
                             "metrics": {"lcc": a["lcc"], "before": b["lcc"] if b["classes"] else None}})
+        return out
+
+    def _new_class_cycles(self, snap, ops: list[dict]) -> list[dict]:
+        """Cycles between classes that a class-level plan creates (pairs of classes newly on one cycle)."""
+        if getattr(self, "_base_cls_scc", None) is None:
+            comp = {}
+            for i, c in enumerate(nx.strongly_connected_components(self.base_snapshot().class_graph())):
+                for n in c:
+                    comp[n] = i
+            self._base_cls_scc = comp
+        base = self._base_cls_scc
+        touched = set()
+        for o in ops:
+            for k in ("from_class", "to_class", "client", "provider", "class", "owner"):
+                if o.get(k):
+                    touched.add(o[k])
+            touched |= set(o.get("callers", []))
+        out = []
+        for c in nx.strongly_connected_components(snap.class_graph()):
+            if len(c) < 2 or not c & touched:
+                continue
+            groups = defaultdict(list)
+            for n in c:
+                groups[base.get(n, ("new", n))].append(n)
+            if len(groups) > 1:            # classes that were not on one cycle before now are
+                out.append({"type": "cyclic_dependency", "level": "class", "classes": sorted(c)[:20],
+                            "size": len(c)})
         return out
 
     def base_snapshot(self):

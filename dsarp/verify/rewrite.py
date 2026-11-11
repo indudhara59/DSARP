@@ -247,11 +247,21 @@ class Rewriter:
         self._write(repo / path, body)
         res.created.append(path)
         res.created_types.append(iface)
-        # provider implements the interface
+        # provider implements the interface (with the provider's type parameters, if it has any)
         p = repo / provider_file
         lines = self._read(p)
         pname = op["provider"].rsplit(".", 1)[-1]
         i = self._decl_line(lines, int(self.type_line.get(op["provider"], 1)) - 1, pname, "type")
+        tp_full, tp_names = "", ""
+        if i is not None:
+            j0 = i
+            while j0 < len(lines) and "{" not in lines[j0]:
+                j0 += 1
+            tp_full, tp_names = self._type_params(" ".join(lines[i: j0 + 1]), pname)
+        if tp_full:
+            body_text = "\n".join(body).replace(f"public interface {simple} {{", f"public interface {simple}{tp_full} {{")
+            _write_text(repo / path, body_text)
+        iface_ref = iface + tp_names
         if i is not None:
             j = i
             while j < len(lines) and "{" not in lines[j]:
@@ -260,9 +270,9 @@ class Rewriter:
                 head = " ".join(lines[i: j + 1])
                 if re.search(r"\bimplements\b", head):
                     k = next(x for x in range(i, j + 1) if "implements" in lines[x])
-                    lines[k] = re.sub(r"\bimplements\b", f"implements {iface},", lines[k], count=1)
+                    lines[k] = re.sub(r"\bimplements\b", f"implements {iface_ref},", lines[k], count=1)
                 else:
-                    lines[j] = lines[j].replace("{", f"implements {iface} {{", 1)
+                    lines[j] = lines[j].replace("{", f"implements {iface_ref} {{", 1)
             self._write(p, lines)
             res.changed.add(provider_file)
         # clients use the interface instead of the provider
@@ -301,6 +311,12 @@ class Rewriter:
                 f = self.type_file.get(op["class"])
                 if f:
                     edits[f].append(("remove_import", 10 ** 9, op["import"], ""))
+        # methods behind an extracted interface implement a public interface method: they must be public
+        for op in ops:
+            if op["op"] == "extract_interface":
+                for m in op.get("methods", []):
+                    if self.member_lines.get(m) and self._member_visibility(m) != "public":
+                        self.widen(m, edits)
         # moved classes used from other packages must be public
         for op in ops:
             if op["op"] == "move_class" and self._type_visibility(op["class"]) != "public":
@@ -320,6 +336,9 @@ class Rewriter:
                 clients[k].append(op["client"])
         for k, op in merged.items():
             self._extract_interface(op, repo, res, clients[k])
+        for op in ops:                         # static members move after the line edits (found by declaration)
+            if op["op"] == "move_member":
+                self._move_members(repo, op, res)
         moves = [o for o in ops if o["op"] == "move_class"]
         for o in list(moves):                  # test classes move with the class they test
             for t in o.get("tests", []):
@@ -329,6 +348,244 @@ class Rewriter:
         if moves:
             self._apply_moves(repo, moves, res)
         return res
+
+    # ------------------------------------------------------------------ move static members
+
+    def _statics_of(self, cls: str) -> set[str]:
+        if not hasattr(self, "_statics"):
+            m = self.model.members
+            st = m[m["static"].astype(str).str.lower().isin(["true", "1"]) & m["kind"].isin(["method", "field"])]
+            self._statics: dict[str, set[str]] = defaultdict(set)
+            for owner, name in zip(st["owner"], st["name"]):
+                self._statics[owner].add(name)
+        return self._statics.get(cls, set())
+
+    @staticmethod
+    def _member_span(text: str, lines: list[str], decl: int, kind: str) -> tuple[int, int]:
+        """First and last line (0-based) of the member declared on line ``decl`` (comments and annotations above
+        included); the end is found by matching braces outside strings and comments."""
+        offs = [0]
+        for ln in lines:
+            offs.append(offs[-1] + len(ln) + 1)
+        i, n, depth, opened = offs[decl], len(text), 0, False
+        end = n - 1
+        while i < n:
+            c = text[i]
+            if text.startswith("//", i):
+                j = text.find("\n", i)
+                i = n if j == -1 else j
+                continue
+            if text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                i = n if j == -1 else j + 2
+                continue
+            if text.startswith('"""', i):
+                j = text.find('"""', i + 3)
+                i = n if j == -1 else j + 3
+                continue
+            if c in "\"'":
+                j = i + 1
+                while j < n and text[j] != c and text[j] != "\n":
+                    j += 2 if text[j] == "\\" else 1
+                i = j + 1
+                continue
+            if c == "{":
+                depth += 1
+                opened = True
+            elif c == "}":
+                depth -= 1
+                if depth == 0 and opened and kind == "method":
+                    end = i
+                    break
+            elif c == ";" and depth == 0 and (kind == "field" or not opened):
+                end = i
+                break
+            i += 1
+        last = next(k for k in range(len(offs) - 1) if offs[k + 1] > end)
+        first = decl
+        while first > 0 and (lines[first - 1].strip().startswith(("*", "/**", "@", "//")) or
+                             lines[first - 1].strip() == "*/"):
+            first -= 1
+        return first, last
+
+    def _move_members(self, repo: Path, op: dict, res: ApplyResult) -> None:
+        src, dst = op["from_class"], op["to_class"]
+        members = op.get("members", [op["member"]])
+        sf, df = self.type_file.get(src), self.type_file.get(dst)
+        if not sf or not df or not (repo / sf).exists() or not (repo / df).exists():
+            res.notes.append(f"move_member: file of {src} or {dst} not found")
+            return
+        src_pkg, dst_pkg = self.type_pkg[src], self.type_pkg[dst]
+        s_simple, d_simple = src.rsplit(".", 1)[-1], dst.rsplit(".", 1)[-1]
+        same_pkg = src_pkg == dst_pkg
+        names = {self.member_name[m] for m in members if m in self.member_name}
+        fields = {self.member_name[m] for m in members if self.member_kind.get(m) == "field"}
+        text = _read_text(repo / sf)
+        lines = text.split("\n")
+        spans = []
+        for m in members:
+            name, kind = self.member_name.get(m), self.member_kind.get(m, "method")
+            line = self.member_lines.get(m, (None, None))[0]
+            pat = re.compile(r"\bstatic\b[^;={]*\b" + re.escape(name) + (r"\s*\(" if kind == "method" else r"\s*(=|;|,)"))
+            hits = [i for i, ln in enumerate(lines) if pat.search(ln)]
+            if not hits:
+                res.notes.append(f"move_member: declaration of {m} not found")
+                return
+            decl = min(hits, key=lambda i: abs(i - (int(line) - 1 if line == line and line else 0)))
+            spans.append(self._member_span(text, lines, decl, kind))
+        spans = sorted(set(spans))
+        merged = []
+        for a_, b_ in spans:
+            if merged and a_ <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b_))
+            else:
+                merged.append((a_, b_))
+        blocks = [lines[a_: b_ + 1] for a_, b_ in merged]
+        for a_, b_ in reversed(merged):
+            del lines[a_: b_ + 1]
+        # visibility of the moved members and qualification of what stays behind
+        stay = self._statics_of(src) - names
+        moved_lines = []
+        for blk in blocks:
+            out = []
+            for ln in blk:
+                if any(re.search(r"\b" + re.escape(nm) + r"\b", ln) for nm in names) and re.search(r"\bstatic\b", ln) \
+                        and not ln.strip().startswith(("*", "/", "@")):
+                    if re.search(r"\bprivate\b", ln):
+                        ln = re.sub(r"\bprivate\s+", "" if same_pkg else "public ", ln, count=1)
+                    elif not same_pkg and not re.search(r"\bpublic\b", ln):
+                        ln = self._make_public(ln)
+                for nm in stay:
+                    ln = re.sub(r"(?<![\w.$])" + re.escape(nm) + r"(?=\s*\(|\b)", f"{s_simple}.{nm}", ln) \
+                        if not ln.strip().startswith(("*", "/")) else ln
+                out.append(ln)
+            moved_lines += [""] + out
+        moved_lines = self._redirect("\n".join(moved_lines), src, dst, names, inside_src=False).split("\n")
+        moved_code = _strip_comments_and_strings("\n".join(moved_lines))
+        # write the source class (callers inside it now call the destination)
+        src_text = "\n".join(lines)
+        src_text = self._redirect(src_text, src, dst, names, inside_src=True, fields=fields)
+        if not same_pkg and re.search(r"(?<![\w.$])" + re.escape(d_simple) + r"\.", _strip_comments_and_strings(src_text)) \
+                and not _imports(src_text, dst) and not _imports_simple(src_text, d_simple):
+            src_text = _add_imports(src_text, [dst])
+        _write_text(repo / sf, "\n".join(_drop_unused_imports(src_text.split("\n"))))
+        res.changed.add(sf)
+        # paste into the destination class with the imports the moved code needs
+        dtext = self._redirect(_read_text(repo / df), src, dst, names, inside_src=False)
+        dtext = re.sub(r"(?<![\w.$])" + re.escape(d_simple) + r"\.(?=(" + "|".join(map(re.escape, names)) + r")\b)",
+                       "", dtext) if names else dtext
+        dl = dtext.split("\n")
+        close = max(i for i, ln in enumerate(dl) if ln.strip().startswith("}"))
+        dl[close:close] = moved_lines
+        dtext = "\n".join(dl)
+        need = []
+        for m_ in re.finditer(r"^\s*import\s+(static\s+)?([\w.]+)\.(\w+|\*)\s*;", text, re.M):
+            simple = m_.group(3)
+            fq = f"{'static ' if m_.group(1) else ''}{m_.group(2)}.{simple}"
+            if simple != "*" and re.search(r"(?<![\w$])" + re.escape(simple) + r"\b", moved_code) \
+                    and not re.search(r"^\s*import\s+" + re.escape(fq) + r"\s*;", dtext, re.M):
+                if m_.group(1) or not _imports_simple(dtext, simple):
+                    need.append(fq)
+        if not same_pkg:
+            for t_, p_ in self.type_pkg.items():
+                if p_ == src_pkg and self.top.get(t_) == t_:
+                    simple = t_.rsplit(".", 1)[-1]
+                    if re.search(r"(?<![\w.$])" + re.escape(simple) + r"\b", moved_code) and not _imports(dtext, t_) \
+                            and not _imports_simple(dtext, simple):
+                        need.append(t_)
+        if need:
+            dtext = _add_imports(dtext, sorted(set(need)))
+        _write_text(repo / df, dtext)
+        res.changed.add(df)
+        # every other file that calls the moved members (subclasses may use them unqualified)
+        sub_files = set()
+        todo = [src]
+        while todo:
+            for sub in self.subtypes.get(todo.pop(), ()):
+                if self.type_file.get(sub) and self.type_file[sub] not in sub_files:
+                    sub_files.add(self.type_file[sub])
+                    todo.append(sub)
+        for f in self.java_files:
+            if f in (sf, df):
+                continue
+            path = repo / f
+            if not path.exists():
+                continue
+            t0 = _read_text(path)
+            if s_simple not in t0 and f not in sub_files:
+                continue
+            t1 = self._redirect(t0, src, dst, names, inside_src=f in sub_files, fields=fields)
+            if t1 != t0:
+                pkg = self.file_pkg.get(f, "")
+                if pkg != dst_pkg and re.search(r"(?<![\w.$])" + re.escape(d_simple) + r"\.",
+                                                _strip_comments_and_strings(t1)) \
+                        and not _imports(t1, dst) and not _imports_simple(t1, d_simple):
+                    t1 = _add_imports(t1, [dst])
+                _write_text(path, "\n".join(_drop_unused_imports(t1.split("\n"))))
+                res.changed.add(f)
+        res.notes.append(f"moved {len(members)} static members of {src} to {dst}")
+
+    @staticmethod
+    def _redirect(text: str, src: str, dst: str, names: set[str], inside_src: bool,
+                  fields: set[str] | None = None) -> str:
+        """Point uses of the moved members to the new class (qualified, static imports, and unqualified uses
+        inside the old class)."""
+        s_simple, d_simple = src.rsplit(".", 1)[-1], dst.rsplit(".", 1)[-1]
+        for nm in sorted(names, key=len, reverse=True):
+            n_ = re.escape(nm)
+            text = re.sub(r"(?<![\w$])" + re.escape(src) + r"\." + n_ + r"\b", f"{dst}.{nm}", text)
+            text = re.sub(r"^(\s*import\s+static\s+)" + re.escape(src) + r"\." + n_ + r"\s*;",
+                          r"\g<1>" + dst + "." + nm + ";", text, flags=re.M)
+            text = re.sub(r"(?<![\w.$])" + re.escape(s_simple) + r"\." + n_ + r"\b", f"{d_simple}.{nm}", text)
+            if inside_src:
+                out = []
+                for ln in text.split("\n"):
+                    if not ln.lstrip().startswith(("*", "//", "/*", "import")):
+                        ln = re.sub(r"(?<![\w.$])" + n_ + r"(?=\s*\()", f"{d_simple}.{nm}", ln)
+                        if nm in (fields or ()):
+                            ln = re.sub(r"(?<![\w.$\"])" + n_ + r"\b(?!\s*\()", f"{d_simple}.{nm}", ln)
+                    out.append(ln)
+                text = "\n".join(out)
+            elif re.search(r"^\s*import\s+static\s+" + re.escape(src) + r"\.\*\s*;", text, re.M) and \
+                    re.search(r"(?<![\w.$])" + n_ + r"\b", _strip_comments_and_strings(text)):
+                text = _add_imports(text, [f"static {dst}.{nm}"])
+        return text
+
+    def _member_visibility(self, m: str) -> str:
+        if not hasattr(self, "_mvis"):
+            mm = self.model.members
+            self._mvis = dict(zip(mm["member"], mm["visibility"]))
+        return str(self._mvis.get(m, "public"))
+
+    @staticmethod
+    def _type_params(head: str, name: str) -> tuple[str, str]:
+        """Type parameters declared after ``name`` in a class header: (with bounds, names only)."""
+        m = re.search(r"\b" + re.escape(name) + r"\s*<", head)
+        if not m:
+            return "", ""
+        i, depth = m.end() - 1, 0
+        for j in range(i, len(head)):
+            if head[j] == "<":
+                depth += 1
+            elif head[j] == ">":
+                depth -= 1
+                if depth == 0:
+                    full = head[i: j + 1]
+                    parts, d, cur = [], 0, ""
+                    for ch in full[1:-1]:
+                        if ch == "<":
+                            d += 1
+                        elif ch == ">":
+                            d -= 1
+                        if ch == "," and d == 0:
+                            parts.append(cur)
+                            cur = ""
+                        else:
+                            cur += ch
+                    parts.append(cur)
+                    names = [re.match(r"\s*(\w+)", x_).group(1) for x_ in parts if re.match(r"\s*(\w+)", x_)]
+                    return full, "<" + ", ".join(names) + ">"
+        return "", ""
 
     def _type_visibility(self, cls: str) -> str:
         t = self.model.types
