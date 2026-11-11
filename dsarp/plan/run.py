@@ -1,7 +1,9 @@
 """Stage 5a + 6: plan the top groups of a repository, check, simulate, rank, write.
 
 For every selected group (package cycles, unstable dependencies and hub-like
-packages; other types are reported with their quick fixes only):
+packages here; god components, feature concentration, scattered
+functionality, class cycles and hub-like classes in :mod:`.restructure` and
+:mod:`.classlevel`, with the same simulation, checks and score):
 
 1. build the group facts and the plan model (:mod:`.facts`, :mod:`.generator`);
 2. solve the trade-off plans (most removed, least change, alternative, budgets);
@@ -311,7 +313,7 @@ class Planner:
         t0 = time.time()
         plans, info, ctx = self._extra_plans(row, kind, scope)
         out["solve_seconds"] = round(time.time() - t0, 1)
-        out.update({"model": {k: v for k, v in info.items() if k != "skipped"}, "context": ctx})
+        out.update({"model": {k: v for k, v in info.items() if k not in ("skipped", "why_none")}, "context": ctx})
         if info.get("skipped"):
             out["skipped"] = info["skipped"]
             return out
@@ -342,9 +344,12 @@ class Planner:
                         and (best is None or entry["score"] > best[0]):
                     best = (entry["score"], "repaired")
         out["recommended"] = best[1] if best else None
-        if best is None and plans and not any(p.operations for p in plans):
-            out["skipped"] = info.get("why_none") or ("no change that the planner can make reduces the smell "
-                                                      "without breaking a rule (see the model information)")
+        if best is None:
+            if plans and not any(p.operations for p in plans):
+                out["skipped"] = info.get("why_none") or ("no change that the planner can make reduces the smell "
+                                                          "without breaking a rule (see the model information)")
+            elif info.get("why_none"):
+                out["no_plan_reason"] = info["why_none"]
         return out
 
     def plan_group(self, row) -> dict:

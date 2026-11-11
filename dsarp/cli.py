@@ -410,7 +410,9 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--model", help="program model folder (default: <results>/model)")
     pl.add_argument("--out", help="output folder (default: <results>/plans)")
     pl.add_argument("--groups", type=int, default=10, help="number of top supported groups to plan (default: 10)")
-    pl.add_argument("--types", help="comma-separated smell types (default: all supported)")
+    pl.add_argument("--types", help="comma-separated smell types (default: all supported): cyclic_dependency, "
+                    "unstable_dependency, hub_like_dependency, god_component, feature_concentration, "
+                    "scattered_functionality; class-level ones as cyclic_dependency:class, hub_like_dependency:class")
     pl.add_argument("--time-limit", type=float, default=60.0, help="solver seconds per plan (default: 60)")
     pl.add_argument("--backend", default="auto", choices=["auto", "cpsat", "highs"],
                     help="solver (auto: CP-SAT if installed, else HiGHS)")
