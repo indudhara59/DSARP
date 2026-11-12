@@ -244,6 +244,12 @@ class App:
             for i, r in res_of.items():
                 if not _valid_resources(r):
                     raise ValueError(f"{i}: resources must be CPUs 1-128, memory like 32G, time like 12:00:00")
+        net = [i for i in ids if BY_ID[i].network]
+        if net and mode == "slurm":
+            if len(ids) > 1:
+                raise ValueError(f"{BY_ID[net[0]].label} needs the internet and runs on this machine, not as a "
+                                 "Slurm job: run it on its own (after Plan, before Verify)")
+            mode = "container" if self.settings.sif else "local"
         chain = uuid.uuid4().hex[:8] if len(ids) > 1 else None
         with self.lock:
             busy = [j for j in self.jobs.list(name) if j.status in ACTIVE and j.stage in ids]

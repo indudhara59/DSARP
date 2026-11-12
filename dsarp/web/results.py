@@ -11,22 +11,46 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from ..outcome import ORDER, outcome, reason
+
 csv.field_size_limit(1 << 26)
 
 
-def _json(p: Path):
+_CACHE: dict[tuple[str, str], tuple[tuple[float, int], object]] = {}
+
+
+def _cached(p: Path, kind: str, load):
+    """Parse a file once and keep it until it changes (result files can be large)."""
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        st = p.stat()
+    except OSError:
         return None
+    key, stamp = (kind, str(p)), (st.st_mtime, st.st_size)
+    hit = _CACHE.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    val = load(p)
+    _CACHE[key] = (stamp, val)
+    return val
+
+
+def _json(p: Path):
+    def load(q):
+        try:
+            return json.loads(q.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    return _cached(p, "json", load)
 
 
 def _csv(p: Path) -> list[dict]:
-    try:
-        with p.open(newline="", encoding="utf-8") as fh:
-            return list(csv.DictReader(fh))
-    except OSError:
-        return []
+    def load(q):
+        try:
+            with q.open(newline="", encoding="utf-8") as fh:
+                return list(csv.DictReader(fh))
+        except OSError:
+            return []
+    return _cached(p, "csv", load) or []
 
 
 def _num(v, cast=float):
@@ -83,6 +107,8 @@ def overview(res: Path) -> dict:
     if plans:
         out["available"]["plan"] = True
         gs = plans.get("groups", [])
+        vj = _json(res / "verify" / "verification.json") or []
+        vmap = {v.get("group_id"): v for v in vj if isinstance(v, dict)}
         rows = []
         for g in gs:
             rec = next((p for p in g.get("plans", []) if p.get("name") == g.get("recommended")), None)
@@ -93,7 +119,10 @@ def overview(res: Path) -> dict:
                          "cost": rec.get("change_cost") if rec else None,
                          "new_smells": rec.get("new_smells") if rec else None,
                          "operations": len(rec.get("operations", [])) if rec else 0,
-                         "skipped": g.get("skipped")})
+                         "skipped": g.get("skipped"), "reason": reason(g),
+                         "outcome": outcome(g, vmap.get(g.get("group_id"))),
+                         "verified_plan": (vmap.get(g.get("group_id")) or {}).get("plan"),
+                         "fallback_from": (vmap.get(g.get("group_id")) or {}).get("fallback_from")})
         by_kind: dict = {}
         for r in rows:
             k = by_kind.setdefault(r["kind"], {"groups": 0, "full": 0, "partial": 0, "none": 0})
@@ -104,7 +133,10 @@ def overview(res: Path) -> dict:
                 k["none"] += 1
         out["plans"] = {"groups": rows, "planned": sum(1 for r in rows if r["recommended"]), "by_kind": by_kind,
                         "backends": plans.get("backends"), "weights": plans.get("weights"),
-                        "by_plan": dict(Counter(r["recommended"] for r in rows if r["recommended"]))}
+                        "by_plan": dict(Counter(r["recommended"] for r in rows if r["recommended"])),
+                        "outcomes": {k: v for k, v in sorted(Counter(r["outcome"] for r in rows).items(),
+                                                            key=lambda kv: ORDER.index(kv[0]))},
+                        "api_policy": plans.get("api_policy"), "frozen_classes": plans.get("frozen_classes")}
     ver = _csv(res / "verify" / "summary.csv")
     if ver:
         out["available"]["verify"] = True

@@ -32,6 +32,17 @@ from ..program import ProgramModel
 
 INVERTIBLE_KINDS = {"call", "param_type", "return_type", "field_type", "local_type", "type_ref", "import", "type_arg"}
 AFFINITY_WEIGHTS = {"structural": 0.6, "cochange": 0.3, "semantic": 0.1}
+
+# A class only moves to a package it relates to: the evidence (dependencies,
+# co-changes, names; fixed weights above) for the target must be at least
+# MIN_FIT and at least FIT_RATIO of the evidence for its current package.
+MIN_FIT = 0.05
+FIT_RATIO = 0.3
+# Public API that many classes use is not moved (policy "balanced"): moving it
+# breaks every user of the library outside the repository.
+CORE_API_MIN_USERS = 20
+CORE_API_PERCENTILE = 95
+API_POLICIES = ("balanced", "strict", "off")
 _CAMEL = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
 
 
@@ -86,9 +97,12 @@ class RepoFacts:
     cochange: dict[str, dict[str, int]]
     deletable: dict[str, dict] = field(default_factory=dict)
     users: dict[str, int] = field(default_factory=dict)   # classes (production and test) that use a class
+    ext_users: dict[str, int] = field(default_factory=dict)   # users in other build modules
+    frozen: dict[str, str] = field(default_factory=dict)      # class -> why it must not move
+    api_policy: str = "balanced"
 
     @classmethod
-    def build(cls, model: ProgramModel) -> "RepoFacts":
+    def build(cls, model: ProgramModel, api_policy: str = "balanced") -> "RepoFacts":
         t = model.types.copy()
         top = dict(zip(t["type"], t["top_level"]))
         tl = t[t["type"] == t["top_level"]]
@@ -138,7 +152,64 @@ class RepoFacts:
         allu = model.deps.assign(st=model.deps["source_type"].map(top), tt=model.deps["target_type"].map(top))
         allu = allu[allu["st"].notna() & (allu["st"] != allu["tt"])]
         f.users = allu.groupby("tt")["st"].nunique().astype(int).to_dict()
+        tl_mod = dict(zip(tl["type"], tl["build_module"].astype(str)))
+        allu = allu.assign(sm=allu["st"].map(tl_mod), tm=allu["tt"].map(tl_mod))
+        f.ext_users = allu[allu["sm"] != allu["tm"]].groupby("tt")["st"].nunique().astype(int).to_dict()
+        f.api_policy = api_policy
+        f.frozen = f._frozen(api_policy)
         return f
+
+    def _frozen(self, policy: str) -> dict[str, str]:
+        """Classes that plans must not move, with the reason.
+
+        ``balanced``: public API used by many classes (at least
+        ``CORE_API_MIN_USERS`` and in the top 5 % of the repository), such as
+        ``MediaType`` or ``ParseContext`` in Tika: moving them breaks every user
+        of the library. ``strict`` additionally freezes all public API used from
+        another build module. ``off`` freezes nothing (only ``protected_api``)."""
+        if policy not in API_POLICIES:
+            raise ValueError(f"api policy must be one of {API_POLICIES}")
+        out: dict[str, str] = {}
+        if policy == "off":
+            return out
+        vals = sorted(self.users.get(c, 0) for c in self.prod)
+        pct = vals[min(len(vals) - 1, int(len(vals) * CORE_API_PERCENTILE / 100))] if vals else 0
+        limit = max(CORE_API_MIN_USERS, pct)
+        for c in self.prod:
+            if not self.api.get(c):
+                continue
+            n, ext = self.users.get(c, 0), self.ext_users.get(c, 0)
+            if n >= limit:
+                out[c] = f"public API used by {n} classes ({ext} in other build modules)"
+            elif policy == "strict" and ext:
+                out[c] = f"public API used from {ext} classes in other build modules"
+        return out
+
+    def fixed(self, c: str) -> str | None:
+        """Why class ``c`` must stay where it is, or ``None`` if it may move."""
+        if self.protected.get(c):
+            return "protected by the configuration"
+        return self.frozen.get(c)
+
+    def evidence(self, c: str, pkg: str) -> float:
+        """Model-independent evidence that ``c`` belongs in ``pkg`` (fixed weights)."""
+        cache = self.__dict__.setdefault("_ev_cache", {})
+        key = (c, pkg)
+        if key not in cache:
+            f, w = self.features(c, pkg), AFFINITY_WEIGHTS
+            cache[key] = round(w["structural"] * f["structural"] + w["cochange"] * f["cochange"]
+                               + w["semantic"] * f["semantic"], 4)
+        return cache[key]
+
+    def fits(self, c: str, pkg: str) -> bool:
+        """Whether ``pkg`` is a sensible new home for ``c``: the class relates to it
+        (dependencies, co-changes or names) and not much less than to its current package."""
+        ev = self.evidence(c, pkg)
+        return ev >= MIN_FIT and ev >= FIT_RATIO * self.evidence(c, self.package[c])
+
+    def misfit_reason(self, c: str, pkg: str) -> str:
+        return (f"{c.rsplit('.', 1)[-1]} has little relation to {pkg} (evidence {self.evidence(c, pkg):.2f} "
+                f"vs {self.evidence(c, self.package[c]):.2f} for its current package)")
 
     # ------------------------------------------------------------ members
 
@@ -386,7 +457,7 @@ def group_facts(rf: RepoFacts, group_id: str, smell_type: str, scope: dict, max_
 
     movable: dict[str, list[tuple[str, float]]] = {}
     for c in ranked:
-        if rf.protected.get(c):
+        if rf.fixed(c):
             continue
         cur = rf.package[c]
         simple = c[len(cur) + 1:]
@@ -395,7 +466,8 @@ def group_facts(rf: RepoFacts, group_id: str, smell_type: str, scope: dict, max_
             other = k[1] if k[0] == c else k[0]
             q = rf.package[other]
             if q != cur and q in allowed_pkgs and rf.module[c] in rf.pkg_modules.get(q, set()) \
-                    and simple not in rf.simple_names.get(q, set()) and rf.visible_after_move(c, q):
+                    and simple not in rf.simple_names.get(q, set()) and rf.visible_after_move(c, q) \
+                    and rf.fits(c, q):
                 cands.add(q)
         scored = sorted(((q, rf.affinity(c, q)) for q in cands), key=lambda x: (-x[1], x[0]))[:max_targets]
         movable[c] = [(cur, rf.affinity(c, cur))] + scored

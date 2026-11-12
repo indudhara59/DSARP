@@ -105,8 +105,11 @@ class Checker:
         rf, c = self.rf, o["class"]
         new_pkg, old_pkg = o["to_package"], o["from_package"]
         new = bool(o.get("new_package"))
-        if rf.protected.get(c):
-            chk.block("class is protected by the configuration")
+        why = rf.fixed(c)
+        if why:
+            chk.block(f"class must not move: {why}")
+        elif not new and new_pkg in rf.pkg_classes and not rf.fits(c, new_pkg):
+            chk.warn(rf.misfit_reason(c, new_pkg))
         if c[len(old_pkg) + 1:] in rf.simple_names.get(new_pkg, set()):
             chk.block(f"a class with the same name already exists in {new_pkg}")
         if not new and rf.module.get(c) not in rf.pkg_modules.get(new_pkg, set()):

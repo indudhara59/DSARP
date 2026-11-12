@@ -163,6 +163,7 @@ def movable_group(rf: RepoFacts, owner: str, members: set[str]) -> set[str] | No
     ix = index(rf)
     if rf.kind.get(owner) != "class" or rf.protected.get(owner):
         return None
+    frozen_owner = bool(rf.frozen.get(owner))
     names = ix.statics.get(owner, {})
     todo, group = list(members), set()
     while todo:
@@ -173,6 +174,8 @@ def movable_group(rf: RepoFacts, owner: str, members: set[str]) -> set[str] | No
         if info is None or not info["static"] or info["kind"] not in ("method", "field") or info["override"] \
                 or info["protected"]:
             return None
+        if frozen_owner and info["visibility"] in ("public", "protected"):
+            return None                                          # part of a widely used public API
         name = m.split("#", 1)[1].split("(")[0]
         same = names.get(name, [])
         group.add(m)

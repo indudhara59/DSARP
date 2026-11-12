@@ -149,9 +149,9 @@ function header(pr, tab) {
 
 /* ---------- pipeline flowchart ---------- */
 const POS = {check: [100, 66], checkout: [100, 200], ingest: [100, 334], model: [310, 267], triage: [520, 190], learn: [520, 380],
-  plan: [735, 267], explain: [955, 86], verify: [955, 267], evaluate: [955, 448], report: [1165, 267]};
+  plan: [735, 267], explain: [955, 58], review: [955, 162], verify: [955, 267], evaluate: [955, 448], report: [1165, 267]};
 const EDGES = [["checkout", "model"], ["ingest", "model"], ["ingest", "triage"], ["model", "triage"], ["model", "learn"], ["checkout", "learn", 1],
-  ["triage", "plan"], ["learn", "plan", 1], ["plan", "explain"], ["plan", "verify"], ["triage", "evaluate"], ["learn", "evaluate", 1], ["plan", "report"], ["verify", "report", 1]];
+  ["triage", "plan"], ["learn", "plan", 1], ["plan", "explain"], ["plan", "review"], ["review", "verify", 1], ["plan", "verify"], ["triage", "evaluate"], ["learn", "evaluate", 1], ["plan", "report"], ["verify", "report", 1]];
 const COL = {done: ["var(--t-bg)", "var(--t)", "var(--t-ink)"], running: ["var(--b-bg)", "var(--b)", "var(--b-ink)"], pending: ["var(--w-bg)", "var(--w)", "var(--w-ink)"],
   queued: ["var(--w-bg)", "var(--w)", "var(--w-ink)"], failed: ["var(--r-bg)", "var(--r)", "var(--r-ink)"], lost: ["var(--r-bg)", "var(--r)", "var(--r-ink)"],
   cancelled: ["var(--soft)", "var(--faint)", "var(--mute)"], todo: ["var(--card)", "var(--line)", "var(--ink)"]};
@@ -348,13 +348,19 @@ async function viewResults(name) {
     <div class="card"><h2>Does learning help? <small>5-fold top-1 accuracy</small></h2>${bars(Object.entries(ev).map(([k, v], i) => ({label: names[k] || k, value: v.top1, color: i ? "var(--c7)" : "var(--c1)"})), {max: 1, fmt: v => num(v, 3), lw: 140})}
     <div class="small muted" style="margin-top:8px">On real historical moves only: ${Object.entries(ev).map(([k, v]) => `${names[k] || k} ${num(v.move_top1, 2)}`).join(" · ")}</div></div></div>`;
   }
-  if (A.plan && pl.by_kind) {
-    const kinds = Object.entries(pl.by_kind).sort((a, b) => b[1].groups - a[1].groups);
-    h += `<div class="card sec"><h2>Recommendations per smell type <small>groups planned in this run</small></h2>${bars(kinds.map(([k, v]) => ({
-      label: k.replace(/_/g, " ").replace(":class", " (class)"), value: 0, total: `${v.full + v.partial}/${v.groups}`,
-      segs: [{value: v.full, color: "var(--c2)", label: "smell removed"}, {value: v.partial, color: "var(--c5)", label: "partly removed"},
-             {value: v.none, color: "var(--c7)", label: "no safe plan"}]})), {lw: 230, fmt: v => v})}
-      ${legend([["smell removed", "var(--c2)"], ["partly removed", "var(--c5)"], ["no safe plan (reason on the group page)", "var(--c7)"]])}</div>`;
+  if (A.plan && pl.groups) {
+    const OC = [["removed", "var(--c2)"], ["reduced", "var(--c5)"], ["planned (not verified)", "var(--c1)"],
+                ["not applicable", "var(--c3)"], ["no effect", "#9a6b4f"], ["no safe plan", "var(--c7)"],
+                ["needs a design change", "var(--c6)"], ["not a smell at this commit", "var(--c4)"]];
+    const per = {};
+    for (const r of pl.groups) { const k = r.kind || r.type; (per[k] = per[k] || {groups: 0})[r.outcome] = ((per[k] || {})[r.outcome] || 0) + 1; per[k].groups++; }
+    const kinds = Object.entries(per).sort((a, b) => b[1].groups - a[1].groups);
+    const used = OC.filter(([o]) => kinds.some(([, v]) => v[o]));
+    const tot = pl.outcomes || {};
+    h += `<div class="card sec"><h2>Outcome per smell type <small>${Object.entries(tot).map(([k, v]) => `${esc(k)} ${v}`).join(" · ")}</small></h2>${bars(kinds.map(([k, v]) => ({
+      label: k.replace(/_/g, " ").replace(":class", " (class)"), value: 0, total: `${(v.removed || 0) + (v.reduced || 0) + (v["planned (not verified)"] || 0)}/${v.groups}`,
+      segs: used.map(([o, c]) => ({value: v[o] || 0, color: c, label: o}))})), {lw: 230, fmt: v => v})}
+      ${legend(used)}<div class="small muted">Removed and reduced are measured on the compiled code after verification. The reason for every other outcome is on the group page.${pl.api_policy ? ` Public API policy: ${esc(pl.api_policy)} (${int(pl.frozen_classes || 0)} classes kept in place).` : ""}</div></div>`;
   }
   if (A.plan) {
     const rows = (pl.groups || []).filter(r => r.recommended);
@@ -365,9 +371,10 @@ async function viewResults(name) {
   }
   if (A.plan) {
     const vb = Object.fromEntries(ver.map(v => [v.group_id, v]));
-    h += `<div class="card sec"><h2>All groups <small>click a row for the step-by-step recommendation</small></h2><div style="overflow:auto"><table><tr><th>rank</th><th>group</th><th>type</th><th>priority</th><th>recommended</th><th>steps</th><th>score</th><th>new smells</th><th>verified</th></tr>
+    h += `<div class="card sec"><h2>All groups <small>click a row for the step-by-step recommendation</small></h2><div style="overflow:auto"><table><tr><th>rank</th><th>group</th><th>type</th><th>priority</th><th>outcome</th><th>plan / reason</th><th>steps</th><th>score</th><th>new smells</th><th>verified</th></tr>
     ${(pl.groups || []).map(r => { const v = vb[r.group_id]; return `<tr class="click" data-act="go" data-href="#/p/${n}/group/${esc(r.group_id)}"><td>${int(r.rank)}</td><td class="mono">${esc(r.group_id)}</td><td>${esc((r.kind || r.type || "").replace(/_/g, " ").replace(":class", " (class)"))}</td><td>${num(r.priority, 3)}</td>
-      <td>${r.recommended ? `<span class="tag pu">${esc(r.recommended)}</span>` : `<span class="small muted" title="${esc(r.skipped || "")}">${esc(String(r.skipped || "no plan").slice(0, 70))}</span>`}</td><td>${r.recommended ? r.operations : ""}</td><td>${r.recommended ? num(r.score, 3) : ""}</td><td>${r.recommended ? num(r.new_smells, 0) : ""}</td>
+      <td>${esc(r.outcome || "")}</td>
+      <td>${r.recommended ? `<span class="tag pu">${esc(r.verified_plan || r.recommended)}</span>${r.fallback_from ? ` <span class="small muted">instead of ${esc(r.fallback_from)}</span>` : ""}` : `<span class="small muted" title="${esc(r.reason || "")}">${esc(String(r.reason || "no plan").slice(0, 90))}${(r.reason || "").length > 90 ? "…" : ""}</span>`}</td><td>${r.recommended ? r.operations : ""}</td><td>${r.recommended ? num(r.score, 3) : ""}</td><td>${r.recommended ? num(r.new_smells, 0) : ""}</td>
       <td>${v ? (v.compiles ? `<span class="tag s-done">compiles</span>` : `<span class="tag s-failed">fails</span>`) + (v.target_removed ? ` <span class="tag s-done">removed</span>` : "") : ""}</td></tr>`; }).join("")}</table></div></div>`;
   }
   if (ver.length) {
@@ -481,6 +488,7 @@ async function viewGroup(name, gid) {
   }
   if (V) {
     h += `<div class="card sec"><h2>Verification on the real code</h2><div>${[["compiles", V.compiles ? "yes" : "no"], ["compile runs", V.compile_runs], ["steps kept", `${V.kept}/${V.operations}`], ["new errors", V.new_errors_full_plan], ["smell removed", V.target_removed ? "yes" : "no"], ["matches simulation", V.prediction_matches ? "yes" : "no"], ["files", V.files_changed], ["patch lines", V.patch_lines], ["seconds", num(V.seconds, 1)]].map(([k, v]) => `<span class="chip">${k} <b>${esc(v)}</b></span>`).join("")}</div>
+    ${(V.tried || []).length > 1 ? `<div class="small" style="margin-top:8px"><b>Plans tried on the code:</b> ${V.tried.map(t => `${esc(t.plan)} (${t.kept}/${t.operations} steps compile${t.target_removed ? ", smell removed" : ""})`).join(" · ")} → kept <b>${esc(V.plan)}</b>.</div>` : ""}
     ${V.smells_before ? `<div class="small muted">smells in the repo before → after: ${Object.keys(V.smells_before).map(k => `${esc(k.replace(/_/g, " "))} ${V.smells_before[k]} → ${(V.smells_after || {})[k] ?? "?"}`).join(" · ")}</div>` : ""}
     ${(V.dropped_operations || []).length ? `<div class="small" style="color:var(--w)">Dropped by delta debugging: ${V.dropped_operations.map(esc).join(", ")}</div>` : ""}</div>`;
   }

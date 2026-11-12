@@ -8,8 +8,10 @@ with ``complete(system, prompt) -> str``. Built in:
 * ``openai``: any server with the OpenAI chat-completions API, e.g. **vLLM**
   serving an open model on a Noctua 2 GPU node
   (``vllm serve <model> --port 8000``), or a hosted API. Configured with
-  ``DSARP_LLM_URL`` (e.g. ``http://localhost:8000/v1``), ``DSARP_LLM_MODEL``
-  and optionally ``DSARP_LLM_KEY``.
+  ``DSARP_LLM_URL`` (e.g. ``http://localhost:8000/v1``, or the University of
+  Paderborn AI gateway ``https://ai-gateway.uni-paderborn.de/v1``),
+  ``DSARP_LLM_MODEL`` and ``DSARP_LLM_KEY`` (read from the environment only,
+  never written to a file). ``dsarp llm-models`` lists the models of the endpoint.
 
 Every answer is treated as a suggestion: operations proposed by the model are
 validated against the candidate operations, and explanations are checked so
@@ -21,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -55,11 +59,19 @@ class OpenAICompatible:
         req = urllib.request.Request(self.url.rstrip("/") + "/chat/completions", data=body,
                                      headers={"Content-Type": "application/json",
                                               **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                data = json.loads(r.read())
-        except Exception as e:  # network, HTTP or JSON errors
-            raise LLMError(f"language model request failed: {e}") from e
+        data = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    data = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                    time.sleep(5 * (attempt + 1))         # rate limit or busy server: wait and retry
+                    continue
+                raise LLMError(f"language model request failed: HTTP {e.code} {e.reason}") from e
+            except Exception as e:  # network or JSON errors
+                raise LLMError(f"language model request failed: {e}") from e
         self.calls += 1
         try:
             return data["choices"][0]["message"]["content"]
@@ -81,7 +93,23 @@ class Scripted:
         return self.answers.pop(0)
 
 
-def from_env(kind: str | None = None):
+def list_models(url: str | None = None, key: str | None = None) -> list[str]:
+    """Model ids offered by an OpenAI-compatible endpoint (``GET /models``)."""
+    url = url or os.environ.get("DSARP_LLM_URL")
+    key = key if key is not None else os.environ.get("DSARP_LLM_KEY", "")
+    if not url:
+        raise LLMError("set DSARP_LLM_URL")
+    req = urllib.request.Request(url.rstrip("/") + "/models",
+                                 headers={**({"Authorization": f"Bearer {key}"} if key else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        raise LLMError(f"listing models failed: {e}") from e
+    return sorted(m.get("id", "") for m in data.get("data", []) if isinstance(m, dict))
+
+
+def from_env(kind: str | None = None, temperature: float | None = None):
     kind = kind or os.environ.get("DSARP_LLM", "none")
     if kind == "none":
         return NoLLM()
@@ -90,7 +118,10 @@ def from_env(kind: str | None = None):
         model = os.environ.get("DSARP_LLM_MODEL")
         if not url or not model:
             raise LLMError("set DSARP_LLM_URL and DSARP_LLM_MODEL for the openai client")
-        return OpenAICompatible(url, model, os.environ.get("DSARP_LLM_KEY", ""))
+        c = OpenAICompatible(url, model, os.environ.get("DSARP_LLM_KEY", ""))
+        if temperature is not None:
+            c.temperature = temperature
+        return c
     raise LLMError(f"unknown language model client {kind!r} (use none or openai)")
 
 

@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import html
 import json
+from collections import Counter
 import re
 from pathlib import Path
 
 import pandas as pd
+
+from .outcome import outcome
 
 CSS = """
 body{font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#1d2125}
@@ -101,6 +104,13 @@ def _read(path: Path):
     return path.read_text()
 
 
+def _brief(t) -> str:
+    if not isinstance(t, dict):
+        return ""
+    return ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in t.items() if k != "present") or \
+        ("present" if t.get("present") else "absent")
+
+
 def build(results: str | Path) -> str:
     r = Path(results)
     model = _read(r / "model" / "model.json") or {}
@@ -116,29 +126,43 @@ def build(results: str | Path) -> str:
              f"<p>Commit <code>{html.escape(str(model.get('commit', '')))}</code>, "
              f"DSARP {html.escape(str(model.get('dsarp_version', '')))}.</p>"]
     groups = plans.get("groups", [])
-    rec = sum(1 for g in groups if g.get("recommended"))
-    compiled = sum(1 for v in verify if v.get("compiles") and v.get("kept", 0) > 0)
-    removed = sum(1 for v in verify if v.get("target_removed"))
+    vmap = {v["group_id"]: v for v in verify}
+    outc = {g["group_id"]: outcome(g, vmap.get(g["group_id"])) for g in groups}
+    counts = Counter(outc.values())
     decisions = triage.get("decisions", {}) if isinstance(triage, dict) else {}
+    real = len(groups) - counts["not a smell at this commit"]
+    usable = sum(1 for g in groups if g.get("recommended") and outc[g["group_id"]] != "not applicable")
     cards = [("smells reported", triage.get("smells", "") if isinstance(triage, dict) else ""),
              ("kept after triage", decisions.get("keep", "")), ("groups planned", len(groups)),
-             ("with a plan", rec), ("plans that compile", f"{compiled}/{len(verify)}" if verify else "not verified"),
-             ("smell removed (verified)", removed if verify else "-")]
+             ("not a smell at this commit", counts["not a smell at this commit"]),
+             ("with a usable plan", f"{usable}/{real}")]
+    if verify:
+        cards += [("removed (verified)", counts["removed"]), ("reduced (verified)", counts["reduced"]),
+                  ("not applicable on the code", counts["not applicable"])]
+    cards += [("no safe plan", counts["no safe plan"]), ("needs a design change", counts["needs a design change"])]
     parts.append("<div class='cards'>" + "".join(f"<div class='card'><b>{html.escape(str(v))}</b>{k}</div>"
                                                 for k, v in cards) + "</div>")
+    parts.append("<p>Outcomes: <b>removed</b> / <b>reduced</b>: verified on the compiled code; <b>not applicable</b>: "
+                 "every step of every plan tried broke the build; <b>no safe plan</b>: candidates exist but each "
+                 "would create new smells, be blocked or cost more than it removes; <b>needs a design change</b>: "
+                 "the operations DSARP can verify cannot fix it; <b>not a smell at this commit</b>: the detector "
+                 "counted tests, generated code, libraries or sub-packages.</p>")
     parts.append("<h2>Overview</h2>")
     ov = []
-    vmap = {v["group_id"]: v for v in verify}
     for g in groups:
-        p = next((x for x in g["plans"] if x["name"] == g.get("recommended")), None)
         v = vmap.get(g["group_id"], {})
-        ov.append({"rank": g["rank"], "group": g["group_id"], "smell": g["type"], "packages": len(g.get("core", [])),
-                   "plan": g.get("recommended") or g.get("skipped") or "none",
-                   "steps": len(p["operations"]) if p else 0, "score": p.get("score") if p else "",
-                   "compiles": (("yes" if v.get("kept", 0) else "no: all steps dropped")
-                                if v.get("compiles") else "no") if v else "-",
-                   "kept steps": f"{v['kept']}/{v['operations']}" if v else "-",
-                   "smell after (verified)": json.dumps(v.get("target_after", "")) if v else "-"})
+        name = v.get("plan") or g.get("recommended")
+        p = next((x for x in g["plans"] if x["name"] == name), None)
+        ov.append({"rank": g["rank"], "group": g["group_id"],
+                   "smell": g["type"] + (" (class)" if g.get("level") == "class" else ""),
+                   "elements": len(g.get("core", [])), "outcome": outc[g["group_id"]],
+                   "plan": (name + (f" (instead of {v['fallback_from']})" if v.get("fallback_from") else ""))
+                   if name else "",
+                   "steps": f"{v['kept']}/{v['operations']} kept" if v else (len(p["operations"]) if p else ""),
+                   "score": p.get("score", "") if p else "",
+                   "smell before → after (verified)": (f"{_brief(v.get('target_before'))} → "
+                                                       f"{_brief(v.get('target_after'))}") if v.get("target_after") else "",
+                   "reason": "" if name else (g.get("skipped") or g.get("no_plan_reason") or "")})
     parts.append(_table(pd.DataFrame(ov)))
     if report_md:
         parts.append("<h2>Plans step by step</h2>")
@@ -159,6 +183,11 @@ def build(results: str | Path) -> str:
                          f"<li>smell before: <code>{html.escape(json.dumps(v.get('target_before')))}</code>, after: "
                          f"<code>{html.escape(json.dumps(v.get('target_after')))}</code>; simulation predicted "
                          f"<code>{html.escape(json.dumps(v.get('predicted_after')))}</code></li>")
+            if len(v.get("tried", [])) > 1:
+                parts.append("<li>plans tried on the code: " + "; ".join(
+                    f"{html.escape(str(t['plan']))}: {t.get('kept')}/{t.get('operations')} steps compile"
+                    + (", smell removed" if t.get("target_removed") else "") for t in v["tried"])
+                    + f" → kept <b>{html.escape(str(v['plan']))}</b></li>")
             if "build" in v:
                 b = v["build"]
                 parts.append(f"<li>build ({html.escape(b['tool'])}, {b['tests_selected']} tests selected): "

@@ -263,6 +263,45 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    from .review import review_plans
+    from .search.llm import LLMError, from_env
+    try:
+        llm = from_env("openai", temperature=0.0)
+    except LLMError as e:
+        print(f"ERROR: {e}. Set DSARP_LLM_URL (e.g. https://ai-gateway.uni-paderborn.de/v1), DSARP_LLM_MODEL "
+              "and DSARP_LLM_KEY (export it in the shell; it is never stored).", file=sys.stderr)
+        return 1
+    for d in map(Path, args.results):
+        if not (d / "plans" / "plans.json").exists():
+            print(f"ERROR {d}: no plans (run dsarp plan)", file=sys.stderr)
+            return 1
+        st = review_plans(d, llm, groups=args.groups, apply=not args.dry_run)
+        print(f"{d.name}: reviewed {st['reviewed']} plans with {st['model']} ({st['llm_calls']} new calls): "
+              f"{st['accept']} accepted, {st['caution']} with caution, {st['reject']} rejected; "
+              f"{st['replaced']} replaced by another plan, {st['dropped']} without a plan, {st['failed']} unanswered")
+        if not args.dry_run:
+            from .explain import explain, write
+            from .plan.facts import RepoFacts
+            from .program import ProgramModel
+            import json
+            result = json.loads((d / "plans" / "plans.json").read_text())
+            rf = RepoFacts.build(ProgramModel(d / "model"), result.get("api_policy", "balanced"))
+            print(f"  report updated: {write(explain(result, rf, None), d / 'plans')}")
+    return 0
+
+
+def _cmd_llm_models(args: argparse.Namespace) -> int:
+    from .search.llm import LLMError, list_models
+    try:
+        for m in list_models():
+            print(m)
+    except LLMError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     import json
 
@@ -341,7 +380,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             affinity = None
         llm = _llm(args.llm)
         planner = Planner(model, triage_dir, backend=args.backend, time_limit=args.time_limit,
-                          affinity=affinity, search=args.search, search_time=args.search_time, llm=llm)
+                          affinity=affinity, search=args.search, search_time=args.search_time, llm=llm,
+                          api_policy=args.api_policy)
         if affinity:
             print(f"  learned affinity: {affinity}")
         types = set(args.types.split(",")) if args.types else None
@@ -422,6 +462,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="tree search after the solver (auto: when no good plan was found)")
     pl.add_argument("--search-time", type=float, default=120.0, help="seconds of tree search per group")
     pl.add_argument("--llm", choices=["none", "openai"], help="language model client (default: $DSARP_LLM or none)")
+    pl.add_argument("--api-policy", default="balanced", choices=["balanced", "strict", "off"],
+                    help="public API that plans must not move (balanced: widely used public classes; strict: also "
+                         "all public classes used from other build modules; off: only protected_api)")
     pl.add_argument("--explain", action="store_true", help="also write plans/report.md")
     pl.set_defaults(func=_cmd_plan)
 
@@ -439,6 +482,16 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("results", nargs="+")
     ex.add_argument("--llm", choices=["none", "openai"], help="language model for the summary (default: none)")
     ex.set_defaults(func=_cmd_explain)
+
+    rv = sub.add_parser("review", help="stage 6b (optional): design review of the recommended plans by a "
+                                       "language model (OpenAI-compatible endpoint, e.g. the Paderborn AI gateway)")
+    rv.add_argument("results", nargs="+")
+    rv.add_argument("--groups", type=int, help="only the first N groups with a plan")
+    rv.add_argument("--dry-run", action="store_true", help="only record the review, do not change the plans")
+    rv.set_defaults(func=_cmd_review)
+
+    lm = sub.add_parser("llm-models", help="list the models of the language-model endpoint ($DSARP_LLM_URL)")
+    lm.set_defaults(func=_cmd_llm_models)
 
     ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
     ve.add_argument("results", nargs="+")

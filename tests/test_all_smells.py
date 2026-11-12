@@ -43,9 +43,9 @@ def make_shop(root: Path) -> None:
         _java(root, "com.shop.text", "TextPart" if i == 1 else f"TextPart{i}",
               f"    private TextPart{i + 1} next;" if i < 5 else "")
     _java(root, "com.shop.text", "TextPart5", "    private TextPart part;")
-    # scattered functionality: one concern used together from com.shop.a, spread over p and q
+    # scattered functionality: one concern (Fee builds on Tax) used together from com.shop.a, spread over p and q
     _java(root, "com.shop.p", "Tax", "    public static int rate() { return 19; }")
-    _java(root, "com.shop.q", "Fee", "    public static int fee() { return 2; }")
+    _java(root, "com.shop.q", "Fee", "    public static int fee() { return com.shop.p.Tax.rate() / 10; }")
     _java(root, "com.shop.a", "Checkout",
           "    public int total() { return com.shop.p.Tax.rate() + com.shop.q.Fee.fee(); }\n"
           "    public int net() { return com.shop.p.Tax.rate() - com.shop.q.Fee.fee(); }")
@@ -193,3 +193,55 @@ def test_recommended_plans_compile_and_remove_the_smell(shop, kind):
     if kind == "cyclic_dependency:class":
         patch = (res / "verify" / out["group_id"] / "plan.patch").read_text()
         assert "Alpha.twice(1)" in patch                              # the test now calls the new owner
+
+
+# ---------------------------------------------------------------------- review and API policy
+
+def test_review_parse_rules():
+    from dsarp.review import Reviewer
+    ok = Reviewer.parse('{"steps": [{"step": 1, "verdict": "wrong", "reason": "x"}], "overall": "accept"}', 1)
+    assert ok["overall"] == "reject"                       # a wrong step cannot be accepted
+    ok = Reviewer.parse('{"steps": [{"step": 1, "verdict": "sensible"}], "overall": "reject"}', 1)
+    assert ok["overall"] == "caution"                      # a rejection must name a wrong step
+    assert Reviewer.parse('{"steps": [], "overall": "accept"}', 1) is None          # wrong number of steps
+    assert Reviewer.parse("no json here", 1) is None
+
+
+@needs_jdk
+def test_review_replaces_rejected_plan_and_caches(shop, tmp_path):
+    from dsarp.review import review_plans
+    from dsarp.search.llm import Scripted
+    _, res = shop
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    out = p.run(50)
+    (res / "plans").mkdir(exist_ok=True)
+    (res / "plans" / "plans.json").write_text(json.dumps(out, default=str))
+    g = next(g for g in out["groups"] if g.get("recommended"))
+    n = len(next(x for x in g["plans"] if x["name"] == g["recommended"])["operations"])
+    reject = json.dumps({"steps": [{"step": i + 1, "verdict": "wrong", "reason": "does not belong"} for i in range(n)],
+                         "overall": "reject", "reason": "wrong place"})
+    llm = Scripted([reject] + [json.dumps({"steps": [{"step": i + 1, "verdict": "sensible"} for i in range(k)],
+                                           "overall": "accept"}) for k in range(1, 40)])
+    llm.model = "scripted"
+    review_plans(res, llm, groups=1)
+    after = json.loads((res / "plans" / "plans.json").read_text())
+    ga = next(x for x in after["groups"] if x["group_id"] == g["group_id"])
+    assert ga["review"]["original"] == g["recommended"] and ga["review"]["tried"][0]["overall"] == "reject"
+    assert ga["recommended"] != g["recommended"] or ga["recommended"] is None
+    assert (res / "plans" / "review_cache.json").exists()
+    calls = llm.calls
+    review_plans(res, llm, groups=1)                        # the same prompts again: answered from the cache
+    assert llm.calls == calls
+
+
+@needs_jdk
+def test_widely_used_public_api_is_frozen(shop):
+    _, res = shop
+    rf = RepoFacts.build(ProgramModel(res / "model"), "balanced")
+    assert all(rf.users.get(c, 0) >= 20 for c in rf.frozen)
+    rf_off = RepoFacts.build(ProgramModel(res / "model"), "off")
+    assert rf_off.frozen == {}
+    # a class never moves to a package it has nothing to do with
+    c = sorted(rf.prod)[0]
+    far = next(q for q in rf.pkg_classes if q != rf.package[c] and rf.evidence(c, q) == 0)
+    assert not rf.fits(c, far)
