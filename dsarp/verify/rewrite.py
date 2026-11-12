@@ -337,7 +337,9 @@ class Rewriter:
         for k, op in merged.items():
             self._extract_interface(op, repo, res, clients[k])
         for op in ops:                         # static members move after the line edits (found by declaration)
-            if op["op"] == "move_member":
+            if op["op"] == "move_member" and op.get("instance"):
+                self._move_instance_methods(repo, op, res)
+            elif op["op"] == "move_member":
                 self._move_members(repo, op, res)
         moves = [o for o in ops if o["op"] == "move_class"]
         for o in list(moves):                  # test classes move with the class they test
@@ -524,6 +526,112 @@ class Rewriter:
                 _write_text(path, "\n".join(_drop_unused_imports(t1.split("\n"))))
                 res.changed.add(f)
         res.notes.append(f"moved {len(members)} static members of {src} to {dst}")
+
+    def _move_instance_methods(self, repo: Path, op: dict, res: ApplyResult) -> None:
+        """Move Method: instance methods of ``from_class`` that take a ``to_class`` parameter become instance
+        methods of ``to_class``; the parameter becomes ``this`` and callers ``x.m(a, t)`` become ``t.m(a)``.
+
+        A call is rewritten only where the receiver is a plain variable declared with the old class as its type
+        in that file; any other call is left unchanged, so the compiler reports it and the verification drops
+        the step instead of silently changing behaviour."""
+        src, dst = op["from_class"], op["to_class"]
+        members = op.get("members", [op["member"]])
+        sf, df = self.type_file.get(src), self.type_file.get(dst)
+        if not sf or not df or not (repo / sf).exists() or not (repo / df).exists():
+            res.notes.append(f"move_method: file of {src} or {dst} not found")
+            return
+        s_simple, d_simple = src.rsplit(".", 1)[-1], dst.rsplit(".", 1)[-1]
+        same_pkg = self.type_pkg[src] == self.type_pkg[dst]
+        text = _read_text(repo / sf)
+        lines = text.split("\n")
+        spans, info = [], {}
+        for m in members:
+            name = self.member_name.get(m) or m.split("#", 1)[1].split("(")[0]
+            line = self.member_lines.get(m, (None, None))[0]
+            pat = re.compile(r"^(?!\s*(return|new|throw|else|if|while|for)\b)[^=;.]*[\w>\]]\s+" + re.escape(name) + r"\s*\(")
+            hits = [i for i, ln in enumerate(lines) if pat.search(ln) and not ln.strip().startswith(("*", "//"))]
+            if not hits:
+                res.notes.append(f"move_method: declaration of {m} not found")
+                return
+            decl = min(hits, key=lambda i: abs(i - (int(line) - 1 if line == line and line else 0)))
+            a_, b_ = self._member_span(text, lines, decl, "method")
+            spans.append((a_, b_))
+            info[(a_, b_)] = (m, name, decl)
+        stay = self._statics_of(src)
+        blocks = []
+        for a_, b_ in sorted(spans, reverse=True):
+            m, name, decl = info[(a_, b_)]
+            blk = "\n".join(lines[a_: b_ + 1])
+            k = op.get("param_index", {}).get(m)
+            start = blk.find("(", blk.find(name, sum(len(x) + 1 for x in lines[a_:decl])))
+            end = _matching(blk, start)
+            if start < 0 or end < 0 or k is None:
+                res.notes.append(f"move_method: signature of {m} not understood")
+                return
+            params = _split_args(blk[start + 1:end])
+            if k >= len(params):
+                res.notes.append(f"move_method: parameter of {m} not found")
+                return
+            pname = params[k].split()[-1].replace("...", "").strip()
+            rest = [x for i, x in enumerate(params) if i != k]
+            head = blk[:start + 1] + ", ".join(x.strip() for x in rest) + blk[end:blk.find("{", end) + 1]
+            body = blk[blk.find("{", end) + 1:]
+            body = re.sub(r"(?<![\w.$])" + re.escape(pname) + r"\b(?!\s*\()", "this", body)
+            for nm in stay:
+                body = re.sub(r"(?<![\w.$])" + re.escape(nm) + r"(?=\s*\(|\b)", f"{s_simple}.{nm}", body)
+            hl = head.split("\n")
+            for j, ln in enumerate(hl):
+                if re.search(r"\b" + re.escape(name) + r"\s*\(", ln):
+                    if not same_pkg or re.search(r"\bprivate\b", ln):
+                        hl[j] = self._make_public(ln)
+                    break
+            blocks.append("\n".join(hl) + body)
+            del lines[a_: b_ + 1]
+        src_text = "\n".join(lines)
+        _write_text(repo / sf, "\n".join(_drop_unused_imports(src_text.split("\n"))))
+        res.changed.add(sf)
+        moved = "\n\n".join(reversed(blocks))
+        moved_code = _strip_comments_and_strings(moved)
+        dtext = _read_text(repo / df)
+        dl = dtext.split("\n")
+        close = max(i for i, ln in enumerate(dl) if ln.strip().startswith("}"))
+        dl[close:close] = [""] + moved.split("\n")
+        dtext = "\n".join(dl)
+        need = []
+        for m_ in re.finditer(r"^\s*import\s+(static\s+)?([\w.]+)\.(\w+|\*)\s*;", text, re.M):
+            simple = m_.group(3)
+            fq = f"{'static ' if m_.group(1) else ''}{m_.group(2)}.{simple}"
+            if simple != "*" and re.search(r"(?<![\w$])" + re.escape(simple) + r"\b", moved_code) \
+                    and not _imports_simple(dtext, simple) and fq != dst:
+                need.append(fq)
+        if not same_pkg:
+            for t_, p_ in self.type_pkg.items():
+                if p_ == self.type_pkg[src] and self.top.get(t_) == t_ and t_ != dst:
+                    simple = t_.rsplit(".", 1)[-1]
+                    if re.search(r"(?<![\w.$])" + re.escape(simple) + r"\b", moved_code) and not _imports(dtext, t_) \
+                            and not _imports_simple(dtext, simple):
+                        need.append(t_)
+        if need:
+            dtext = _add_imports(dtext, sorted(set(need)))
+        _write_text(repo / df, dtext)
+        res.changed.add(df)
+        # callers: x.m(a, t, b) -> t.m(a, b) where x is declared as the old class
+        names = {self.member_name.get(m) or m.split("#", 1)[1].split("(")[0]: op.get("param_index", {}).get(m)
+                 for m in members}
+        files = {self.type_file.get(c) for c in op.get("callers", [])} - {None, sf}
+        left = 0
+        for f in sorted(files):
+            path = repo / f
+            if not path.exists():
+                continue
+            t0 = _read_text(path)
+            t1, n_left = _rewrite_calls(t0, s_simple, names)
+            left += n_left
+            if t1 != t0:
+                _write_text(path, "\n".join(_drop_unused_imports(t1.split("\n"))))
+                res.changed.add(f)
+        res.notes.append(f"moved {len(members)} instance methods of {src} to {dst}"
+                         + (f"; {left} calls left for the compiler to check" if left else ""))
 
     @staticmethod
     def _redirect(text: str, src: str, dst: str, names: set[str], inside_src: bool,
@@ -770,3 +878,91 @@ def openrewrite_recipe(ops: list[dict], name: str = "dsarp.Plan") -> str:
                       f"      oldFullyQualifiedTypeName: {o['class']}",
                       f"      newFullyQualifiedTypeName: {new}"]
     return "\n".join(lines) + "\n"
+
+
+def _matching(text: str, start: int) -> int:
+    """Index of the parenthesis that closes the one at ``start`` (-1 if none)."""
+    if start < 0 or start >= len(text) or text[start] != "(":
+        return -1
+    depth, i = 0, start
+    while i < len(text):
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < len(text) and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _split_args(s: str) -> list[str]:
+    """Split an argument or parameter list at top-level commas."""
+    out, cur, depth = [], "", 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c in "\"'":
+            j = i + 1
+            while j < len(s) and s[j] != c:
+                j += 2 if s[j] == "\\" else 1
+            cur += s[i:j + 1]
+            i = j + 1
+            continue
+        if c in "(<[{":
+            depth += 1
+        elif c in ")>]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    if cur.strip():
+        out.append(cur)
+    return [x.strip() for x in out]
+
+
+def _rewrite_calls(text: str, cls_simple: str, names: dict[str, int]) -> tuple[str, int]:
+    """Rewrite ``x.m(a, t, b)`` to ``t.m(a, b)`` for variables ``x`` declared as ``cls_simple`` in ``text``.
+
+    Returns the new text and the number of calls of these names that were not rewritten."""
+    declared = set(re.findall(r"\b" + re.escape(cls_simple) + r"(?:<[^;(){}]*?>)?\s+(\w+)\s*[;=,)]", text))
+    left = 0
+    for name, k in names.items():
+        if k is None:
+            continue
+        pos = 0
+        pat = re.compile(r"(?<![\w$.])(\w+)\s*\.\s*" + re.escape(name) + r"\s*\(")
+        while True:
+            m = pat.search(text, pos)
+            if not m:
+                break
+            start = text.find("(", m.end() - 1)
+            end = _matching(text, start)
+            if m.group(1) not in declared or end < 0:
+                left += 1
+                pos = m.end()
+                continue
+            args = _split_args(text[start + 1:end])
+            if k >= len(args):
+                left += 1
+                pos = m.end()
+                continue
+            t_expr = args[k]
+            if not re.fullmatch(r"[\w.$]+", t_expr):
+                t_expr = f"({t_expr})"
+            rest = [a for i, a in enumerate(args) if i != k]
+            new = f"{t_expr}.{name}({', '.join(rest)})"
+            text = text[:m.start()] + new + text[end + 1:]
+            pos = m.start() + len(new)
+    return text, left
+

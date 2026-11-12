@@ -65,6 +65,29 @@ detectors:
 protected_api: []         # packages/classes plans must never move
 ```
 
+A detector entry can also say how to **run** the tool. `dsarp detect` then runs
+it on the checkout at the configured commit, so its output always matches the
+analysed code (output goes to `path`, by default `detected/<name>/<tool>` under
+the data root), and stage 8 can run it on the refactored code:
+
+```yaml
+detectors:
+  - tool: designite
+    command: java -jar /opt/designite/DesigniteJava.jar -i {repo} -o {out}/
+  - tool: arcan
+    path: Arcan/Tika
+    command: java -jar /path/to/arcan.jar ... {repo} ... {out}
+```
+
+```bash
+dsarp checkout configs/tika.yaml --workdir work
+dsarp detect configs/tika.yaml --workdir work            # stage 0: run the detectors at the commit
+```
+
+The container builds the open-source DesigniteJava (Apache 2.0, class-level
+smells only) at `/opt/designite/DesigniteJava.jar`. Architecture smells need
+Designite Java (Enterprise, free academic licence) and Arcan: give their commands.
+
 Detector paths are relative to a data folder given with `--data-root` or the
 `DSARP_DATA` environment variable. When a detector was run separately per
 module (as Designite on Karaf), list each output folder with its `module`.
@@ -241,11 +264,26 @@ verification:
 | Cyclic dependency, packages (Arcan, Designite) | move classes, remove unused imports, delete dead code, extract interfaces | no cycle among the group's packages |
 | Unstable dependency (Arcan, Designite) | the same operations | no dependency on a less stable package |
 | Hub-like package (Arcan) | the same operations | fan-in or fan-out at the threshold |
-| God component (Designite) | **split the package**: whole sets of related classes (with nested classes and tests) move to related packages or new sub-packages; *strict* plans keep every new package cohesive, *relaxed* ones may not (shown as a side effect) | at most 30 classes |
-| Feature concentration (Designite) | **split the package by concern**: unrelated sets move to the package they are related to or to a new cohesive sub-package | Designite's LCC (sets of related classes / classes) at most 0.2 |
+| God component (Designite) | **split the package**: whole sets of related classes (with nested classes and tests) move to related packages or new sub-packages; *strict* plans keep every new package free of feature concentration, *relaxed* ones may not (shown as a side effect) | at most 30 types (production and test classes, nested ones included, as Designite counts) |
+| Feature concentration (Designite) | **split the package by concern**: unrelated sets move to the package they are related to or to a new sub-package | fewer than 6 types, or Designite's LCC (sets of related classes / types) below 0.2 |
 | Scattered functionality (Designite) | **gather the concern**: the classes that the reporting packages use together move into one of the concern's packages (every target is tried) | no package has more than one method using the concern spread over packages |
-| Cyclic dependency, classes (Arcan) | remove unused imports, delete dead code, extract interfaces, **move static members** (pull the used static members into the caller, or push static members to the class they use) | no cycle among the group's classes |
+| Cyclic dependency, classes (Arcan) | remove unused imports, delete dead code, extract interfaces, **move static members** (pull the used static members into the caller, or push static members to the class they use), **move instance methods** (a method that works on a parameter of the other class and uses no state of its own class moves there: `x.m(a, t)` becomes `t.m(a)`) | no cycle among the group's classes |
 | Hub-like class (Arcan) | the same class-level operations | Arcan's rule (fan-in and fan-out above the median and balanced, test classes counted as clients) no longer holds |
+
+**Calibrated against the detectors.** On 242 feature-concentration reports of
+Designite in the five study repositories, no package with fewer than 6 types
+is reported, and LCC = 0.2 is reported (4 sets in 20 types): the rule is
+"at least 6 types and LCC >= 0.2". Designite counts every type of a package,
+test classes included, for both feature concentration and god components.
+With these rules DSARP's detection agrees with Designite's reports on the
+Tika packages Designite analysed with precision 0.79 and recall 0.94 (before:
+0.26 and 1.0); the published relation kinds (field types, inheritance,
+realisation) fit best (F1 0.86; adding other dependency kinds does not help).
+
+Classes may share a **new sub-package** only if they depend on each other or
+share a meaningful word in their names (not "Utils", "Exception", ... or words
+of the package path), so a split never creates a bin of unrelated classes.
+Creating a package costs 3 (a related existing package is preferred).
 
 New sub-packages are named after the most frequent word of their classes'
 names (`org.apache.tika.sax.text`), test classes move with the class they
@@ -406,6 +444,73 @@ compiled, and 8/8 interface extractions under the final rules (only classes
 as clients, no inherited signatures, no nested provider types). Passing the
 object on as the concrete type is not visible in the dependency facts, so such
 steps are left to the verification.
+
+### 7b. One combined plan for the whole repository
+
+```bash
+dsarp combine results/tika --workdir work                      # non-conflicting plans applied together
+dsarp combine results/tika --workdir work --build auto --config configs/tika.yaml   # + tests, + real detectors
+```
+
+The verified plans of all groups whose smell was removed or reduced are
+combined: a plan is left out if it changes a class another selected plan
+changes, or if the whole-repository simulation shows that it weakens another
+plan or creates new smells together with them. The selection is applied to
+one copy of the code and compiled (plans that break the build together are
+dropped by delta debugging), every group is measured on the combined code, and
+the smells of the whole repository are counted before and after
+(`combined/combined.json`, `combined/plan.patch`).
+
+On Tika (local, HiGHS): 119 groups have a verified plan (58 smells removed and
+58 reduced on the compiled code; 109 plans compile with all steps, 115 match
+the simulation). 77 of them combine into one plan of 160 operations that
+compiles; whole repository: package cycles 11 → 6, feature concentration
+96 → 70, unstable dependencies 13 → 5, hub-like packages 2 → 0, god
+components 16 → 15. With `--build` the affected
+modules are built and the tests that use a changed class are run; with the
+detector commands of the configuration (or `--arcan-cmd`, `--designite-cmd`)
+the real tools are run on the original and the combined code and every
+group is checked against their output. `dsarp verify --config ...` does the
+same for every single plan (slow).
+
+### 7c. Design advice for groups without a verified plan (optional)
+
+```bash
+dsarp advise results/tika          # needs DSARP_LLM_URL, DSARP_LLM_MODEL, DSARP_LLM_KEY
+```
+
+For groups that need a design change or have no safe plan, a language model
+suggests up to three design directions (what to introduce or split, effort,
+risk) from the facts DSARP has. Advice is marked **not verified**, never
+changes plans or results, and is discarded if it names a fully qualified class
+or package that does not exist.
+
+### 7d. Evaluation: history and expert rating
+
+```bash
+dsarp history results/tika --workdir work --until origin/HEAD    # what did the developers do later?
+dsarp history results/tika --refminer "RefactoringMiner -bc {repo} {start} {end} -json {json}"
+dsarp rating sheet results/tika --groups 40                      # evaluation/rating_sheet.csv for raters
+dsarp rating agreement rater1.csv rater2.csv --llm-review results/tika/evaluation/rating_llm_review.csv
+```
+
+`history` compares every recommended step with the commits after the analysed
+one: the class was later moved to the **same** package, into a **new package**
+too, somewhere **other**, **deleted**, or left **unchanged** (not done yet,
+not necessarily wrong); with RefactoringMiner, method moves and extracted
+interfaces are matched too. On Tika (1,218 later commits, 37 class moves), 7
+recommended moves into new packages were later also made into new packages
+(e.g. DSARP splits the encoding detectors out of `parser.txt`; the developers
+later moved them to `detect.icu4j` and `detect.universal`) and 16 moved
+classes were deleted.
+
+`rating sheet` samples groups (stratified by smell type) and writes one row
+per step (what, element, from, to, why) with empty `verdict` (sensible,
+questionable, wrong) and `comment` columns; the language-model review is kept
+in a separate file so raters are not influenced. `rating agreement` reports
+the share of sensible steps per rater and smell type, Cohen's (two raters) or
+Fleiss' kappa (more), the majority verdict, and each rater's agreement with
+the language-model review.
 
 ### 8. Report and evaluation
 
@@ -579,13 +684,18 @@ Detector output of the study repositories is not stored in this repository.
 6. **Verification, report and evaluation** (stages 8-9): apply plans to the code, compile, delta debugging, re-detection on the compiled code, optional build/tests/detectors, patches and OpenRewrite recipes, HTML report, evaluation against NSGA-II, random, solver-only and search-only with ablation and weight sensitivity. Done.
 7. **Web interface**: run stages locally, in the container or as Slurm jobs, live flowchart and logs, results dashboard and group pages. Done.
 8. **All smell types**: god components and feature concentration (package splits), scattered functionality (gathering a concern), class cycles and hub-like classes (static member moves, interfaces, imports, dead code). Done.
+9. **Accuracy**: rules calibrated against Designite, public API kept in place, fit rule, move instance method, combined plan, detectors at the commit and on the result, history and expert-rating evaluation, design advice. Done.
 
 Known limitations: the compile check compiles the whole repository at once,
 so it does not see build-module boundaries (use `--build`); history moves are
 described by the code at the analysed commit; an extracted interface fails to
 compile when the client passes the object on as the concrete type, and a
 moved static member fails when code reaches it in a way the rewriter does not
-see (reflection, generated code): the verification drops such steps; only
+see (reflection, generated code): the verification drops such steps; a
+facade for scattered functionality was evaluated and left out: on Tika none
+of the 1,138 methods that use a scattered concern reaches it only through
+static members or constructors, so a facade would hide the dependency instead
+of removing it; only
 deprecated members that nothing calls any more (tests included) are deleted;
 smells that need new abstractions or splitting a class's responsibilities get
 a reason instead of a plan; the evaluation baselines (NSGA-II, random, search
@@ -630,6 +740,7 @@ dsarp/            Python package
     mcts.py       Monte Carlo tree search (PUCT), language-model proposals and repair
     llm.py        language-model clients (none, OpenAI-compatible)
   review.py       stage 6b: design review of the plans by a language model (optional)
+  advice.py       stage 7b: design advice for groups without a verified plan (optional)
   outcome.py      outcome category of every group (report and web interface)
   explain.py      stage 7: step-by-step report
   verify/         stage 8
@@ -638,9 +749,12 @@ dsarp/            Python package
     compile.py    compile, compare errors, detect again on the compiled code
     debug.py      delta debugging (ddmin) and reduction to the passing steps
     build.py      Maven/Gradle build of affected modules, test selection
-    detectors.py  re-run Arcan/Designite
+    detectors.py  run Arcan/Designite on a result, check every group against their output
     run.py        orchestration, patches, results
+    combine.py    stage 8b: one combined plan, whole repository before/after
   evaluate/       stage 9 (research)
+    history.py    later commits: did the developers make the recommended changes?
+    rating.py     expert rating sheet, agreement (kappa) with raters and the review
     baselines.py  NSGA-II, random search, language model only
     harness.py    all approaches on the same groups, summary, weight sensitivity
   report.py       stage 9 (users): HTML report

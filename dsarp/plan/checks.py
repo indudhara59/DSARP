@@ -238,9 +238,14 @@ def _move_member_check(self, o: dict, chk: OpCheck, after: dict[str, str]) -> No
         chk.block(f"{dst} is not a class")
     for m in members:
         info = rf.member_info.get(m)
-        if info is None or not info["static"]:
+        if info is None or (not info["static"] and not o.get("instance")):
             chk.block(f"{m} is not a static member")
             continue
+        if o.get("instance"):
+            from .classlevel import movable_instance
+            if movable_instance(rf, src, m, dst) is None:
+                chk.block(f"{m.split('#')[1]} cannot move to {dst.rsplit('.', 1)[-1]} (it uses state of its class, "
+                          "is overridden or is called inside it)")
         if info["api"]:
             chk.warn(f"{m.split('#')[1]} is public API: keep a deprecated delegate in {src} for one release")
     if rf.package.get(src) != rf.package.get(dst) and any(

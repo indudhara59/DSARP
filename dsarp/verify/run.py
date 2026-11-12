@@ -138,36 +138,7 @@ class Verifier:
                         "dropped_operations": [ops[i] for i in dropped]})
             # detection on the compiled code vs the simulation
             if kept_ops:
-                prod_after = self._production_after(res, kept_ops)
-                after = cmp.detect(comp, prod_after)
-                g_after, _ = cmp.package_graph(comp, prod_after)
-                before = cmp.detect(self.baseline(), self.prod_files)
-                g_before, _ = cmp.package_graph(self.baseline(), self.prod_files)
-                central = group.get("central", "") if group["type"] != "cyclic_dependency" else ""
-                core = group.get("core", [])
-                kind = group.get("kind", group["type"])
-                ctx = group.get("context") or {}
-                if kind in EXTRA_KINDS:
-                    from ..plan.extra import snapshot_from_compile
-                    if kind == "hub_like_dependency:class":
-                        core = [central]
-                    snap_b = snapshot_from_compile(self.baseline(), self.prod_files)
-                    snap_a = snapshot_from_compile(comp, prod_after)
-                    ren = _renamed(kept_ops)
-                    ctx_a = {**ctx, "methods": [_rename_member(m, ren) for m in ctx.get("methods", [])],
-                             "concern_classes": [ren.get(c, c) for c in ctx.get("concern_classes", [])]}
-                    tb = self.sim.extra_measure(snap_b, kind, core, central, ctx)
-                    ta = self.sim.extra_measure(snap_a, kind, core, central, ctx_a)
-                else:
-                    tb = self.sim.target_measure(g_before, before, group["type"], core, central)
-                    ta = self.sim.target_measure(g_after, after, group["type"], core, central)
-                predicted = self.sim.run(kept_ops, kind, core, central, ctx)
-                rec.update({
-                    "target_before": _small(tb), "target_after": _small(ta),
-                    "target_removed": not ta.get("present", True),
-                    "predicted_after": _small(predicted.target_after),
-                    "prediction_matches": _small(predicted.target_after) == _small(ta),
-                    "smells_before": dict(Counter(before["type"])), "smells_after": dict(Counter(after["type"]))})
+                rec.update(self.measure(group, res, comp, kept_ops))
             # patch and recipe
             patch = ws.diff()
             (out / "plan.patch").write_text(patch)
@@ -193,10 +164,50 @@ class Verifier:
                                 "command": " ".join(after_b.command), "log_tail": after_b.log_tail[-3000:]}
             # detectors
             for tool, command in self.detector_cmds.items():
-                rec.setdefault("detectors", {})[tool] = run_detector(tool, command, ws.path, out / f"{tool}-after")
+                if not kept_ops:
+                    continue
+                d = run_detector(tool, command, ws.path, out / f"{tool}-after", groups=[group])
+                rec.setdefault("detectors", {})[tool] = d
+                if d.get("ok") and d.get("groups", {}).get(gid) is False:
+                    rec.setdefault("confirmed_by", []).append(tool)
         rec["seconds"] = round(time.time() - t0, 1)
         (out / "verification.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
+
+    def measure(self, group: dict, res, comp, kept_ops: list[dict], all_ops: list[dict] | None = None) -> dict:
+        """The group's smell on the compiled code (``comp``), before and after, and the simulation's prediction.
+
+        ``all_ops`` (default ``kept_ops``) are the operations applied to the code, used for renamed classes
+        and members when several plans are applied together."""
+        all_ops = all_ops if all_ops is not None else kept_ops
+        prod_after = self._production_after(res, all_ops)
+        after = cmp.detect(comp, prod_after)
+        g_after, _ = cmp.package_graph(comp, prod_after)
+        before = cmp.detect(self.baseline(), self.prod_files)
+        g_before, _ = cmp.package_graph(self.baseline(), self.prod_files)
+        central = group.get("central", "") if group["type"] != "cyclic_dependency" else ""
+        core = group.get("core", [])
+        kind = group.get("kind", group["type"])
+        ctx = group.get("context") or {}
+        if kind in EXTRA_KINDS:
+            from ..plan.extra import snapshot_from_compile
+            if kind == "hub_like_dependency:class":
+                core = [central]
+            snap_b = snapshot_from_compile(self.baseline(), self.prod_files)
+            snap_a = snapshot_from_compile(comp, prod_after)
+            ren = _renamed(all_ops)
+            ctx_a = {**ctx, "methods": [_rename_member(m, ren) for m in ctx.get("methods", [])],
+                     "concern_classes": [ren.get(c, c) for c in ctx.get("concern_classes", [])]}
+            tb = self.sim.extra_measure(snap_b, kind, core, central, ctx)
+            ta = self.sim.extra_measure(snap_a, kind, core, central, ctx_a)
+        else:
+            tb = self.sim.target_measure(g_before, before, group["type"], core, central)
+            ta = self.sim.target_measure(g_after, after, group["type"], core, central)
+        predicted = self.sim.run(kept_ops, kind, core, central, ctx)
+        return {"target_before": _small(tb), "target_after": _small(ta), "target_removed": not ta.get("present", True),
+                "predicted_after": _small(predicted.target_after),
+                "prediction_matches": _small(predicted.target_after) == _small(ta),
+                "smells_before": dict(Counter(before["type"])), "smells_after": dict(Counter(after["type"]))}
 
     def verify_group(self, g: dict) -> dict:
         """Verify the recommended plan; if it does not fully work on the code, also verify up to

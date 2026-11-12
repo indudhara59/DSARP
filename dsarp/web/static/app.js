@@ -148,10 +148,10 @@ function header(pr, tab) {
 }
 
 /* ---------- pipeline flowchart ---------- */
-const POS = {check: [100, 66], checkout: [100, 200], ingest: [100, 334], model: [310, 267], triage: [520, 190], learn: [520, 380],
-  plan: [735, 267], explain: [955, 58], review: [955, 162], verify: [955, 267], evaluate: [955, 448], report: [1165, 267]};
-const EDGES = [["checkout", "model"], ["ingest", "model"], ["ingest", "triage"], ["model", "triage"], ["model", "learn"], ["checkout", "learn", 1],
-  ["triage", "plan"], ["learn", "plan", 1], ["plan", "explain"], ["plan", "review"], ["review", "verify", 1], ["plan", "verify"], ["triage", "evaluate"], ["learn", "evaluate", 1], ["plan", "report"], ["verify", "report", 1]];
+const POS = {check: [100, 50], checkout: [100, 160], detect: [100, 270], ingest: [100, 380], model: [310, 267], triage: [520, 190], learn: [520, 380],
+  plan: [735, 267], explain: [955, 58], review: [955, 162], verify: [955, 267], advise: [955, 360], evaluate: [955, 470], combine: [1165, 140], report: [1165, 330]};
+const EDGES = [["checkout", "detect"], ["detect", "ingest", 1], ["checkout", "model"], ["ingest", "model"], ["ingest", "triage"], ["model", "triage"], ["model", "learn"], ["checkout", "learn", 1],
+  ["triage", "plan"], ["learn", "plan", 1], ["plan", "explain"], ["plan", "review"], ["plan", "advise"], ["advise", "report", 1], ["review", "verify", 1], ["plan", "verify"], ["triage", "evaluate"], ["learn", "evaluate", 1], ["plan", "report"], ["verify", "combine"], ["combine", "report", 1], ["verify", "report", 1]];
 const COL = {done: ["var(--t-bg)", "var(--t)", "var(--t-ink)"], running: ["var(--b-bg)", "var(--b)", "var(--b-ink)"], pending: ["var(--w-bg)", "var(--w)", "var(--w-ink)"],
   queued: ["var(--w-bg)", "var(--w)", "var(--w-ink)"], failed: ["var(--r-bg)", "var(--r)", "var(--r-ink)"], lost: ["var(--r-bg)", "var(--r)", "var(--r-ink)"],
   cancelled: ["var(--soft)", "var(--faint)", "var(--mute)"], todo: ["var(--card)", "var(--line)", "var(--ink)"]};
@@ -362,6 +362,13 @@ async function viewResults(name) {
       segs: used.map(([o, c]) => ({value: v[o] || 0, color: c, label: o}))})), {lw: 230, fmt: v => v})}
       ${legend(used)}<div class="small muted">Removed and reduced are measured on the compiled code after verification. The reason for every other outcome is on the group page.${pl.api_policy ? ` Public API policy: ${esc(pl.api_policy)} (${int(pl.frozen_classes || 0)} classes kept in place).` : ""}</div></div>`;
   }
+  if (A.combine && ov.combined && ov.combined.whole_repository) {
+    const C = ov.combined, wb = C.whole_repository.before || {}, wa = C.whole_repository.after || {};
+    const ks = [...new Set([...Object.keys(wb), ...Object.keys(wa)])].sort();
+    h += `<div class="card sec"><h2>Combined plan for the whole repository <small>${(C.plans_applied || []).length} plans applied together · ${int(C.operations)} operations · ${C.compiles ? "compiles" : "does not compile"} · ${int(C.removed)} smells removed · ${int(C.left_out)} plans left out</small></h2>
+    ${bars(ks.map(k => ({label: k.replace(/_/g, " "), value: 0, total: `${wb[k] || 0} → ${wa[k] || 0}`, segs: [{value: wa[k] || 0, color: "var(--c1)", label: "after"}, {value: Math.max(0, (wb[k] || 0) - (wa[k] || 0)), color: "var(--c2)", label: "removed"}]})), {lw: 200, fmt: v => v})}
+    ${legend([["after the combined plan", "var(--c1)"], ["removed", "var(--c2)"]])}<div class="small muted">Patch: <code>combined/plan.patch</code>.</div></div>`;
+  }
   if (A.plan) {
     const rows = (pl.groups || []).filter(r => r.recommended);
     const planNames = [...new Set(rows.map(r => r.recommended))], pc = Object.fromEntries(planNames.map((p, i) => [p, PAL[i % PAL.length]]));
@@ -458,7 +465,9 @@ async function viewGroup(name, gid) {
   <div class="row" style="margin:6px 0 4px"><h1 class="mono" style="font-size:20px">${esc(gid)}</h1><span class="tag pu">${esc((P.type || T.type || "").replace(/_/g, " "))}</span>${P.rank ? `<span class="chip">rank <b>${P.rank}</b></span>` : ""}</div>
   <div class="small muted">${pk.map(x => `<code>${esc(x)}</code>`).join(" ")}</div>
   <div style="margin-top:10px">${[["severity", num(T.severity)], ["PageRank", num(T.pagerank, 3)], ["changes", T.changes], ["class edges", T.class_edges], ["smells merged", T.smells], ["tools", T.tools], ["priority", num(T.priority, 3)]].filter(x => x[1] != null && x[1] !== "–").map(([k, v]) => `<span class="chip">${k} <b>${esc(v)}</b></span>`).join("")}</div>`;
-  if (!plans.length || !plans.some(p => (p.operations || []).length)) { h += `<div class="empty sec">No plan for this group. ${esc(P.skipped || P.no_plan_reason || "")}</div>`; $("#view").innerHTML = h; return; }
+  const advice = P.advice && P.advice.directions ? `<div class="card sec"><h2>Design advice <small>not verified · ${esc(P.advice.model || "language model")} · never counted in the results</small></h2>${P.advice.directions.map(d => `<div style="margin:8px 0"><b>${esc(d.title || "")}</b> <span class="tag">${esc(d.effort || "?")} effort</span><div class="small">${esc(d.change || "")}</div>${d.risk ? `<div class="small muted">Risk: ${esc(d.risk)}</div>` : ""}</div>`).join("")}</div>` : "";
+  if (!plans.length || !plans.some(p => (p.operations || []).length)) { h += `<div class="empty sec">No plan for this group. ${esc(P.skipped || P.no_plan_reason || "")}</div>` + advice; $("#view").innerHTML = h; return; }
+  if (!P.recommended) h += advice;
   if (!P.recommended && (P.no_plan_reason || P.skipped)) h += `<div class="card sec small"><b>No plan recommended.</b> ${esc(P.no_plan_reason || P.skipped)}</div>`;
   h += `<div class="grid g2 sec"><div class="card"><h2>Plans compared</h2><table><tr><th>plan</th><th>steps</th><th>cost</th><th>benefit</th><th>new</th><th>score</th></tr>${plans.map(p => `<tr${p.name === P.recommended ? ' style="background:var(--a-bg)"' : ""}><td>${esc(p.name)} ${p.name === P.recommended ? '<span class="tag pu">recommended</span>' : ""}</td><td>${(p.operations || []).length}</td><td>${num(p.change_cost, 1)}</td><td>${num(p.benefit)}</td><td>${num(p.new_smells, 0)}</td><td><b>${num(p.score, 3)}</b></td></tr>`).join("")}</table></div>
   <div class="card"><h2>Score breakdown</h2>${(() => { const w = S.info && P ? ({new_smell: .25, side_removed: .05, cost: .3}) : {}; return plans.filter(p => p.score != null).map(p => {

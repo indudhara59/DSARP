@@ -72,6 +72,9 @@ STAGES: tuple[Stage, ...] = (
           options=(Option("shallow", "--shallow", "bool", False, "fetch only the commit (no history for co-change "
                                                                    "and learned moves)"),),
           resources=Resources(2, "8G", "02:00:00")),
+    Stage("detect", "Run detectors", "0", "Optional: run Arcan/Designite (detectors with a 'command' in the config) "
+          "on the checkout at the chosen commit, so their output matches the analysed code",
+          outputs=(), requires=("checkout",), resources=Resources(8, "32G", "04:00:00")),
     Stage("ingest", "Ingest", "1", "Import detector output into one smell table",
           outputs=("smells.csv", "manifest.json"), resources=Resources(2, "8G", "01:00:00")),
     Stage("model", "Program model", "2", "javac extracts classes, members, dependencies; git history",
@@ -113,6 +116,12 @@ STAGES: tuple[Stage, ...] = (
                           minimum=1),
                    Option("dry_run", "--dry-run", "bool", False, "only record the review, keep the plans")),
           resources=Resources(1, "4G", "01:00:00")),
+    Stage("advise", "Design advice", "7b", "Optional: a language model suggests design directions for groups "
+          "without a verified plan (marked as not verified, never counted). Needs DSARP_LLM_URL, DSARP_LLM_MODEL "
+          "and DSARP_LLM_KEY in the environment of the web server",
+          outputs=("plans/advice_cache.json",), requires=("plan",), network=True,
+          options=(Option("groups", "--groups", "int", None, "only the first N groups (empty = all)", minimum=1),),
+          resources=Resources(1, "4G", "01:00:00")),
     Stage("explain", "Explain", "7", "Step-by-step report of the recommended plans",
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
@@ -124,8 +133,20 @@ STAGES: tuple[Stage, ...] = (
                    Option("build", "--build", "choice", "none", "also build and run selected tests",
                           ("none", "auto", "maven", "gradle")),
                    Option("max_compiles", "--max-compiles", "int", 30, "compiler runs for delta debugging", minimum=1),
-                   Option("memory", "--memory", "text", "4g", "Java heap")),
+                   Option("memory", "--memory", "text", "4g", "Java heap"),
+                   Option("detectors", "@config", "bool", False, "also run the configured detectors on every plan "
+                          "(slow; the combined plan runs them once)")),
           resources=Resources(8, "32G", "12:00:00")),
+    Stage("combine", "Combined plan", "8b", "Non-conflicting verified plans applied together, compiled once; "
+          "smells of the whole repository before and after",
+          outputs=("combined/combined.json",), requires=("verify", "checkout"),
+          options=(Option("max_compiles", "--max-compiles", "int", 12, "compiler runs for dropping plans", minimum=1),
+                   Option("memory", "--memory", "text", "4g", "Java heap"),
+                   Option("build", "--build", "choice", "auto", "build the affected modules and run their tests",
+                          ("none", "auto", "maven", "gradle")),
+                   Option("detectors", "@config", "bool", True, "run the configured detectors on the original and "
+                          "the combined code")),
+          resources=Resources(8, "32G", "04:00:00")),
     Stage("evaluate", "Compare", "9", "Optional, for the thesis: run baselines (solver only, search only, "
           "NSGA-II, random, fixed affinity) on the same groups to compare with DSARP",
           outputs=("evaluation/summary.csv",), requires=("triage",), optional_requires=("learn",),
@@ -137,7 +158,7 @@ STAGES: tuple[Stage, ...] = (
                    Option("seed", "--seed", "int", 0, "random seed", minimum=0)),
           resources=Resources(16, "64G", "24:00:00")),
     Stage("report", "HTML report", "9", "Self-contained report with triage, plans and verification",
-          outputs=("report.html",), requires=("plan",), optional_requires=("verify",),
+          outputs=("report.html",), requires=("plan",), optional_requires=("verify", "combine"),
           resources=Resources(1, "4G", "00:20:00")),
 )
 
@@ -227,18 +248,24 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
     base: dict[str, list[str]] = {
         "check": ["check", cfg, *data],
         "checkout": ["checkout", cfg, "--workdir", work, *data],
+        "detect": ["detect", cfg, "--workdir", work, *data],
         "ingest": ["ingest", cfg, *data, "--out", res],
         "model": ["model", cfg, "--workdir", work, "--out", str(p.results / "model"), "--ingest", res, *data],
         "triage": ["triage", res],
         "learn": ["learn", res, "--workdir", work],
         "plan": ["plan", res],
         "review": ["review", res],
+        "advise": ["advise", res],
         "explain": ["explain", res],
         "verify": ["verify", res, "--workdir", work],
+        "combine": ["combine", res, "--workdir", work],
         "evaluate": ["evaluate", res],
         "report": ["report", res],
     }
-    return base[stage_id] + option_args(stage, values)
+    args = option_args(stage, values)
+    if "@config" in args:                      # use the detector commands of the project's configuration
+        args = [a for a in args if a != "@config"] + ["--config", cfg, *data]
+    return base[stage_id] + args
 
 
 def output_state(stage: Stage, p: Paths) -> dict:

@@ -50,12 +50,20 @@ class DetectorInput:
         path_root: Absolute path prefix used on the machine where the
             detector ran (Designite writes absolute file paths). Optional; it
             is inferred when missing.
+        command: How to run the detector (optional), with ``{repo}`` (source
+            folder) and ``{out}`` (output folder) as placeholders, e.g.
+            ``java -jar /opt/DesigniteJava.jar -i {repo} -o {out}``. With a
+            command, ``dsarp detect`` runs the tool on the checkout at the
+            configured commit and writes its output to ``path`` (default
+            ``detected/<name>/<tool>`` under the data root), so the input always
+            matches the analysed code; stage 8 can run it on the changed code.
     """
 
     tool: str
     path: Path
     module: str | None = None
     path_root: str | None = None
+    command: str | None = None
 
 
 @dataclass
@@ -121,17 +129,19 @@ def parse_config(raw: dict[str, Any], data_root: Path, source: str = "<config>")
     if not isinstance(raw["detectors"], list) or not raw["detectors"]:
         raise ConfigError(f"{source}: 'detectors' must be a non-empty list")
     for i, entry in enumerate(raw["detectors"]):
-        if not isinstance(entry, dict) or "tool" not in entry or "path" not in entry:
-            raise ConfigError(f"{source}: detectors[{i}] needs 'tool' and 'path'")
+        if not isinstance(entry, dict) or "tool" not in entry or ("path" not in entry and "command" not in entry):
+            raise ConfigError(f"{source}: detectors[{i}] needs 'tool' and 'path' (or a 'command' to run it)")
         tool = str(entry["tool"]).lower()
         if tool not in SUPPORTED_TOOLS:
             raise ConfigError(f"{source}: detectors[{i}].tool must be one of {sorted(SUPPORTED_TOOLS)}, got '{tool}'")
-        p = Path(entry["path"])
+        mod = entry.get("module")
+        p = Path(entry.get("path") or f"detected/{raw['name']}/{tool}{'_' + str(mod) if mod else ''}")
         detectors.append(DetectorInput(
             tool=tool,
             path=p if p.is_absolute() else data_root / p,
-            module=entry.get("module"),
+            module=mod,
             path_root=entry.get("path_root"),
+            command=str(entry["command"]) if entry.get("command") else None,
         ))
 
     commit = raw.get("commit")

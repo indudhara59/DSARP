@@ -36,6 +36,14 @@ From: ubuntu:24.04
     # Solver used from phase 4 on.
     /opt/venv/bin/pip install --no-cache-dir "ortools>=9.10"
 
+    # Open-source DesigniteJava (Apache 2.0): class-level smells (cyclic-dependent and hub-like
+    # modularization) for re-detection without a licence. Optional: the image builds without it.
+    # Use:  java -jar /opt/designite/DesigniteJava.jar -i {repo} -o {out}/
+    ( git clone --depth 1 https://github.com/tushartushar/DesigniteJava.git /tmp/dj \
+      && cd /tmp/dj && mvn -q -DskipTests package \
+      && mkdir -p /opt/designite && cp target/*-jar-with-dependencies.jar /opt/designite/DesigniteJava.jar \
+      && rm -rf /tmp/dj ~/.m2 ) || echo "DesigniteJava (open source) not built; continuing without it"
+
 %environment
     export PATH=/opt/venv/bin:$PATH
     export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64

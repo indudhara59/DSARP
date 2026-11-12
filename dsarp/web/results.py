@@ -153,6 +153,13 @@ def overview(res: Path) -> dict:
                              "per_group": [{"group_id": r.get("group_id"), "approach": r.get("approach"),
                                             "score": _num(r.get("score")), "new_smells": _num(r.get("new_smells"))}
                                            for r in _csv(res / "evaluation" / "results.csv")]}
+    comb = _json(res / "combined" / "combined.json")
+    if comb:
+        out["available"]["combine"] = True
+        out["combined"] = {k: comb.get(k) for k in ("plans_applied", "operations", "compiles", "removed",
+                                                   "whole_repository", "files_changed", "patch_lines")}
+        out["combined"]["left_out"] = len(comb.get("conflicts", [])) + len(comb.get("interfering", [])) + \
+            len(comb.get("plans_dropped_by_compiler", []))
     out["available"]["report"] = (res / "report.html").exists()
     out["available"]["report_md"] = (res / "plans" / "report.md").exists()
     return out
