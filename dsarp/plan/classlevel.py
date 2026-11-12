@@ -7,6 +7,10 @@ change. Candidate operations for a dependency ``s -> t``:
 * **Delete dead code** (deprecated members nobody calls, as for packages);
 * **Extract interface** (``s`` uses only instance methods of ``t``): ``s``
   depends on a new interface that ``t`` implements;
+* **Move instance method** (feature envy): an instance method of ``s`` that
+  takes a ``t`` parameter, uses no state of ``s`` and is not called inside
+  ``s`` becomes an instance method of ``t`` (the parameter becomes ``this``;
+  callers ``x.m(a, tt)`` become ``tt.m(a)``);
 * **Move static members**: *pull* the static methods and fields of ``t`` that
   ``s`` uses into ``s``, or *push* the static members of ``s`` that use ``t``
   into ``t``. Members only move with everything they need from their class
@@ -197,6 +201,74 @@ def movable_group(rf: RepoFacts, owner: str, members: set[str]) -> set[str] | No
     return group if len(group) <= 12 else None
 
 
+def _params(mid: str) -> list[str]:
+    """Parameter types of a member id ``a.B#m(int,C)`` (simple names, generics removed)."""
+    m = re.search(r"\((.*)\)$", mid)
+    if not m or not m.group(1).strip():
+        return []
+    depth, cur, out = 0, "", []
+    for ch in m.group(1):
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        if depth == 0 and ch not in "<>":
+            cur += ch
+    out.append(cur)
+    return [x.strip().rsplit(".", 1)[-1].replace("...", "[]") for x in out]
+
+
+def movable_instance(rf: RepoFacts, owner: str, m: str, dest: str) -> int | None:
+    """Index of the ``dest`` parameter if instance method ``m`` of ``owner`` can move to ``dest``.
+
+    Conditions (Move Method, feature envy): a plain instance method of a class
+    (no constructor, override, overridden method, abstract or protected API),
+    exactly one parameter of type ``dest``, no use of instance members or
+    nested types of ``owner``, not called inside ``owner`` and never used as a
+    method reference; ``dest`` is a production class without a member of that name."""
+    info = rf.member_info.get(m)
+    if info is None or info["kind"] != "method" or info["static"] or info["override"] or info["protected"]:
+        return None
+    if rf.kind.get(owner) != "class" or rf.kind.get(dest) != "class" or dest not in rf.prod or rf.fixed(dest) \
+            or rf.protected.get(owner):
+        return None
+    if rf.frozen.get(owner) and info["visibility"] in ("public", "protected"):
+        return None
+    name = m.split("#", 1)[1].split("(")[0]
+    if name.startswith("<") or rf._is_overridden(m):
+        return None
+    params = _params(m)
+    d_simple = dest.rsplit(".", 1)[-1]
+    hits = [i for i, p in enumerate(params) if p == d_simple]
+    if len(hits) != 1:
+        return None
+    ix = index(rf)
+    for tgt, top, kind in ix.member_uses.get(m, []):
+        if top != owner:
+            continue
+        if "#" not in tgt:
+            if tgt != owner:
+                return None                      # a nested type of the owner
+            continue
+        ti = rf.member_info.get(tgt)
+        if ti is None or not ti["static"]:
+            return None                          # instance state of the owner
+    for src, a in ix.member_users.get(m, []):
+        if a == owner:
+            return None                          # called inside its class: the dependency would stay
+    d = rf.model.deps
+    if ((d["target"] == m) & (d["kind"] == "method_ref")).any():
+        return None
+    dest_names = {mid.split("#", 1)[1].split("(")[0] for mid, i in rf.member_info.items() if i["owner"] == dest}
+    if name in dest_names:
+        return None
+    return hits[0]
+
+
 @dataclass
 class Candidate:
     key: str
@@ -274,6 +346,10 @@ def candidates(rf: RepoFacts, focus: list[tuple[str, str]], edges: set[tuple[str
                 out.setdefault(c.key, c)
         srcs = {m for m in e.source_members if "#" in m}
         ix = index(rf)
+        if srcs and not any("#" not in m and m != s for m in e.source_members if m not in srcs):
+            c = _instance_candidate(rf, s, t, srcs, edges)
+            if c:
+                out.setdefault(c.key, c)
         type_level = any("#" not in src and kind != "import"
                          for src, _, b, kind in ix.rows_from.get(s, []) if b == t)
         if srcs and not type_level:
@@ -283,6 +359,35 @@ def candidates(rf: RepoFacts, focus: list[tuple[str, str]], edges: set[tuple[str
         if len(out) >= max_candidates:
             break
     return list(out.values())
+
+
+def _instance_candidate(rf: RepoFacts, owner: str, dest: str, members: set[str],
+                        edges: set[tuple[str, str]]) -> Candidate | None:
+    """Move the instance methods ``members`` of ``owner`` (all its uses of ``dest``) into ``dest``."""
+    idx = {}
+    for m in members:
+        info = rf.member_info.get(m)
+        if info is None or info["static"]:
+            return None
+        k = movable_instance(rf, owner, m, dest)
+        if k is None:
+            return None
+        idx[m] = k
+    after = apply_member_moves(rf, edges, {m: dest for m in members})
+    removes, adds = edges - after, after - edges
+    if not removes:
+        return None
+    ix = index(rf)
+    callers = {a for m in members for _, a in ix.member_users.get(m, []) if a not in (owner, dest)}
+    api = any(rf.member_info[m]["api"] for m in members)
+    cost = round(1.5 + 0.5 * len(members) + 0.3 * len(callers) + (5.0 if api else 0.0), 3)
+    op = {"op": "move_member", "instance": True, "member": sorted(members)[0], "members": sorted(members),
+          "param_index": {m: idx[m] for m in sorted(members)}, "from_class": owner, "to_class": dest,
+          "callers": sorted(callers), "cost": cost,
+          "reason": f"{', '.join(m.split('#', 1)[1].split('(')[0] for m in sorted(members))} work on a "
+                    f"{dest.rsplit('.', 1)[-1]} and use no state of {owner.rsplit('.', 1)[-1]}"}
+    return Candidate(f"method:{owner}>{dest}:{','.join(sorted(members))}", [op], cost, removes, adds, set(members),
+                     f"move {len(members)} instance methods of {owner} to {dest}")
 
 
 # ------------------------------------------------------------------------ plan model

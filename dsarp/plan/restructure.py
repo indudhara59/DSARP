@@ -17,7 +17,7 @@ their nested classes and their tests. Units are never broken up. Each unit
 stays, moves to an existing package it is related to (learned affinity), or
 moves to a new sub-package; for every package that keeps or receives units::
 
-    5 * sets - classes <= 0                       (LCC <= 0.2)
+    small or 5 * sets - classes <= -1            (Designite: fewer than 6 types, or LCC < 0.2)
     or no worse than today for a receiving package that already has the smell
 
 plus the same no-cycle and size rules as above.
@@ -42,7 +42,7 @@ from collections import Counter, defaultdict
 import networkx as nx
 
 from . import solver as slv
-from .extra import FC_LCC, GOD_CLASSES, ExtraFacts, extra, scattered_methods
+from .extra import FC_LCC, FC_MIN_TYPES, GOD_CLASSES, ExtraFacts, extra, fc_present, scattered_methods
 from .facts import (EDGE_COST, FIT_RATIO, MIN_FIT, NEW_EDGE_COST, RepoFacts, current_package_pairs, move_cost,
                     tokens)
 from .generator import Plan
@@ -54,6 +54,13 @@ GENERIC = {"impl", "util", "utils", "abstract", "base", "default", "helper", "he
 
 # ------------------------------------------------------------------------ helpers
 
+NEW_PACKAGE_COST = 3.0
+# words that say nothing about a concern (shared by unrelated classes)
+GENERIC_WORDS = {"util", "utils", "helper", "helpers", "exception", "exceptions", "handler", "factory", "impl",
+                 "abstract", "base", "default", "simple", "config", "manager", "service", "test", "tests",
+                 "type", "types", "info", "data", "common", "constants", "support"}
+
+
 def split_cost(rf: RepoFacts, c: str) -> float:
     """Cost of moving ``c`` into a new sub-package of its own package (no affinity: cohesion decides)."""
     users = rf.users.get(c, len(rf.dependents(c)))
@@ -61,14 +68,6 @@ def split_cost(rf: RepoFacts, c: str) -> float:
     if rf.api.get(c):
         cost += 5.0
     return round(cost, 3)
-
-
-def _weights(rf: RepoFacts) -> dict[str, int]:
-    if getattr(rf, "_nested", None) is None:
-        t = rf.model.types
-        t = t[~t["is_test"].astype(bool) & ~t["is_generated"].astype(bool)]
-        rf._nested = t["top_level"].value_counts().to_dict()
-    return rf._nested
 
 
 def _all_packages(rf: RepoFacts) -> set[str]:
@@ -211,12 +210,12 @@ def _key(p: Plan) -> list:
 def split_god(rf: RepoFacts, gid: str, pkg: str, time_limit: float = 60.0, backend: str = "auto",
               max_parts: int = 4) -> tuple[list[Plan], dict]:
     """Split a package with more than 30 classes (see :func:`split_units`)."""
-    w = _weights(rf)
-    size = sum(w.get(c, 1) for c in rf.pkg_classes.get(pkg, ()))
+    xf = extra(rf)
+    size = sum(1 for t, p in xf.type_pkg.items() if p == pkg and t not in xf.generated)
     if size <= GOD_CLASSES:
         return [], {"classes": size, "limit": GOD_CLASSES,
-                    "skipped": f"{pkg} has {size} production classes (limit {GOD_CLASSES}) at this commit; "
-                               "the detector also counted test or generated classes"}
+                    "skipped": f"{pkg} has {size} types (limit {GOD_CLASSES}, tests and nested classes counted) at "
+                               "this commit; the detector analysed a different version of the code"}
     k = min(max_parts, max(1, math.ceil(size / GOD_CLASSES)))
     strict, info = split_units(rf, gid, pkg, "god", time_limit, backend, max_new=k)
     relaxed, _ = split_units(rf, gid, pkg, "god", time_limit, backend, max_new=k, strict=False)
@@ -226,7 +225,7 @@ def split_god(rf: RepoFacts, gid: str, pkg: str, time_limit: float = 60.0, backe
             p.name = "relaxed_" + p.name
             strict.append(p)
             seen.append(_key(p))
-    info["variants"] = "strict: new sub-packages must be cohesive (LCC <= 0.2); relaxed: they may not be"
+    info["variants"] = "strict: new sub-packages must be cohesive (fewer than 6 types or LCC < 0.2); relaxed: they may not be"
     return strict, info
 
 
@@ -267,6 +266,21 @@ def fc_units(rf: RepoFacts, pkg: str) -> tuple[list[dict], dict]:
     return units, {"classes": len(types), "sets": k, "lcc": round(k / len(types), 4) if types else 0.0}
 
 
+def _fc_free(m, name: str, terms: dict[str, tuple[int, int]], n0: int, k0: int, slack=None) -> None:
+    """Package ``name`` (``n0`` types and ``k0`` sets now, plus ``terms``: variable -> (types, sets) it brings)
+    has no feature concentration: fewer than FC_MIN_TYPES types, or 5 * sets <= types - 1 (LCC < 0.2).
+    With ``slack`` the cohesion part is soft (slack = sets above the limit, times 5)."""
+    big_n = n0 + sum(n for n, _ in terms.values())
+    big_k = n0 + sum(5 * k for _, k in terms.values()) + 5 * k0 + 1
+    y = m.binary(f"small|{name}")             # 1: the package has fewer than FC_MIN_TYPES types
+    m.add({**{v: n for v, (n, _) in terms.items()}, y: big_n}, ub=FC_MIN_TYPES - 1 - n0 + big_n,
+          name=f"small {name}")
+    coh = {**{v: 5 * k - n for v, (n, k) in terms.items()}, y: -big_k}
+    if slack is not None:
+        coh[slack] = -1
+    m.add(coh, ub=-1 - (5 * k0 - n0), name=f"cohesive {name}")
+
+
 def split_fc(rf: RepoFacts, gid: str, pkg: str, time_limit: float = 60.0, backend: str = "auto",
              max_new: int = 4) -> tuple[list[Plan], dict]:
     """Split a package with unrelated sets of classes (see :func:`split_units`)."""
@@ -279,17 +293,16 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
 
     ``mode="fc"``: the package's LCC must drop to 0.2 (remaining smell: how far it is above).
     ``mode="god"``: the package must drop to 30 classes (remaining: classes above); its LCC may not get worse.
-    In both modes every receiving package keeps LCC <= 0.2 (or no worse than today) and at most 30
-    classes, new sub-packages are cohesive (LCC <= 0.2) and no new package cycle is closed.
+    In both modes every receiving package keeps fewer than 6 types or LCC < 0.2 (or no worse than today) and at most 30
+    classes, new sub-packages are cohesive (fewer than 6 types or LCC < 0.2) and no new package cycle is closed.
     With ``strict=False`` a new sub-package may be less cohesive (each set above the limit costs 2):
     the split then appears as a plan with a feature-concentration side effect, and the score decides."""
     xf = extra(rf)
     units, info = fc_units(rf, pkg)
-    w = _weights(rf)
     for u in units:
-        u["size"] = sum(w.get(c, 1) for c in u["classes"])
+        u["size"] = u["n"]                     # Designite counts every type: production, test, nested
     info["size"] = sum(u["size"] for u in units)
-    if mode == "fc" and (not units or info["lcc"] <= FC_LCC):
+    if mode == "fc" and (not units or not fc_present(info["classes"], info["sets"])):
         return [], {**info, "skipped": f"LCC of {pkg} is {info['lcc']} at this commit (limit {FC_LCC}): "
                                       "its classes are related enough"}
     if getattr(rf, "_pairs", None) is None:
@@ -329,7 +342,9 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
             aff = sum(rf.affinity(c, q) for c in u["classes"]) / len(u["classes"])
             scored.append((q, aff))
         opts[i] = sorted(scored, key=lambda x: (-x[1], x[0]))[:targets_per_unit]
-    stand_alone = [i for i, u in enumerate(units) if not u["fixed"] and 5 * u["sets"] <= u["n"]]
+    def coherent(n, k):
+        return not fc_present(n, k)
+    stand_alone = [i for i, u in enumerate(units) if not u["fixed"] and coherent(u["n"], u["sets"])]
     n_new = max_new if not strict else min(max_new, max(1, len(stand_alone)))
     new_parts = [f"#{j}" for j in range(1, n_new + 1)]
     targets = sorted({q for o in opts.values() for q, _ in o})
@@ -353,7 +368,7 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
             if a in ts and b in ts:
                 g.add_edge(a, b)
         q_state[q] = {"n": len(ts), "sets": nx.number_connected_components(g) if ts else 0,
-                      "size": sum(w.get(c, 1) for c in rf.pkg_classes.get(q, ()))}
+                      "size": len(ts)}
     # dependencies between units (production classes) and with the classes that never move
     unit_deps = Counter()
     for (s, t), e in rf.edges.items():
@@ -368,16 +383,25 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
             ext_deps[(unit_of[s], "out", pt)] += 1
         if pt == pkg and ps in targets and t in unit_of:
             ext_deps[(unit_of[t], "in", ps)] += 1
+    # units may share a new sub-package only if they belong together: a dependency between them or a
+    # meaningful common word in their class names (a new package must not be a bin of unrelated classes)
+    generic = GENERIC_WORDS | tokens(pkg)                 # words of the package path say nothing either
+    words = {i: set().union(*[tokens(c.rsplit(".", 1)[-1]) for c in u["classes"]]) - generic
+             for i, u in enumerate(units)}
+    linked = {(a, b) for (a, b) in unit_deps} | {(b, a) for (a, b) in unit_deps}
+    apart = [(a, b) for a in opts for b in opts if a < b and (a, b) not in linked and not (words[a] & words[b])]
     info.update({"units": len(units), "movable_units": len(opts), "candidate_packages": targets,
                  "new_parts": len(new_parts)})
-    single = sum(1 for i, u in enumerate(units) if not u["fixed"] and 5 * u["sets"] > u["n"])
-    homeless = sum(1 for i, u in enumerate(units) if not u["fixed"] and not opts.get(i) and 5 * u["sets"] > u["n"])
+    movable = sum(1 for u in units if not u["fixed"])
+    fixed_n = sum(u["n"] for u in units if u["fixed"])
+    homeless = sum(1 for i, u in enumerate(units) if not u["fixed"] and not opts.get(i))
     info["why_none"] = (
-        f"{pkg} has {info['sets']} sets of related classes in {info['classes']} classes (LCC {info['lcc']}); "
-        f"{single} sets are too small to form a cohesive package of their own (Designite needs at most one set "
-        f"per 5 classes) and {homeless} of them have no related package to move to, so every placement would "
-        "give the receiving package the same smell; a fix needs new relations between the classes (shared "
-        "abstractions), which is a design change DSARP cannot verify")
+        f"{pkg} has {info['sets']} sets of related classes in {info['classes']} types (LCC {info['lcc']}); "
+        f"{movable} sets can move ({homeless} of them have no related package), {len(units) - movable} must stay "
+        f"({fixed_n} types: protected or widely used public API, or tests only); no placement leaves every "
+        f"package with fewer than {FC_MIN_TYPES} types or LCC below {FC_LCC} without new cycles or more cost "
+        "than benefit; a fix needs new relations between the classes (shared abstractions), which is a design "
+        "change DSARP cannot verify")
 
     def options(i):
         if i not in opts:
@@ -403,28 +427,37 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
             m.add({v: 1 for v in vs}, lb=1, ub=1)
         stay = {f"x|{i}|{pkg}": i for i in range(len(units))}
         if mode == "fc":
-            # LCC of the package itself (soft: remaining smell)
-            slack = m.var("lcc_slack", 0, 5 * sum(u["sets"] for u in units))
+            # feature concentration of the package itself (soft: remaining smell)
+            slack = m.var("lcc_slack", 0, 5 * sum(u["sets"] for u in units) + 1)
             back[slack] = 1.0
-            m.add({**{v: 5 * units[i]["sets"] - units[i]["n"] for v, i in stay.items()}, slack: -1}, ub=0)
+            _fc_free(m, "self", {v: (units[i]["n"], units[i]["sets"]) for v, i in stay.items()}, 0, 0, slack)
         else:
             # size of the package itself (soft: remaining smell); its LCC must not get worse
             over = m.var("over", 0, info["size"])
             back[over] = 1.0
             m.add({**{v: units[i]["size"] for v, i in stay.items()}, over: -1}, ub=GOD_CLASSES)
             k0, n0 = info["sets"], info["classes"]
-            if 5 * k0 <= n0:
-                m.add({v: 5 * units[i]["sets"] - units[i]["n"] for v, i in stay.items()}, ub=0, name="lcc kept")
+            if not fc_present(n0, k0):
+                _fc_free(m, "self", {v: (units[i]["n"], units[i]["sets"]) for v, i in stay.items()}, 0, 0)
             else:
                 m.add({v: n0 * units[i]["sets"] - k0 * units[i]["n"] for v, i in stay.items()}, ub=0,
                       name="lcc not worse")
         for j in new_parts:
-            terms = {f"x|{i}|{j}": 5 * u["sets"] - u["n"] for i, u in enumerate(units) if m.has(f"x|{i}|{j}")}
+            # creating a package is a design change of its own: prefer a related existing package
+            used = m.binary(f"used|{j}")
+            cost[used] = NEW_PACKAGE_COST
+            for i in range(len(units)):
+                if m.has(f"x|{i}|{j}"):
+                    m.add({f"x|{i}|{j}": 1, used: -1}, ub=0)
+            for a, b in apart:
+                if m.has(f"x|{a}|{j}") and m.has(f"x|{b}|{j}"):
+                    m.add({f"x|{a}|{j}": 1, f"x|{b}|{j}": 1}, ub=1)
+            sj = None
             if not strict:
-                sj = m.var(f"incoherent|{j}", 0, 5 * sum(u["sets"] for u in units))
+                sj = m.var(f"incoherent|{j}", 0, 5 * sum(u["sets"] for u in units) + 1)
                 cost[sj] = 2.0 / 5
-                terms[sj] = -1
-            m.add(terms, ub=0)
+            _fc_free(m, j, {f"x|{i}|{j}": (u["n"], u["sets"]) for i, u in enumerate(units) if m.has(f"x|{i}|{j}")},
+                     0, 0, sj)
         for q in targets:
             st = q_state[q]
             terms = {}
@@ -433,13 +466,13 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
                 if not m.has(v):
                     continue
                 added = u["sets"] - (1 if q in links.get(i, ()) else 0)
-                if 5 * st["sets"] <= st["n"]:
-                    terms[v] = 5 * added - u["n"]
-                else:
-                    terms[v] = st["n"] * added - st["sets"] * u["n"]
+                terms[v] = (u["n"], added)
             if terms:
-                ub = st["n"] - 5 * st["sets"] if 5 * st["sets"] <= st["n"] else 0
-                m.add(terms, ub=ub, name=f"lcc {q}")
+                if coherent(st["n"], st["sets"]):
+                    _fc_free(m, q, terms, st["n"], st["sets"])        # must stay free of the smell
+                else:                                                 # already concentrated: not worse
+                    m.add({v: st["n"] * k - st["sets"] * n for v, (n, k) in terms.items()}, ub=0,
+                          name=f"lcc {q}")
             sz = {f"x|{i}|{q}": u["size"] for i, u in enumerate(units) if m.has(f"x|{i}|{q}")}
             if sz:
                 m.add(sz, ub=max(GOD_CLASSES, st["size"]) - st["size"], name=f"size {q}")

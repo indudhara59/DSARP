@@ -109,6 +109,52 @@ def _cmd_checkout(args: argparse.Namespace) -> int:
     return status
 
 
+def _cmd_detect(args: argparse.Namespace) -> int:
+    """Stage 0: run the configured detectors on the checkout at the configured commit."""
+    import json
+    import subprocess
+    import time
+
+    from .verify.detectors import execute
+    status = 0
+    for path in args.configs:
+        try:
+            cfg = load_config(path, args.data_root)
+        except ConfigError as exc:
+            print(f"ERROR {path}: {exc}", file=sys.stderr)
+            status = 1
+            continue
+        repo = Path(args.workdir) / cfg.name
+        if not repo.exists():
+            print(f"ERROR {cfg.name}: no checkout at {repo} (run dsarp checkout)", file=sys.stderr)
+            status = 1
+            continue
+        head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if cfg.commit and not head.startswith(cfg.commit[:12]):
+            print(f"ERROR {cfg.name}: checkout is at {head[:12]}, not {cfg.commit[:12]} (run dsarp checkout)",
+                  file=sys.stderr)
+            status = 1
+            continue
+        runs = [d for d in cfg.detectors if d.command and (not args.tool or d.tool in args.tool)]
+        if not runs:
+            print(f"{cfg.name}: no detector has a 'command' in the configuration; nothing to run")
+            continue
+        for d in runs:
+            src = repo
+            if d.module:
+                cands = [p for p in [repo / d.module] + sorted(repo.glob(f"**/{d.module}"))[:5] if p.is_dir()]
+                src = cands[0] if cands else repo
+            t0 = time.time()
+            ok, tail = execute(d.command, src, d.path, timeout=args.timeout)
+            (Path(d.path) / "dsarp-detect.json").write_text(json.dumps(
+                {"tool": d.tool, "module": d.module, "commit": head, "command": d.command, "ok": ok,
+                 "seconds": round(time.time() - t0, 1)}, indent=1))
+            print(f"{cfg.name}: {d.tool}{' (' + d.module + ')' if d.module else ''} at {head[:12]} -> {d.path}: "
+                  + ("ok" if ok else "FAILED\n" + tail) + f" [{time.time() - t0:.0f} s]")
+            status |= 0 if ok else 1
+    return status
+
+
 def _cmd_model(args: argparse.Namespace) -> int:
     try:
         cfg = load_config(args.config, args.data_root)
@@ -291,6 +337,29 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_advise(args: argparse.Namespace) -> int:
+    import json
+
+    from .advice import advise_groups
+    from .search.llm import LLMError, from_env
+    try:
+        llm = from_env("openai", temperature=0.2)
+    except LLMError as e:
+        print(f"ERROR: {e}. Set DSARP_LLM_URL, DSARP_LLM_MODEL and DSARP_LLM_KEY.", file=sys.stderr)
+        return 1
+    for d in map(Path, args.results):
+        st = advise_groups(d, llm, groups=args.groups)
+        print(f"{d.name}: {st['groups']} groups without a verified plan; advice for {st['advised']}, "
+              f"{st['rejected']} discarded, {st['failed']} unanswered ({st['llm_calls']} new calls)")
+        from .explain import explain, write
+        from .plan.facts import RepoFacts
+        from .program import ProgramModel
+        result = json.loads((d / "plans" / "plans.json").read_text())
+        rf = RepoFacts.build(ProgramModel(d / "model"), result.get("api_policy", "balanced"))
+        print(f"  report updated: {write(explain(result, rf, None), d / 'plans')}")
+    return 0
+
+
 def _cmd_llm_models(args: argparse.Namespace) -> int:
     from .search.llm import LLMError, list_models
     try:
@@ -315,12 +384,82 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         if not repo.exists():
             print(f"ERROR {d}: no checkout at {repo} (run dsarp checkout)", file=sys.stderr)
             return 1
-        cmds = {k: v for k, v in (("arcan", args.arcan_cmd), ("designite", args.designite_cmd)) if v}
+        cmds = _detector_cmds(args)
         print(f"\n{d.name}:")
         v = Verifier(d, repo, memory=args.memory, classpath=args.classpath, build_tool=args.build,
                      run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
         v.run(args.groups, set(args.group) if args.group else None)
         print(f"  written: {d / 'verify'}")
+    return 0
+
+
+def _detector_cmds(args: argparse.Namespace) -> dict[str, str]:
+    """Detector commands: --arcan-cmd/--designite-cmd, else $DSARP_ARCAN_CMD/$DSARP_DESIGNITE_CMD, else the
+    'command' entries of the configuration given with --config (whole-repository runs only)."""
+    import os
+    cmds = {}
+    for tool in ("arcan", "designite"):
+        c = getattr(args, f"{tool}_cmd", None) or os.environ.get(f"DSARP_{tool.upper()}_CMD")
+        if c:
+            cmds[tool] = c
+    if getattr(args, "config", None):
+        cfg = load_config(args.config, getattr(args, "data_root", None))
+        for d in cfg.detectors:
+            if d.command and not d.module and d.tool not in cmds:
+                cmds[d.tool] = d.command
+    return cmds
+
+
+def _cmd_combine(args: argparse.Namespace) -> int:
+    import json
+
+    from .verify.combine import Combiner
+    from .verify.run import Verifier
+    for d in map(Path, args.results):
+        if not (d / "verify" / "verification.json").exists():
+            print(f"ERROR {d}: no verification (run dsarp verify)", file=sys.stderr)
+            return 1
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        print(f"\n{d.name}:")
+        v = Verifier(d, repo, memory=args.memory, classpath=args.classpath)
+        r = Combiner(v).run(args.max_compiles, _detector_cmds(args), args.build)
+        if "whole_repository" in r:
+            b, a = r["whole_repository"]["before"], r["whole_repository"]["after"]
+            print(f"  {len(r['plans_applied'])} plans applied together ({r['operations']} operations), compiles: "
+                  f"{'yes' if r['compiles'] else 'no'}; {r['removed']} smells removed on the combined code")
+            for k in sorted(set(b) | set(a)):
+                print(f"    {k}: {b.get(k, 0)} -> {a.get(k, 0)}")
+        print(f"  written: {d / 'combined'}")
+    return 0
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    import json
+
+    from .evaluate.history import compare
+    for d in map(Path, args.results):
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        print(f"\n{d.name}:")
+        compare(d, repo, args.until, args.refminer)
+        print(f"  written: {d / 'evaluation' / 'history.csv'}")
+    return 0
+
+
+def _cmd_rating(args: argparse.Namespace) -> int:
+    import json
+
+    from .evaluate.rating import agreement, sheet
+    if args.action == "sheet":
+        for d in map(Path, args.paths):
+            print(f"{d.name}: written {sheet(d, args.groups, args.seed)} (fill in 'verdict': sensible, "
+                  "questionable or wrong)")
+        return 0
+    res = agreement(args.paths, args.llm_review)
+    print(json.dumps(res, indent=1))
+    if args.out:
+        Path(args.out).write_text(json.dumps(res, indent=1))
     return 0
 
 
@@ -490,8 +629,60 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("--dry-run", action="store_true", help="only record the review, do not change the plans")
     rv.set_defaults(func=_cmd_review)
 
+    ad = sub.add_parser("advise", help="stage 7b (optional): design advice by a language model for groups without "
+                                      "a verified plan (marked as not verified; never counted)")
+    ad.add_argument("results", nargs="+")
+    ad.add_argument("--groups", type=int, help="only the first N such groups")
+    ad.set_defaults(func=_cmd_advise)
+
     lm = sub.add_parser("llm-models", help="list the models of the language-model endpoint ($DSARP_LLM_URL)")
     lm.set_defaults(func=_cmd_llm_models)
+
+    dt = sub.add_parser("detect", help="stage 0: run the detectors that have a 'command' in the configuration on "
+                                      "the checkout at the configured commit (their output then matches the code)")
+    dt.add_argument("configs", nargs="+")
+    dt.add_argument("--workdir", default="work", help="folder with the checkouts")
+    dt.add_argument("--data-root", default=None)
+    dt.add_argument("--tool", action="append", choices=["arcan", "designite"], help="only this tool (repeatable)")
+    dt.add_argument("--timeout", type=int, default=7200, help="seconds per detector run")
+    dt.set_defaults(func=_cmd_detect)
+
+    hi = sub.add_parser("history", help="evaluation: compare the recommended steps with what the developers did "
+                                       "in the commits after the analysed one")
+    hi.add_argument("results", nargs="+")
+    hi.add_argument("--workdir", default="work")
+    hi.add_argument("--repo", help="checkout folder with the full history (default: <workdir>/<name>)")
+    hi.add_argument("--until", default="origin/HEAD", help="later revision to compare with (default: origin/HEAD)")
+    hi.add_argument("--refminer", help="RefactoringMiner command with {repo} {start} {end} {json}, e.g. "
+                                      "'RefactoringMiner -bc {repo} {start} {end} -json {json}' (method moves, "
+                                      "extracted interfaces)")
+    hi.set_defaults(func=_cmd_history)
+
+    ra = sub.add_parser("rating", help="evaluation: expert rating sheet of the recommendations, and agreement")
+    ra.add_argument("action", choices=["sheet", "agreement"])
+    ra.add_argument("paths", nargs="+", help="sheet: result folders; agreement: filled rating sheets (CSV)")
+    ra.add_argument("--groups", type=int, default=40, help="sheet: groups in the sample (stratified by smell type)")
+    ra.add_argument("--seed", type=int, default=0)
+    ra.add_argument("--llm-review", help="agreement: evaluation/rating_llm_review.csv (compare raters with it)")
+    ra.add_argument("--out", help="agreement: write the result as JSON")
+    ra.set_defaults(func=_cmd_rating)
+
+    co = sub.add_parser("combine", help="stage 8b: one combined plan (non-conflicting verified plans applied "
+                                        "together, compiled, whole repository before/after)")
+    co.add_argument("results", nargs="+")
+    co.add_argument("--workdir", default="work", help="folder with the checkouts")
+    co.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
+    co.add_argument("--max-compiles", type=int, default=12, help="compiler runs for dropping plans that break the build")
+    co.add_argument("--memory", default="4g")
+    co.add_argument("--classpath", default="")
+    co.add_argument("--build", default="none", choices=["none", "auto", "maven", "gradle"],
+                    help="also build the affected modules and run the tests that use a changed class")
+    co.add_argument("--config", help="repository configuration (its detector 'command' entries are run on the "
+                                     "original and the combined code)")
+    co.add_argument("--data-root", default=None)
+    co.add_argument("--arcan-cmd", help="command to run Arcan ({repo}, {out})")
+    co.add_argument("--designite-cmd", help="command to run Designite ({repo}, {out})")
+    co.set_defaults(func=_cmd_combine)
 
     ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
     ve.add_argument("results", nargs="+")
@@ -507,6 +698,8 @@ def build_parser() -> argparse.ArgumentParser:
     ve.add_argument("--classpath", default="", help="jars of the external libraries (fewer baseline errors)")
     ve.add_argument("--arcan-cmd", help="command to run Arcan on the result ({repo}, {out})")
     ve.add_argument("--designite-cmd", help="command to run Designite on the result ({repo}, {out})")
+    ve.add_argument("--config", help="repository configuration: run its detector 'command' entries on each result")
+    ve.add_argument("--data-root", default=None)
     ve.set_defaults(func=_cmd_verify)
 
     ev = sub.add_parser("evaluate", help="stage 9: compare solver, search, hybrid, NSGA-II, random (and LLM)")

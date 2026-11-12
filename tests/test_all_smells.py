@@ -31,10 +31,10 @@ def make_shop(root: Path) -> None:
         for i in range(1, 18):
             nxt = f"    private {prefix}{i + 1} next;" if i < 17 else ""
             _java(root, "com.shop.big", f"{prefix}{i}", nxt + f"\n    public int id() {{ return {i}; }}")
-    # feature concentration: two related sets of five and one class related to another package
-    for prefix in ("Cart", "Price"):
-        for i in range(1, 6):
-            nxt = f"    private {prefix}{i + 1} next;" if i < 5 else ""
+    # feature concentration: related sets of six and five and one class related to another package
+    for prefix, n in (("Cart", 6), ("Price", 5)):
+        for i in range(1, n + 1):
+            nxt = f"    private {prefix}{i + 1} next;" if i < n else ""
             _java(root, "com.shop.misc", f"{prefix}{i}", nxt)
     _java(root, "com.shop.misc", "Formatter", "    private Text text;\n    public String show() { return \"\" + text; }",
           "import com.shop.text.Text;")
@@ -110,7 +110,7 @@ def test_measures_match_designite_rules(shop):
     snap = xf.snapshot(initial_state(rf), [])
     assert ex.god_size(snap, "com.shop.big") == {"present": True, "classes": 34, "limit": 30}
     f = ex.lcc(snap, "com.shop.misc")
-    assert f["sets"] == 3 and f["classes"] == 11 and f["present"]
+    assert f["sets"] == 3 and f["classes"] == 12 and f["present"]
     assert not ex.lcc(snap, "com.shop.text")["present"]
     methods, classes = ex.scattered_methods(xf, {"com.shop.a"}, {"com.shop.p", "com.shop.q"})
     assert len(methods) == 2 and classes == {"com.shop.p.Tax", "com.shop.q.Fee"}
@@ -245,3 +245,22 @@ def test_widely_used_public_api_is_frozen(shop):
     c = sorted(rf.prod)[0]
     far = next(q for q in rf.pkg_classes if q != rf.package[c] and rf.evidence(c, q) == 0)
     assert not rf.fits(c, far)
+
+
+@needs_jdk
+def test_combined_plan_applies_all_groups_together(shop):
+    from dsarp.verify.combine import Combiner
+    from dsarp.verify.run import Verifier
+    repo, res = shop
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    out = p.run(50)
+    (res / "plans").mkdir(exist_ok=True)
+    (res / "plans" / "plans.json").write_text(json.dumps(out, default=str))
+    v = Verifier(res, repo, log=lambda *_: None)
+    v.run()
+    r = Combiner(v, log=lambda *_: None).run()
+    assert r["compiles"] and len(r["plans_applied"]) >= 3, r
+    assert r["removed"] >= 3
+    wb, wa = r["whole_repository"]["before"], r["whole_repository"]["after"]
+    assert wa.get("god_component", 0) < wb.get("god_component", 0)
+    assert (res / "combined" / "plan.patch").read_text().strip()

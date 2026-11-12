@@ -38,7 +38,8 @@ from .. import detect as det
 
 REL_KINDS = {"field_type", "extends", "implements"}          # association, aggregation, composition, inheritance
 ACCESS_KINDS = {"call", "field_access", "new", "method_ref"}
-FC_LCC = 0.2                                                  # Designite's threshold
+FC_LCC = 0.2                                                  # Designite's threshold (LCC >= 0.2)
+FC_MIN_TYPES = 6        # Designite never reports packages with fewer types (checked on 242 reports, 5 repositories)
 GOD_CLASSES = det.PIPELINE.god_classes                        # more than 30 classes
 _TEST_NAME = re.compile(r"^(?:Test(?P<a>\w+)|(?P<b>\w+?)(?:Tests?|IT|TestCase|Benchmark))$")
 
@@ -149,6 +150,13 @@ class ExtraFacts:
             self._tests_of = {k: sorted(v) for k, v in out.items()}
         return self._tests_of.get(c, [])
 
+    def test_owner(self) -> dict[str, str]:
+        """Test class -> the production class it tests (see :meth:`tests_of`)."""
+        if getattr(self, "_test_owner", None) is None:
+            self.tests_of("")
+            self._test_owner = {t: c for c, ts in self._tests_of.items() for t in ts}
+        return self._test_owner
+
     # ------------------------------------------------------------------ snapshots
 
     def snapshot(self, st, ops: list[dict] | None = None) -> Snapshot:
@@ -229,12 +237,17 @@ def lcc(snap: Snapshot, pkg: str) -> dict:
             g.add_edge(a, b)
     k = nx.number_connected_components(g)
     v = k / len(nodes)
-    return {"present": v > FC_LCC, "classes": len(nodes), "sets": k, "lcc": round(v, 4)}
+    return {"present": fc_present(len(nodes), k), "classes": len(nodes), "sets": k, "lcc": round(v, 4)}
+
+
+def fc_present(n: int, sets: int) -> bool:
+    """Designite's feature concentration: at least 6 types and LCC = sets / types >= 0.2."""
+    return n >= FC_MIN_TYPES and 5 * sets >= n
 
 
 def god_size(snap: Snapshot, pkg: str) -> dict:
-    n = sum(1 for x, p in snap.type_pkg.items()
-            if p == pkg and x not in snap.tests and x not in snap.generated)
+    """Designite's god component: more than 30 types (production and test classes, nested ones too)."""
+    n = sum(1 for x, p in snap.type_pkg.items() if p == pkg and x not in snap.generated)
     return {"present": n > GOD_CLASSES, "classes": n, "limit": GOD_CLASSES}
 
 

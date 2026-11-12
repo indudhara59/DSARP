@@ -203,6 +203,37 @@ def build(results: str | Path) -> str:
                 parts.append(f"<details><summary>Patch ({patch.count(chr(10))} lines, "
                              f"<code>verify/{html.escape(v['group_id'])}/plan.patch</code>)</summary>"
                              f"<pre>{html.escape(patch[:60000])}</pre></details>")
+    combined = _read(r / "combined" / "combined.json")
+    if combined and combined.get("whole_repository"):
+        parts.append("<h2>Combined plan for the whole repository</h2>")
+        parts.append(f"<p>{len(combined['plans_applied'])} verified plans that do not touch the same classes and do "
+                     f"not undo each other were applied together ({combined['operations']} operations, "
+                     f"{combined['files_changed']} files). The result "
+                     f"<span class='{'ok' if combined['compiles'] else 'bad'}'>"
+                     f"{'compiles' if combined['compiles'] else 'does not compile'}</span>; "
+                     f"{combined['removed']} of the groups' smells are removed on the combined code. "
+                     f"Patch: <code>combined/plan.patch</code>.</p>")
+        wb, wa = combined["whole_repository"]["before"], combined["whole_repository"]["after"]
+        parts.append(_table(pd.DataFrame([{"smell": k.replace("_", " "), "before": wb.get(k, 0), "after": wa.get(k, 0),
+                                           "change": wa.get(k, 0) - wb.get(k, 0)}
+                                          for k in sorted(set(wb) | set(wa))])))
+        if combined.get("conflicts") or combined.get("interfering") or combined.get("plans_dropped_by_compiler"):
+            rows = [{"group": c["group_id"], "not applied because": f"changes the same classes as {', '.join(c['with'])}"}
+                    for c in combined.get("conflicts", [])]
+            rows += [{"group": c["group_id"], "not applied because": c["reason"]} for c in combined.get("interfering", [])]
+            rows += [{"group": g, "not applied because": "breaks the build together with the others"}
+                     for g in combined.get("plans_dropped_by_compiler", [])]
+            parts.append("<details><summary>Plans left out of the combination</summary>"
+                         + _table(pd.DataFrame(rows)) + "</details>")
+    hist = _read(r / "evaluation" / "history.json")
+    if hist:
+        parts.append("<h2>Compared with what the developers did later</h2>")
+        parts.append(f"<p>{hist['later_commits']} commits after the analysed one (up to <code>{html.escape(str(hist['until']))}"
+                     f"</code>), with {hist['later_class_moves']} class moves. Of the {hist['checked']} recommended steps "
+                     "that can be checked, the developers later made the <b>same</b> change, moved the class into a "
+                     "<b>new package</b> too, moved it somewhere <b>other</b>, <b>deleted</b> it, or left it "
+                     "<b>unchanged</b> (not done yet; not necessarily wrong).</p>")
+        parts.append(_table(pd.DataFrame([{"result": k, "steps": v} for k, v in hist["results"].items()])))
     if evaluation is not None and not evaluation.empty:
         parts.append("<h2>Evaluation of the plan generators</h2>")
         parts.append(_table(evaluation))

@@ -204,6 +204,23 @@ def load(inp: DetectorInput) -> DetectorResult:
         warnings.append(f"{folder}: ArchitectureSmells.csv missing")
 
     design_file = folder / "DesignSmells.csv"
+    community = folder / "designCodeSmells.csv"
+    if not design_file.exists() and community.exists():
+        # open-source DesigniteJava: class-level smells only, without the classes of a cycle
+        dc = _read(community)
+        cols = {c.strip().lower(): c for c in dc.columns}
+        pc, tc, sc = cols.get("package name"), cols.get("type name"), cols.get("code smell")
+        if pc and tc and sc:
+            for row in dc.itertuples(index=False):
+                vals = dict(zip(dc.columns, row))
+                pkg, cls, kind = str(vals[pc]).strip(), str(vals[tc]).strip(), str(vals[sc]).strip()
+                fq = f"{pkg}.{cls}" if pkg else cls
+                if kind == "Cyclic-Dependent Modularization":
+                    smells.append(Smell(new_id(), TOOL, SmellType.CYCLIC_DEPENDENCY, Level.CLASS, [fq],
+                                        source=str(community), description=kind))
+                elif kind == "Hub-like Modularization":
+                    smells.append(Smell(new_id(), TOOL, SmellType.HUB_LIKE_DEPENDENCY, Level.CLASS, [fq], central=fq,
+                                        source=str(community), description=kind))
     if design_file.exists():
         design = _read(design_file)
         design = design[design["Smell"].isin(DESIGN_TYPES)]

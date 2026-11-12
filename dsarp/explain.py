@@ -87,6 +87,16 @@ def _step_text(rf: RepoFacts, i: int, op: dict, eff: dict) -> list[str]:
         lines.append(f"- **Evidence:** {evidence(rf, op['class'], op['from_package'], op['to_package'])}")
         if op.get("tests"):
             lines.append(f"- **Tests moved with it:** {_names(op['tests'])}")
+    elif o == "move_member" and op.get("instance"):
+        ms = op.get("members", [op["member"]])
+        lines.append(f"### Step {i}: Move instance method{'s' if len(ms) > 1 else ''} "
+                     + ", ".join(f"`{m.split('#', 1)[1]}`" for m in ms))
+        lines.append(f"- **From** class `{op['from_class']}` **to** class `{op['to_class']}`")
+        d_simple = op["to_class"].rsplit(".", 1)[-1]
+        lines.append(f"- **How:** remove the `{d_simple}` parameter and use `this` instead; callers change from "
+                     f"`x.{ms[0].split('#', 1)[1].split('(')[0]}(..., t, ...)` to "
+                     f"`t.{ms[0].split('#', 1)[1].split('(')[0]}(...)`"
+                     + (f" ({len(op.get('callers', []))} classes)" if op.get("callers") else ""))
     elif o == "move_member":
         lines.append(f"### Step {i}: Move static member `{op['member']}`")
         lines.append(f"- **From** class `{op['from_class']}` **to** class `{op['to_class']}`")
@@ -242,6 +252,12 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
                          "more harm (new smells, cost) than benefit. Candidates are listed in `summary.csv`.")
         if group.get("quick_fixes"):
             lines.append(f"- **Quick fixes:** {len(group['quick_fixes'])} (see `plans.json`)")
+        adv = group.get("advice") or {}
+        if adv.get("directions"):
+            lines += ["", f"**Design advice (not verified; {adv.get('model') or 'language model'})**", ""]
+            for d in adv["directions"]:
+                lines.append(f"- *{d.get('title', '')}* ({d.get('effort', '?')} effort): {d.get('change', '')}"
+                             + (f" Risk: {d['risk']}" if d.get("risk") else ""))
         out["markdown"] = "\n".join(lines) + "\n"
         return out
     sim = plan["simulation"]

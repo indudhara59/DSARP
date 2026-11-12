@@ -93,15 +93,23 @@ def interface_name(op: dict) -> str:
 
 
 def class_counts(rf: RepoFacts, st: State) -> dict[str, int]:
-    """Classes per package, nested classes counted with their top-level class (as in stage 3)."""
+    """Types per package as Designite counts them for god components: production and test classes,
+    nested classes included. Test classes move with the class they test."""
+    from .extra import extra
     t = rf.model.types
-    t = t[~t["is_test"].astype(bool) & ~t["is_generated"].astype(bool)]
+    t = t[~t["is_generated"].astype(bool)]
     nested = Counter(t["top_level"])
     out: Counter = Counter()
     for c, p in st.package.items():
         out[p] += nested.get(c, 1)
     for _, p in st.interfaces.items():
         out[p] += 1
+    xf = extra(rf)
+    owner = xf.test_owner()
+    tl = t[t["is_test"].astype(bool) & (t["type"] == t["top_level"])]
+    for tst, p in zip(tl["type"], tl["package"]):
+        c = owner.get(tst)
+        out[st.package.get(c, p) if c else p] += nested.get(tst, 1)
     return dict(out)
 
 
