@@ -459,7 +459,14 @@ plan or creates new smells together with them. The selection is applied to
 one copy of the code and compiled (plans that break the build together are
 dropped by delta debugging), every group is measured on the combined code, and
 the smells of the whole repository are counted before and after
-(`combined/combined.json`, `combined/plan.patch`). With `--build` the affected
+(`combined/combined.json`, `combined/plan.patch`).
+
+On Tika (local, HiGHS): 119 groups have a verified plan (58 smells removed and
+58 reduced on the compiled code; 109 plans compile with all steps, 115 match
+the simulation). 77 of them combine into one plan of 160 operations that
+compiles; whole repository: package cycles 11 → 6, feature concentration
+96 → 70, unstable dependencies 13 → 5, hub-like packages 2 → 0, god
+components 16 → 15. With `--build` the affected
 modules are built and the tests that use a changed class are run; with the
 detector commands of the configuration (or `--arcan-cmd`, `--designite-cmd`)
 the real tools are run on the original and the combined code and every
@@ -493,7 +500,9 @@ too, somewhere **other**, **deleted**, or left **unchanged** (not done yet,
 not necessarily wrong); with RefactoringMiner, method moves and extracted
 interfaces are matched too. On Tika (1,218 later commits, 37 class moves), 7
 recommended moves into new packages were later also made into new packages
-and 16 moved classes were deleted.
+(e.g. DSARP splits the encoding detectors out of `parser.txt`; the developers
+later moved them to `detect.icu4j` and `detect.universal`) and 16 moved
+classes were deleted.
 
 `rating sheet` samples groups (stratified by smell type) and writes one row
 per step (what, element, from, to, why) with empty `verdict` (sensible,

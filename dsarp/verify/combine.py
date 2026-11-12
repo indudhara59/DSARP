@@ -39,7 +39,9 @@ from . import compile as cmp
 from .rewrite import openrewrite_recipe
 
 
-def _key(o: dict) -> str:
+def _key(o) -> str:
+    if isinstance(o, list):
+        o = [{k: x for k, x in i.items() if k != "check"} for i in o]
     return json.dumps(o, sort_keys=True, default=str)
 
 
@@ -102,10 +104,29 @@ class Combiner:
         s = self.sim.run(ops, kind, core, central, g.get("context") or {})
         return _benefit(s, kind), s
 
+    def new_smells(self, ops: list[dict]) -> set[tuple]:
+        """New smells of an operation list, measured the same way whatever the plans' smell types: package-level
+        smells, feature concentration in the packages it touches, and class pairs newly on one cycle."""
+        key = _key(ops)
+        cache = self.__dict__.setdefault("_new_cache", {})
+        if key in cache:
+            return cache[key]
+        sim = self.sim.run(ops, "feature_concentration", [], "", {})
+        out = {(n["type"], n.get("central") or "", tuple(sorted(n.get("packages") or n.get("classes") or [])))
+               for n in sim.new_smells}
+        if any(o["op"] in ("move_member", "extract_interface", "delete_member", "remove_unused_import") for o in ops):
+            from ..plan.extra import extra
+            from ..plan.simulate import apply
+            st = apply(self.rf, ops, self.sim.base_state)
+            snap = extra(self.rf).snapshot(st, ops)
+            out |= {("class_cycle", "", tuple(sorted(n.get("classes") or n.get("members") or [])))
+                    for n in self.sim._new_class_cycles(snap, ops)}
+        cache[key] = out
+        return out
+
     def select(self) -> dict:
         chosen, combined, conflicts, interfering = [], [], [], []
         own: dict[str, float] = {}
-        new_alone: dict[str, int] = {}
         t0 = time.time()
         for g, ops, v in self.candidates():
             gid = g["group_id"]
@@ -131,17 +152,16 @@ class Combiner:
                 if b_c + 1e-9 < own[c["group_id"]]:
                     ok, why = False, f"it reduces the effect of {c['group_id']} from {own[c['group_id']]:.2f} to {b_c:.2f}"
             if ok:
-                allowed = sum(new_alone.values()) + len(s_alone.new_smells)
-                if len(s_trial.new_smells) > allowed:
-                    ok, why = False, (f"together they create {len(s_trial.new_smells)} new smells, more than the "
-                                      f"{allowed} of the plans on their own")
+                extra_new = self.new_smells(trial) - self.new_smells(combined) - self.new_smells(ops)
+                if extra_new:
+                    ok, why = False, (f"together with the selected plans it creates {len(extra_new)} new smells "
+                                      f"that neither creates on its own (e.g. {extra_new.pop()[0].replace('_', ' ')})")
             if not ok:
                 interfering.append({"group_id": gid, "reason": why})
                 continue
             chosen.append({"group_id": gid, "group": g, "ops": ops, "status": verified_status(v)})
             combined = trial
             own[gid] = b_alone
-            new_alone[gid] = len(s_alone.new_smells)
         self.log(f"selected {len(chosen)} plans ({len(combined)} operations); {len(conflicts)} conflicts, "
                  f"{len(interfering)} interfering [{time.time() - t0:.0f} s]")
         return {"chosen": chosen, "conflicts": conflicts, "interfering": interfering}
