@@ -36,6 +36,7 @@ model better (use it on the cluster).
 from __future__ import annotations
 
 import json
+from collections import Counter
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -141,11 +142,11 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict |
 class Planner:
     def __init__(self, model_dir: str | Path, triage_dir: str | Path, backend: str = "auto",
                  time_limit: float = 60.0, log=print, affinity: str | Path | None = None,
-                 search: str = "auto", search_time: float = 120.0, llm=None):
+                 search: str = "auto", search_time: float = 120.0, llm=None, api_policy: str = "balanced"):
         self.log = log
         t0 = time.time()
         self.model = ProgramModel(model_dir)
-        self.rf = RepoFacts.build(self.model)
+        self.rf = RepoFacts.build(self.model, api_policy)
         self.affinity = None
         if affinity:
             from ..learn.affinity import AffinityModel
@@ -350,6 +351,8 @@ class Planner:
                                                           "without breaking a rule (see the model information)")
             elif info.get("why_none"):
                 out["no_plan_reason"] = info["why_none"]
+            else:
+                out["no_plan_reason"] = why_rejected(out["plans"])
         return out
 
     def plan_group(self, row) -> dict:
@@ -402,6 +405,8 @@ class Planner:
                         and (best is None or sc["score"] > best[0]):
                     best = (sc["score"], "search")
         out["recommended"] = best[1] if best else None
+        if best is None and not out.get("skipped") and not out.get("no_plan_reason"):
+            out["no_plan_reason"] = why_rejected(out["plans"])
         return out
 
     def _search(self, gf, plans: list[Plan], t: str, central: str) -> tuple[dict | None, dict]:
@@ -441,9 +446,36 @@ class Planner:
                      + f" [{time.time() - t0:.0f} s]")
             results.append(r)
         return {"groups": results, "backends": slv.available_backends(), "weights": WEIGHTS,
-                "affinity_model": self.affinity, "search": self.search,
+                "affinity_model": self.affinity, "search": self.search, "api_policy": self.rf.api_policy,
+                "frozen_classes": len(self.rf.frozen),
                 "llm": getattr(self.llm, "name", "none") if self.llm else "none",
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}
+
+
+def why_rejected(plans: list[dict]) -> str:
+    """Why no candidate plan was recommended, from the evaluated candidates (with numbers)."""
+    cands = [p for p in plans if p.get("operations") and "score" in p]
+    if not cands:
+        return "the plan models found no change that reduces the smell within the rules (no candidate plan)"
+    useful = [p for p in cands if (p.get("benefit") or 0) > 0]
+    if not useful:
+        return (f"none of the {len(cands)} candidate plans removes any part of the smell when simulated on the "
+                f"whole repository")
+    p = max(useful, key=lambda x: (x.get("score", -9), x.get("benefit", 0)))
+    parts = []
+    if (p.get("checks") or {}).get("status") == "blocked":
+        notes = [n for o in p["operations"] for n in (o.get("check") or {}).get("notes", [])
+                 if (o.get("check") or {}).get("status") == "blocked"]
+        parts.append(f"{p['checks']['blocked']} of its steps are blocked" + (f" ({notes[0]})" if notes else ""))
+    new = (p.get("simulation") or {}).get("new_smells") or []
+    if new:
+        kinds = Counter(n.get("type", "?") for n in new)
+        parts.append("it would create " + ", ".join(f"{v} new {k.replace('_', ' ')}" for k, v in kinds.items()))
+    if (p.get("score") or 0) <= 0:
+        parts.append(f"its score is {p.get('score')} (benefit {p.get('benefit')}, new smells "
+                     f"{p.get('new_smells')}, normalised change cost {p.get('cost_normalised')})")
+    return (f"the best of {len(cands)} candidate plans ({p['name']}, {len(p['operations'])} steps, removes "
+            f"{round(100 * p.get('benefit', 0))}% of the smell) is not safe to recommend: " + "; ".join(parts))
 
 
 def _reported_by(triage_dir: Path) -> dict[str, set[str]]:

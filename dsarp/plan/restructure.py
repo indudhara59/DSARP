@@ -43,8 +43,10 @@ import networkx as nx
 
 from . import solver as slv
 from .extra import FC_LCC, GOD_CLASSES, ExtraFacts, extra, scattered_methods
-from .facts import EDGE_COST, NEW_EDGE_COST, RepoFacts, current_package_pairs, move_cost, tokens
+from .facts import (EDGE_COST, FIT_RATIO, MIN_FIT, NEW_EDGE_COST, RepoFacts, current_package_pairs, move_cost,
+                    tokens)
 from .generator import Plan
+
 
 GENERIC = {"impl", "util", "utils", "abstract", "base", "default", "helper", "helpers", "test", "tests", "java",
            "main", "core", "common", "internal", "support", "the", "and", "for"}
@@ -260,7 +262,7 @@ def fc_units(rf: RepoFacts, pkg: str) -> tuple[list[dict], dict]:
         prod = sorted(t for t in comp if t in rf.prod)
         tests = sorted(t for t in comp if t in xf.tests and xf.top.get(t) == t)
         units.append({"types": comp, "n": len(comp), "sets": len({comp_of[t] for t in comp}), "classes": prod,
-                      "tests": tests, "fixed": (not prod) or any(rf.protected.get(c) for c in prod)})
+                      "tests": tests, "fixed": (not prod) or any(rf.fixed(c) for c in prod)})
     k = nx.number_connected_components(rel)
     return units, {"classes": len(types), "sets": k, "lcc": round(k / len(types), 4) if types else 0.0}
 
@@ -320,6 +322,10 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
                 continue
             if not all(rf.visible_after_move(c, q) for c in u["classes"]):
                 continue
+            ev_q = sum(rf.evidence(c, q) for c in u["classes"]) / len(u["classes"])
+            ev_now = sum(rf.evidence(c, pkg) for c in u["classes"]) / len(u["classes"])
+            if ev_q < MIN_FIT or ev_q < FIT_RATIO * ev_now:
+                continue                       # the unit has (almost) nothing to do with q
             aff = sum(rf.affinity(c, q) for c in u["classes"]) / len(u["classes"])
             scored.append((q, aff))
         opts[i] = sorted(scored, key=lambda x: (-x[1], x[0]))[:targets_per_unit]
@@ -510,16 +516,23 @@ def consolidate(rf: RepoFacts, gid: str, concern: list[str], accessors: set[str]
     if not any(v > 1 for v in per_pkg.values()):
         return [], {**info, "skipped": "no package has more than one method that uses classes of these "
                                        "packages together at this commit"}
-    plans = []
+    plans, why_blocked = [], {}
     for q in sorted(concern_set):
         t0 = time.time()
         movers = sorted(c for c in classes if rf.package[c] != q)
         ops, blocked = [], []
         simple_q = rf.simple_names.get(q, set())
         for c in movers:
-            if rf.protected.get(c) or rf.module.get(c) not in rf.pkg_modules.get(q, set()) \
-                    or c.rsplit(".", 1)[-1] in simple_q or not rf.visible_after_move(c, q):
+            why = rf.fixed(c)
+            if not why and rf.module.get(c) not in rf.pkg_modules.get(q, set()):
+                why = f"{q} is in another build module"
+            if not why and (c.rsplit(".", 1)[-1] in simple_q or not rf.visible_after_move(c, q)):
+                why = f"name clash or visibility in {q}"
+            if not why and not rf.fits(c, q):
+                why = f"no relation to {q}"
+            if why:
                 blocked.append(c)
+                why_blocked.setdefault(c, why)
                 continue
             ops.append(_move(rf, xf, c, q, rf.affinity(c, q), False,
                              f"used together with {q} by {len(methods)} methods"))
@@ -529,6 +542,11 @@ def consolidate(rf: RepoFacts, gid: str, concern: list[str], accessors: set[str]
                   status="optimal" if not blocked else "feasible")
         if ops:
             plans.append(p)
+    if not plans and why_blocked:
+        items = sorted(why_blocked.items(), key=lambda kv: (not kv[1].startswith("public API"), kv[0]))
+        info["why_none"] = ("the concern cannot be gathered: every class that would have to move must stay — "
+                            + "; ".join(f"{c.rsplit('.', 1)[-1]} ({w})" for c, w in items[:6])
+                            + (f" and {len(items) - 6} more" if len(items) > 6 else ""))
     plans.sort(key=lambda p: (p.remaining, p.change_cost))
     if plans:
         plans[0].name = "most_removed"

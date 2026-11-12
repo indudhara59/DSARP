@@ -308,6 +308,46 @@ with HiGHS in this time, so none is recommended and the candidates are listed.
 Use CP-SAT (installed in the container) and longer time limits on the cluster
 for large groups.
 
+#### Keeping recommendations acceptable to developers
+
+A plan that removes a smell is not useful if developers would reject it. Two
+rules apply to every plan of every smell type:
+
+* **Public API stays in place** (`--api-policy`, default `balanced`): public
+  classes used by many classes (at least 20 and in the top 5 % of the
+  repository, e.g. `MediaType` and `ParseContext` in Tika) never move, and
+  their public static members never move either. Moving them would break every
+  user of the library outside the repository. `strict` also keeps all public
+  classes used from other build modules; `off` keeps only `protected_api`.
+* **A class only moves where it belongs**: the evidence for the target
+  package (dependencies, co-changes, names) must be at least 0.05 and at least
+  30 % of the evidence for its current package. On Tika, 113 of the 189 moves
+  recommended before this rule sent a class to a package it had fewer ties to,
+  many of them to packages it had no relation to at all.
+
+When no plan is recommended, the reason is given with numbers, for example
+the new smells the best candidate would create, or the classes that must stay.
+
+#### Design review by a language model (optional)
+
+```bash
+export DSARP_LLM_URL=https://ai-gateway.uni-paderborn.de/v1   # or a vLLM server on a GPU node
+export DSARP_LLM_KEY=...                                       # your key; read from the environment only
+dsarp llm-models                                               # models offered by the endpoint
+export DSARP_LLM_MODEL=<one of them>
+dsarp review results/tika                                      # after plan, before verify
+```
+
+A language model judges, as an architect of the project, whether every step
+puts the code where a developer would accept it (`sensible`, `questionable`,
+`wrong`). It cannot add or change steps. A plan with a wrong step is replaced
+by the next acceptable plan of the group that the review does not reject; if
+none is left the group gets no recommendation and the reason. Answers that do
+not follow the format are ignored. Answers are cached in
+`plans/review_cache.json`, so a re-run costs nothing; the key is never written
+to a file. The review needs the internet: on the cluster run it on the login
+node (the web interface does this automatically).
+
 ### 7. Verification on the code
 
 ```bash
@@ -326,7 +366,10 @@ interfaces created and implemented. Then **all Java files are compiled** with
 the JDK compiler; errors that were not there before are caused by the plan
 (errors about library symbols the repository does not define are ignored).
 If there are new errors, **delta debugging** finds the steps that cause them
-and the plan is reduced to the steps that compile. The smells are then
+and the plan is reduced to the steps that compile. If the recommended plan
+does not fully work on the code (steps dropped, or a result different from the
+simulation), up to two next-best acceptable plans of the group are verified
+as well and the best verified result is kept (`tried` in `verification.json`). The smells are then
 **detected again on the compiled code** and compared with the original code
 and with the prediction of the simulation. With `--build`, the affected
 modules are built and the tests that use a changed class are run (download
@@ -338,7 +381,14 @@ the dependencies once on a login node; the build runs offline).
 | `rewrite.yml` | OpenRewrite recipe for the moves (`org.openrewrite.java.ChangeType`) |
 | `operations.json` | steps kept and dropped |
 | `new_errors.csv`, `new_errors_full_plan.csv` | compiler errors caused by the plan |
-| `verification.json` | result: compiles, kept/dropped, smell before/after, prediction, build |
+| `verification.json` | result: plan verified (and plans tried), compiles, kept/dropped, smell before/after, prediction, build, outcome |
+
+Every group ends with one **outcome** (report and web interface):
+`removed` / `reduced` (measured on the compiled code), `not applicable`
+(every step of every plan tried broke the build), `no safe plan`, `needs a
+design change` (the operations DSARP can verify cannot fix it) or `not a smell
+at this commit` (the detector counted tests, generated code, libraries or
+sub-packages).
 
 Results (compile check, no build; 6 groups per repository, 30 s solver and 60 s search):
 
@@ -579,6 +629,8 @@ dsarp/            Python package
     actions.py    candidate operations for a state
     mcts.py       Monte Carlo tree search (PUCT), language-model proposals and repair
     llm.py        language-model clients (none, OpenAI-compatible)
+  review.py       stage 6b: design review of the plans by a language model (optional)
+  outcome.py      outcome category of every group (report and web interface)
   explain.py      stage 7: step-by-step report
   verify/         stage 8
     workspace.py  clean working copies (git worktree)

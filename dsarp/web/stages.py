@@ -53,11 +53,13 @@ class Stage:
     options: tuple[Option, ...] = ()
     resources: Resources = field(default_factory=Resources)
     inner: tuple[str, ...] = ()        # sub-steps shown inside the flowchart node
+    network: bool = False              # needs the internet: runs on this machine, never as a Slurm job
 
     def spec(self) -> dict:
         return {"id": self.id, "label": self.label, "number": self.number, "summary": self.summary,
                 "outputs": list(self.outputs), "requires": list(self.requires),
                 "optional_requires": list(self.optional_requires), "inner": list(self.inner),
+                "network": self.network,
                 "options": [o.spec() for o in self.options],
                 "resources": {"cpus": self.resources.cpus, "mem": self.resources.mem, "time": self.resources.time}}
 
@@ -98,15 +100,26 @@ STAGES: tuple[Stage, ...] = (
                           ("auto", "always", "never")),
                    Option("search_time", "--search-time", "float", 120.0, "seconds of tree search per group", minimum=1),
                    Option("types", "--types", "text", "", "only these smell types (comma-separated)"),
+                   Option("api_policy", "--api-policy", "choice", "balanced",
+                          "public API that must not move", ("balanced", "strict", "off")),
                    Option("explain", "--explain", "bool", True, "also write plans/report.md"),
                    Option("llm", "--llm", "choice", "none", "language model for suggestions", ("none", "openai"))),
           resources=Resources(16, "32G", "12:00:00")),
+    Stage("review", "Design review", "6b", "Optional: a language model judges whether every step puts the code "
+          "where a developer would accept it; rejected plans are replaced by the next acceptable one. Needs "
+          "DSARP_LLM_URL, DSARP_LLM_MODEL and DSARP_LLM_KEY in the environment of the web server",
+          outputs=("plans/review_cache.json",), requires=("plan",), network=True,
+          options=(Option("groups", "--groups", "int", None, "only the first N groups with a plan (empty = all)",
+                          minimum=1),
+                   Option("dry_run", "--dry-run", "bool", False, "only record the review, keep the plans")),
+          resources=Resources(1, "4G", "01:00:00")),
     Stage("explain", "Explain", "7", "Step-by-step report of the recommended plans",
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
           resources=Resources(1, "4G", "00:30:00")),
     Stage("verify", "Verify", "8", "Apply plans to the code, compile, delta-debug, re-detect, write patches",
           outputs=("verify/verification.json", "verify/summary.csv"), requires=("plan", "checkout"),
+          optional_requires=("review",),
           options=(Option("groups", "--groups", "int", None, "only the first N groups (empty = all)", minimum=1),
                    Option("build", "--build", "choice", "none", "also build and run selected tests",
                           ("none", "auto", "maven", "gradle")),
@@ -219,6 +232,7 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
         "triage": ["triage", res],
         "learn": ["learn", res, "--workdir", work],
         "plan": ["plan", res],
+        "review": ["review", res],
         "explain": ["explain", res],
         "verify": ["verify", res, "--workdir", work],
         "evaluate": ["evaluate", res],

@@ -253,6 +253,15 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
             f"{s['type']} {s.get('central') or ', '.join(s.get('packages', [])[:4])}" for s in sim["new_smells"]))
     if sim["removed_smells"]:
         lines.append(f"- **Other smells removed:** {len(sim['removed_smells'])}")
+    rv = group.get("review") or {}
+    mine = next((t for t in rv.get("tried", []) if t.get("plan") == plan["name"] and t.get("overall")), None)
+    if mine:
+        lines.append(f"- **Design review ({rv.get('model', 'language model')}):** {mine['overall']}"
+                     + (f" — {mine['reason']}" if mine.get("reason") else ""))
+    rejected = [t for t in rv.get("tried", []) if t.get("overall") == "reject"]
+    if rejected:
+        lines.append("- **Rejected by the review:** " + "; ".join(f"`{t['plan']}` ({t.get('reason', '')})"
+                                                                 for t in rejected))
     lines.append("")
     focus = set(group.get("core", [])) | {o.get("to_package") for o in plan["operations"] if o.get("to_package")}
     if group.get("central"):
@@ -261,7 +270,11 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
     for i, op in enumerate(plan["operations"], 1):
         eff = step_effect(rf, {k: v for k, v in op.items() if k != "check"}, base, focus)
         steps.append(eff)
-        lines += _step_text(rf, i, op, eff) + [""]
+        lines += _step_text(rf, i, op, eff)
+        sv = next((x for x in (mine or {}).get("steps", []) if x["step"] == i), None)
+        if sv and sv["verdict"] != "sensible":
+            lines.append(f"   - Review: {sv['verdict']} — {sv['reason']}")
+        lines.append("")
     others = [p for p in group["plans"] if p["name"] != plan["name"] and p.get("operations")]
     if others:
         lines += ["**Alternatives**", "", "| plan | steps | score | benefit | new smells | cost |", "|---|---|---|---|---|---|"]

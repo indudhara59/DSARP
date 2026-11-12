@@ -242,7 +242,9 @@ def test_report_counts_plans_without_kept_steps_as_not_compiling(project):
         {"group_id": "G1", "compiles": True, "kept": 0, "operations": 1, "reduction": "ddmin", "compile_runs": 2,
          "dropped_operations": [{"op": "move_class", "class": "a.B", "to_package": "c"}]}]))
     page = build(project)
-    assert "0/1</b>plans that compile" in page and "every step broke the build" in page
+    assert "every step broke the build" in page and "not applicable on the code" in page
+    from dsarp.outcome import outcome
+    assert outcome({"recommended": "x"}, {"kept": 0, "operations": 1, "compiles": True}) == "not applicable"
     (vdir / "verification.json").unlink()
 
 

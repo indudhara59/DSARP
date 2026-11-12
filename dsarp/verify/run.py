@@ -19,12 +19,14 @@ For each group with a recommended plan:
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
+from ..outcome import quality as _quality
 from ..plan.facts import RepoFacts
 from ..plan.simulate import EXTRA_KINDS, Simulator, interface_name
 from ..program import ProgramModel
@@ -98,9 +100,9 @@ class Verifier:
 
     # ------------------------------------------------------------------ plan
 
-    def verify_plan(self, group: dict, plan: dict) -> dict:
+    def verify_plan(self, group: dict, plan: dict, sub: str | None = None) -> dict:
         gid = group["group_id"]
-        out = self.results / "verify" / gid
+        out = self.results / "verify" / gid / sub if sub else self.results / "verify" / gid
         out.mkdir(parents=True, exist_ok=True)
         ops = [{k: v for k, v in o.items() if k != "check"} for o in plan["operations"]]
         checks = [o.get("check", {}) for o in plan["operations"]]
@@ -196,16 +198,56 @@ class Verifier:
         (out / "verification.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
 
+    def verify_group(self, g: dict) -> dict:
+        """Verify the recommended plan; if it does not fully work on the code, also verify up to
+        ``FALLBACK_PLANS`` next-best acceptable plans and keep the best verified result."""
+        ranked = [next(p for p in g["plans"] if p["name"] == g["recommended"])]
+        seen = {frozenset(json.dumps(o, sort_keys=True, default=str) for o in ranked[0]["operations"])}
+        for p in sorted(g["plans"], key=lambda p: -(p.get("score") or 0)):
+            key = frozenset(json.dumps(o, sort_keys=True, default=str) for o in p.get("operations", []))
+            if p["name"] != g["recommended"] and _acceptable(p) and key not in seen:
+                ranked.append(p)
+                seen.add(key)
+        for old in (self.results / "verify" / g["group_id"]).glob("try_*"):
+            shutil.rmtree(old, ignore_errors=True)
+        tried = []
+        for i, plan in enumerate(ranked[:1 + FALLBACK_PLANS]):
+            r = self.verify_plan(g, plan, sub=None if i == 0 else f"try_{plan['name']}")
+            r["score"] = plan.get("score")
+            tried.append(r)
+            if _complete(r):
+                break
+        best = max(range(len(tried)), key=lambda i: (_quality(tried[i]), -i))
+        rec = dict(tried[best])
+        rec["tried"] = [{"plan": t["plan"], "compiles": t.get("compiles"), "kept": t.get("kept"),
+                         "operations": t.get("operations"), "target_removed": t.get("target_removed")}
+                        for t in tried]
+        rec["recommended_plan"] = g["recommended"]
+        if best:
+            rec["fallback_from"] = g["recommended"]
+            top = self.results / "verify" / g["group_id"]
+            src = top / f"try_{rec['plan']}"
+            for f in src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, top / f.name)
+        rec["status"] = ("not_applicable" if not rec.get("kept") else
+                         "removed" if rec.get("target_removed") else "reduced" if _quality(rec)[2] else
+                         "no_effect")
+        (self.results / "verify" / g["group_id"] / "verification.json").write_text(
+            json.dumps(rec, indent=1, default=str))
+        return rec
+
     def run(self, groups: int | None = None, only: set[str] | None = None) -> list[dict]:
         plans = json.loads((self.results / "plans" / "plans.json").read_text())
         self.baseline()
         out = []
         todo = [g for g in plans["groups"] if g.get("recommended") and (not only or g["group_id"] in only)]
         for g in todo[:groups] if groups else todo:
-            plan = next(p for p in g["plans"] if p["name"] == g["recommended"])
-            rec = self.verify_plan(g, plan)
+            rec = self.verify_group(g)
             yn = {True: "yes", False: "no", None: "-"}
-            self.log(f"{g['group_id']}: {rec['kept']}/{rec['operations']} operations compile "
+            self.log(f"{g['group_id']}: plan {rec['plan']}"
+                     + (f" (fallback from {rec['fallback_from']})" if rec.get("fallback_from") else "")
+                     + f": {rec['kept']}/{rec['operations']} operations compile "
                      f"({rec['reduction']}, {rec['compile_runs']} compiles); smell removed: "
                      f"{yn[rec.get('target_removed')]}; result equals simulation: {yn[rec.get('prediction_matches')]}"
                      + (f"; build {'ok' if rec['build']['ok'] else 'FAILED'}" if "build" in rec else "")
@@ -221,6 +263,20 @@ class Verifier:
             summary, index=False)
         (self.results / "verify" / "verification.json").write_text(json.dumps(out, indent=1, default=str))
         return out
+
+
+FALLBACK_PLANS = 2       # further plans verified when the recommended one does not fully work
+
+
+def _acceptable(p: dict) -> bool:
+    return bool(p.get("operations")) and (p.get("checks") or {}).get("status") != "blocked" \
+        and (p.get("benefit") or 0) > 0 and (p.get("score") or 0) > 0
+
+
+def _complete(r: dict) -> bool:
+    """The plan works on the code as planned: every step compiles and the result is as simulated."""
+    return bool(r.get("compiles")) and r.get("kept") == r.get("operations") and r.get("kept", 0) > 0 \
+        and bool(r.get("target_removed") or r.get("prediction_matches"))
 
 
 def _renamed(ops: list[dict]) -> dict[str, str]:
