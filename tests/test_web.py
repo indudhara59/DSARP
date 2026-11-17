@@ -309,3 +309,21 @@ def test_api_preview_run_and_new_project(server):
     assert code == 200 and s["mode"] == "slurm"
     assert _req(url + "/api/settings", data={"account": "a b"})[0] == 400
     assert _req(url + "/api/projects/demo/run", data={"stage": "verify", "resources": {"verify": {"cpus": 999}}})[0] == 400
+
+
+def test_numbers_are_small_and_cached(tmp_path):
+    import json as _j
+    from dsarp.web import results as R
+    (tmp_path / "triage").mkdir()
+    (tmp_path / "plans").mkdir()
+    (tmp_path / "triage" / "triage.json").write_text(_j.dumps({"smells": 5, "decisions": {"keep": 4, "drop": 1},
+                                                              "groups": 2}))
+    (tmp_path / "plans" / "plans.json").write_text(_j.dumps({"groups": [
+        {"group_id": "A", "type": "cyclic_dependency", "recommended": "most_removed", "plans": []},
+        {"group_id": "B", "type": "god_component", "recommended": None, "plans": [],
+         "skipped": "x has 12 types (limit 30) at this commit"}]}))
+    n = R.numbers(tmp_path)
+    assert n["plans"]["with_plan"] == 1
+    assert n["plans"]["outcomes"] == {"planned (not verified)": 1, "not a smell at this commit": 1}
+    assert (tmp_path / "web_numbers.json").exists()
+    assert R.numbers(tmp_path)["_stamp"] == n["_stamp"]                 # served from the cache

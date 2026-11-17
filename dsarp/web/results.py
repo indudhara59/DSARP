@@ -64,6 +64,82 @@ def _bool(v) -> bool:
     return str(v).lower() in ("true", "1", "yes")
 
 
+NUMBER_SOURCES = ("manifest.json", "triage/triage.json", "plans/plans.json", "verify/verification.json",
+                  "combined/combined.json", "evaluation/history.json")
+
+
+def numbers(res: Path) -> dict:
+    """Only the key numbers of a project (the Results page). Computed once and stored in
+    ``web_numbers.json`` next to the results; computed again only when one of its sources changes."""
+    stamp = {}
+    for rel in NUMBER_SOURCES:
+        try:
+            st = (res / rel).stat()
+            stamp[rel] = [st.st_mtime, st.st_size]
+        except OSError:
+            pass
+    cache = res / "web_numbers.json"
+    try:
+        old = json.loads(cache.read_text(encoding="utf-8"))
+        if old.get("_stamp") == stamp:
+            return old
+    except (OSError, ValueError):
+        pass
+    out: dict = {"_stamp": stamp}
+    man = _json(res / "manifest.json") or {}
+    if man:
+        bt = man.get("counts", {}).get("by_tool_and_type") or {}
+        out["detectors"] = {"smells": man.get("counts", {}).get("smells"),
+                            "by_tool": {t: sum(v.values()) if isinstance(v, dict) else v for t, v in bt.items()}}
+    tri = _json(res / "triage" / "triage.json") or {}
+    if tri:
+        out["triage"] = {"smells": tri.get("smells"), "decisions": tri.get("decisions"), "groups": tri.get("groups")}
+    plans = _json(res / "plans" / "plans.json")
+    vj = _json(res / "verify" / "verification.json") or []
+    vmap = {v.get("group_id"): v for v in vj if isinstance(v, dict)}
+    if plans:
+        gs = plans.get("groups", [])
+        per_type: dict = {}
+        for g in gs:
+            k = g.get("kind") or g.get("type")
+            o = outcome(g, vmap.get(g.get("group_id")))
+            per_type.setdefault(k, Counter())[o] += 1
+        tot = Counter()
+        for c in per_type.values():
+            tot.update(c)
+        out["plans"] = {"groups": len(gs), "with_plan": sum(1 for g in gs if g.get("recommended")),
+                        "outcomes": {k: tot[k] for k in ORDER if tot.get(k)},
+                        "per_type": {k: {o: c[o] for o in ORDER if c.get(o)} | {"groups": sum(c.values())}
+                                     for k, c in sorted(per_type.items(), key=lambda kv: -sum(kv[1].values()))},
+                        "api_policy": plans.get("api_policy"), "frozen_classes": plans.get("frozen_classes"),
+                        "review": plans.get("review"), "advice": plans.get("advice")}
+    if vj:
+        out["verify"] = {"plans": len(vj),
+                         "compile_all_steps": sum(1 for v in vj if v.get("compiles") and v.get("kept") == v.get("operations")),
+                         "steps_kept": sum(int(v.get("kept") or 0) for v in vj),
+                         "steps": sum(int(v.get("operations") or 0) for v in vj),
+                         "equal_to_simulation": sum(1 for v in vj if v.get("prediction_matches")),
+                         "next_best_used": sum(1 for v in vj if v.get("fallback_from"))}
+    comb = _json(res / "combined" / "combined.json") or {}
+    if comb.get("whole_repository"):
+        out["combined"] = {"plans_applied": len(comb.get("plans_applied", [])), "operations": comb.get("operations"),
+                           "compiles": comb.get("compiles"), "removed": comb.get("removed"),
+                           "left_out": len(comb.get("conflicts", [])) + len(comb.get("interfering", []))
+                           + len(comb.get("plans_dropped_by_compiler", [])),
+                           "before": comb["whole_repository"].get("before"),
+                           "after": comb["whole_repository"].get("after")}
+    hist = _json(res / "evaluation" / "history.json") or {}
+    if hist:
+        out["history"] = {"later_commits": hist.get("later_commits"), "checked": hist.get("checked"),
+                          "results": hist.get("results")}
+    out["report"] = (res / "report.html").exists()
+    try:
+        cache.write_text(json.dumps(out, default=str), encoding="utf-8")
+    except OSError:
+        pass
+    return out
+
+
 def overview(res: Path) -> dict:
     """Numbers and chart data across all stages."""
     out: dict = {"available": {}}
