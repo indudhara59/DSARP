@@ -307,7 +307,24 @@ Spinellis 2020): with field types, `extends` and `implements` as relations
 DSARP reproduces 336 of the 537 related sets Designite reports for Tika.
 Designite's exact filter for scattered functionality is not published (the
 published rule agrees poorly with its output), so DSARP measures the concern
-directly. Hub-like classes use Arcan's median rule with test classes as
+directly: production members that use classes of two or more concern
+packages, by any kind of use (calls, field accesses, object creation and
+types in fields, parameters, return values, local variables, type arguments,
+`throws` clauses and annotations). Test code is left out, because an
+architectural refactoring does not target it; when only test methods use the
+concern, the group is reported as not a smell at this commit, with the number
+of test methods. On Struts, 26 of the 68 reported groups are of this kind.
+
+**Detectors run on a built checkout.** When the detector output lists copies
+of the sources in build folders (`target/classes`, an exploded `WEB-INF/src`,
+`build/`, `out/`, `bin/`), ingest keeps each class's real source file and
+warns how many classes were counted more than once (on Struts, 138 classes;
+260 of 2,721 Designite entries are copies). Designite's feature concentration
+and god component reports count these copies, so some packages are reported
+with more types than they have; the reasons for these groups say so.
+`dsarp detect` runs the detectors on a clean checkout of the chosen commit.
+
+Hub-like classes use Arcan's median rule with test classes as
 clients, which reproduces all 8 hub-like classes Arcan reports for Tika.
 
 **Tree search (stage 5b).** When the solver finds no good plan (no positive
@@ -385,6 +402,50 @@ not follow the format are ignored. Answers are cached in
 `plans/review_cache.json`, so a re-run costs nothing; the key is never written
 to a file. The review needs the internet: on the cluster run it on the login
 node (the web interface does this automatically).
+
+Reasoning models spend part of their token budget on reasoning before they
+answer. When an answer is cut off, the client retries with a larger budget
+(up to 32,000 tokens) and low reasoning effort. Settings:
+`DSARP_LLM_MAX_TOKENS` (answer budget, default 1500; reasoning models get four
+times as much), `DSARP_LLM_REASONING` (`low`, `medium`, `high`),
+`DSARP_LLM_TIMEOUT` (seconds per request, default 300) and
+`DSARP_LLM_WORKERS` (groups at the same time, default 1).
+
+#### A language model on a Noctua 2 GPU node (instead of a hosted API)
+
+`slurm/llm_server.sbatch` serves an open model with vLLM on one GPU node
+(4 × A100 40 GB) as an OpenAI-compatible endpoint. Every DSARP stage that uses
+a language model then talks to it directly: no API key from outside, no
+request limits, and the same model weights for every run, which makes the
+results reproducible. The default model is `Qwen/Qwen3.6-27B` (Apache 2.0) in
+full precision on the four GPUs.
+
+One-time setup on a login node (compute nodes have no internet):
+
+```bash
+module load tools Apptainer
+cd /scratch/<project>/<user>
+apptainer pull vllm.sif docker://vllm/vllm-openai:latest
+export HF_HOME=$PWD/hf
+apptainer exec vllm.sif hf download Qwen/Qwen3.6-27B      # about 55 GB; older images: huggingface-cli download
+```
+
+Each time you need it:
+
+```bash
+VLLM_SIF=/scratch/<project>/<user>/vllm.sif HF_HOME=/scratch/<project>/<user>/hf \
+    sbatch -A <project> slurm/llm_server.sbatch            # runs up to 24 h; scancel <jobid> to stop
+tail -f logs/llm-server-<jobid>.out                       # wait for "ready" (a few minutes)
+source ~/.dsarp/llm.env                                   # URL, model, a random key for this job, 8 workers
+dsarp llm-models                                          # check: lists the model
+dsarp review results/struts                               # or start the web interface now
+```
+
+The job writes `~/.dsarp/llm.env` (readable only by you) when the model is
+ready and removes it when the job ends. The key in it is made for that job
+only and keeps other users of the cluster from using the server. Load the
+file before starting the web interface, so that its stages see the settings.
+Another model: `DSARP_LLM_MODEL=<id>` when downloading and submitting.
 
 ### 7. Verification on the code
 

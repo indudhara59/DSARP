@@ -275,6 +275,9 @@ def ingest(cfg: RepoConfig) -> IngestResult:
     """Run stages 0 and 1 for one repository configuration."""
     results = [detectors.load(d) for d in cfg.detectors]
     warnings = [w for r in results for w in r.warnings]
+    build_output = {f"{r.tool}:{inp.module or Path(inp.path).name}": r.components.attrs["build_output"]
+                    for r, inp in zip(results, cfg.detectors)
+                    if (r.components.attrs.get("build_output") or {}).get("build_rows")}
     commit = _resolve_commit(cfg, results, warnings)
     roots = _relativize(results, cfg, warnings)
     components = _merge_components(results)
@@ -302,6 +305,7 @@ def ingest(cfg: RepoConfig) -> IngestResult:
             "with_external_members": int((smells["external_members"] > 0).sum()) if len(smells) else 0,
         },
         "warnings": warnings,
+        "build_output": build_output,
     }
     return IngestResult(cfg, commit, smells, components, manifest, warnings)
 

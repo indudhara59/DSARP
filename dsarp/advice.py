@@ -25,10 +25,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from pathlib import Path
 
 from .outcome import outcome
-from .search.llm import LLMError
+from .search.llm import LLMError, parallel
 
 SYSTEM = (
     "You are a senior software architect. A tool found an architectural smell in a Java code base that cannot be "
@@ -49,6 +50,7 @@ class Advisor:
         self.cache_file = cache_file
         self.cache = json.loads(cache_file.read_text()) if cache_file and cache_file.exists() else {}
         self.calls = 0
+        self._lock = threading.Lock()
         if cache_file:
             cache_file.write_text(json.dumps(self.cache, indent=0))      # output exists also when nothing is asked
         self.known = set(rf.package.values()) | set(rf.package) | set(rf.model.types["type"])
@@ -80,10 +82,11 @@ class Advisor:
         answer = self.cache.get(key)
         if answer is None:
             answer = self.llm.complete(SYSTEM, text)
-            self.calls += 1
-            self.cache[key] = answer
-            if self.cache_file:
-                self.cache_file.write_text(json.dumps(self.cache, indent=0))
+            with self._lock:
+                self.calls += 1
+                self.cache[key] = answer
+                if self.cache_file:
+                    self.cache_file.write_text(json.dumps(self.cache, indent=0))
         return self.parse(answer)
 
     def parse(self, answer: str) -> dict:
@@ -108,7 +111,8 @@ class Advisor:
         return {"directions": out} if out else {"rejected": "no usable direction"}
 
 
-def advise_groups(results: str | Path, llm, groups: int | None = None, log=print) -> dict:
+def advise_groups(results: str | Path, llm, groups: int | None = None, log=print,
+                  workers: int | None = None) -> dict:
     from .plan.facts import RepoFacts
     from .program import ProgramModel
     r = Path(results)
@@ -121,14 +125,19 @@ def advise_groups(results: str | Path, llm, groups: int | None = None, log=print
         todo = todo[:groups]
     stats = {"groups": 0, "advised": 0, "rejected": 0, "failed": 0}
     first_error = None
-    for g in todo:
-        stats["groups"] += 1
+
+    def one(g):
         try:
-            res = adv.advise(g)
+            return g, adv.advise(g), None
         except LLMError as e:
+            return g, None, str(e)
+
+    for g, res, err in parallel(one, todo, workers):
+        stats["groups"] += 1
+        if err:
             stats["failed"] += 1
-            first_error = first_error or str(e)
-            log(f"{g['group_id']}: no answer ({e})")
+            first_error = first_error or err
+            log(f"{g['group_id']}: no answer ({err})")
             continue
         if "directions" in res:
             g["advice"] = {"verified": False, "model": getattr(llm, "model", ""), **res}

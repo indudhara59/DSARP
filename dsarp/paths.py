@@ -117,6 +117,30 @@ def is_generated_path(path: str) -> bool:
     return any(marker in p for marker in _GENERATED_MARKERS)
 
 
+_BUILD_DIRS = {"target", "build", "out", "bin", "WEB-INF"}
+_GEN_SOURCE_DIRS = ("generated-sources", "generated-test-sources", "generated", "gen-java")
+
+
+def is_build_output_path(path: str, package: str | None = None) -> bool:
+    """True for a copy of a source file in build output (``target/``, ``build/``, ``out/``, ``bin/``, ``WEB-INF/``).
+
+    Detectors run on a checkout that was built see these copies as well (e.g. Maven's
+    ``target/classes`` or an exploded web application with ``WEB-INF/src``). Only the folders
+    above the package folders are checked, so a package called ``build`` is not mistaken for one.
+    Generated sources (``target/generated-sources``) are real inputs of the build and are not copies.
+    """
+    p = normalize(path)
+    if package:
+        tail = "/" + package.replace(".", "/") + "/"
+        i = ("/" + p).rfind(tail)
+        if i >= 0:
+            p = p[:max(i - 1, 0)]
+    parts = p.split("/")
+    if any(x in _GEN_SOURCE_DIRS for x in parts):
+        return False
+    return any(x in _BUILD_DIRS for x in parts[:-1] if x) or (bool(package) and parts[-1] in _BUILD_DIRS)
+
+
 def common_dir_prefix(paths: list[str]) -> str:
     """Longest common directory prefix of paths of the same kind (all absolute or all relative)."""
     items = [normalize(p) for p in paths if p]

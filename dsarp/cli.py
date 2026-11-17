@@ -322,7 +322,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         if not (d / "plans" / "plans.json").exists():
             print(f"ERROR {d}: no plans (run dsarp plan)", file=sys.stderr)
             return 1
-        st = review_plans(d, llm, groups=args.groups, apply=not args.dry_run)
+        st = review_plans(d, llm, groups=args.groups, apply=not args.dry_run, workers=args.workers)
         print(f"{d.name}: reviewed {st['reviewed']} plans with {st['model']} ({st['llm_calls']} new calls): "
               f"{st['accept']} accepted, {st['caution']} with caution, {st['reject']} rejected; "
               f"{st['replaced']} replaced by another plan, {st['dropped']} without a plan, {st['failed']} unanswered")
@@ -352,7 +352,7 @@ def _cmd_advise(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}. Set DSARP_LLM_URL, DSARP_LLM_MODEL and DSARP_LLM_KEY.", file=sys.stderr)
         return 1
     for d in map(Path, args.results):
-        st = advise_groups(d, llm, groups=args.groups)
+        st = advise_groups(d, llm, groups=args.groups, workers=args.workers)
         print(f"{d.name}: {st['groups']} groups without a verified plan; advice for {st['advised']}, "
               f"{st['rejected']} discarded, {st['failed']} unanswered ({st['llm_calls']} new calls)")
         if st["failed"] and st["failed"] >= st["groups"]:
@@ -635,12 +635,14 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("results", nargs="+")
     rv.add_argument("--groups", type=int, help="only the first N groups with a plan")
     rv.add_argument("--dry-run", action="store_true", help="only record the review, do not change the plans")
+    rv.add_argument("--workers", type=int, help="groups reviewed at the same time (default DSARP_LLM_WORKERS or 1)")
     rv.set_defaults(func=_cmd_review)
 
     ad = sub.add_parser("advise", help="stage 7b (optional): design advice by a language model for groups without "
                                       "a verified plan (marked as not verified; never counted)")
     ad.add_argument("results", nargs="+")
     ad.add_argument("--groups", type=int, help="only the first N such groups")
+    ad.add_argument("--workers", type=int, help="groups advised at the same time (default DSARP_LLM_WORKERS or 1)")
     ad.set_defaults(func=_cmd_advise)
 
     lm = sub.add_parser("llm-models", help="list the models of the language-model endpoint ($DSARP_LLM_URL)")

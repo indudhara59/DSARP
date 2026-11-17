@@ -48,38 +48,48 @@ class OpenAICompatible:
     key: str = ""
     temperature: float = 0.2
     max_tokens: int = 1500
-    timeout: float = 120.0
+    timeout: float = 300.0
     name: str = "openai"
     calls: int = field(default=0)
 
-    def _body(self, system: str, prompt: str) -> bytes:
+    reasoning: str = ""                 # reasoning effort for reasoning models: low, medium, high ("" = server default)
+    max_budget: int = 32000             # largest completion budget tried after an answer was cut off
+
+    def _body(self, system: str, prompt: str, budget: int | None = None, effort: str = "") -> bytes:
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
         if getattr(self, "_newer_api", False):
             # newer models (reasoning models): no temperature, max_completion_tokens instead of max_tokens,
             # with room for the tokens the model spends on reasoning before it answers
-            return json.dumps({"model": self.model, "max_completion_tokens": max(self.max_tokens, 1500) * 4,
-                               "messages": msgs}).encode()
-        return json.dumps({"model": self.model, "temperature": self.temperature, "max_tokens": self.max_tokens,
-                           "messages": msgs}).encode()
+            body = {"model": self.model, "max_completion_tokens": budget or max(self.max_tokens, 1500) * 4,
+                    "messages": msgs}
+            effort = effort or self.reasoning
+            if effort and not getattr(self, "_no_effort", False):
+                body["reasoning_effort"] = effort
+            return json.dumps(body).encode()
+        return json.dumps({"model": self.model, "temperature": self.temperature,
+                           "max_tokens": budget or self.max_tokens, "messages": msgs}).encode()
 
-    def complete(self, system: str, prompt: str) -> str:
-        data = None
+    def _post(self, body: bytes) -> dict:
         switched = False
         attempt = 0
         while True:
-            req = urllib.request.Request(self.url.rstrip("/") + "/chat/completions", data=self._body(system, prompt),
+            req = urllib.request.Request(self.url.rstrip("/") + "/chat/completions", data=body,
                                          headers={"Content-Type": "application/json",
                                                   **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    data = json.loads(r.read())
-                break
+                    return json.loads(r.read())
             except urllib.error.HTTPError as e:
                 detail = _error_text(e)
+                if e.code == 400 and "reasoning_effort" in body.decode("utf-8", "replace") and re.search(
+                        r"reasoning", detail, re.I) and not getattr(self, "_no_effort", False):
+                    self._no_effort = True                       # the model takes no reasoning effort
+                    body = json.dumps({k: v for k, v in json.loads(body).items() if k != "reasoning_effort"}).encode()
+                    continue
                 if e.code == 400 and not switched and not getattr(self, "_newer_api", False) and re.search(
                         r"temperature|max_tokens|max_completion_tokens|unsupported|not supported", detail, re.I):
                     self._newer_api, switched = True, True       # remembered for all further requests
-                    continue
+                    raise _Switch() from e
                 if e.code in (429, 500, 502, 503, 504) and attempt < 3:
                     attempt += 1
                     time.sleep(5 * attempt)                       # rate limit or busy server: wait and retry
@@ -88,14 +98,41 @@ class OpenAICompatible:
                                + (f": {detail}" if detail else "")) from e
             except Exception as e:  # network or JSON errors
                 raise LLMError(f"language model request failed: {e}") from e
-        self.calls += 1
-        try:
-            text = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise LLMError(f"unexpected answer: {str(data)[:200]}") from e
-        if not text:
-            raise LLMError("empty answer (the model used its whole token budget; try another model)")
-        return text
+
+    def complete(self, system: str, prompt: str) -> str:
+        budget, effort, used, finish = None, "", 0, None
+        for _ in range(4):
+            try:
+                data = self._post(self._body(system, prompt, budget, effort))
+            except _Switch:
+                continue                                          # retry in the newer API format
+            self.calls += 1
+            try:
+                choice = data["choices"][0]
+                text = choice["message"].get("content") or ""
+            except (KeyError, IndexError, TypeError, AttributeError) as e:
+                raise LLMError(f"unexpected answer: {str(data)[:200]}") from e
+            text = _THINK.sub("", text).strip()                   # open models that write their reasoning inline
+            if text:
+                return text
+            used = budget or (max(self.max_tokens, 1500) * 4 if getattr(self, "_newer_api", False) else self.max_tokens)
+            finish = choice.get("finish_reason")
+            if finish != "length" or used >= self.max_budget:
+                break
+            # the answer was cut off (usually by the model's reasoning): more room and less reasoning
+            budget, effort = min(used * 4, self.max_budget), "low"
+        if finish != "length":
+            raise LLMError(f"empty answer from {self.model} (finish reason {finish!r})")
+        raise LLMError(f"empty answer: the model {self.model} used its whole token budget ({used} tokens) "
+                       "before answering; set DSARP_LLM_MAX_TOKENS higher, DSARP_LLM_REASONING=low, "
+                       "or use another model")
+
+
+class _Switch(Exception):
+    """Internal: retry the request in the newer API format."""
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.S)
 
 
 def _error_text(e) -> str:
@@ -154,8 +191,29 @@ def from_env(kind: str | None = None, temperature: float | None = None):
         c = OpenAICompatible(url, model, os.environ.get("DSARP_LLM_KEY", ""))
         if temperature is not None:
             c.temperature = temperature
+        if os.environ.get("DSARP_LLM_MAX_TOKENS"):
+            c.max_tokens = int(os.environ["DSARP_LLM_MAX_TOKENS"])
+            c.max_budget = max(c.max_budget, c.max_tokens)
+        c.reasoning = os.environ.get("DSARP_LLM_REASONING", "").strip().lower()
+        if os.environ.get("DSARP_LLM_TIMEOUT"):
+            c.timeout = float(os.environ["DSARP_LLM_TIMEOUT"])
+        if os.environ.get("DSARP_LLM_NEW_API", "").lower() in ("1", "true", "yes"):
+            c._newer_api = True
         return c
     raise LLMError(f"unknown language model client {kind!r} (use none or openai)")
+
+
+def parallel(fn, items: list, workers: int | None = None):
+    """``fn`` applied to every item, ``workers`` at a time (default ``DSARP_LLM_WORKERS``, else 1), in order."""
+    if workers is None:
+        workers = int(os.environ.get("DSARP_LLM_WORKERS", "1") or 1)
+    if workers <= 1 or len(items) <= 1:
+        for x in items:
+            yield fn(x)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        yield from ex.map(fn, items)
 
 
 def extract_json(text: str):

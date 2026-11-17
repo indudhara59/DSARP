@@ -110,18 +110,24 @@ STAGES: tuple[Stage, ...] = (
           resources=Resources(16, "32G", "12:00:00")),
     Stage("review", "Design review", "6b", "Optional: a language model judges whether every step puts the code "
           "where a developer would accept it; rejected plans are replaced by the next acceptable one. Needs "
-          "DSARP_LLM_URL, DSARP_LLM_MODEL and DSARP_LLM_KEY in the environment of the web server",
+          "DSARP_LLM_URL, DSARP_LLM_MODEL and DSARP_LLM_KEY in the environment of the web server (for a model "
+          "on a GPU node: source ~/.dsarp/llm.env before starting the web server)",
           outputs=("plans/review_cache.json",), requires=("plan",), network=True,
           options=(Option("groups", "--groups", "int", None, "only the first N groups with a plan (empty = all)",
                           minimum=1),
-                   Option("dry_run", "--dry-run", "bool", False, "only record the review, keep the plans")),
-          resources=Resources(1, "4G", "01:00:00")),
+                   Option("dry_run", "--dry-run", "bool", False, "only record the review, keep the plans"),
+                   Option("workers", "--workers", "int", None, "groups at the same time (empty = DSARP_LLM_WORKERS "
+                          "or 1; about 8 for a model on a GPU node)", minimum=1)),
+          resources=Resources(1, "4G", "04:00:00")),
     Stage("advise", "Design advice", "7b", "Optional: a language model suggests design directions for groups "
           "without a verified plan (marked as not verified, never counted). Needs DSARP_LLM_URL, DSARP_LLM_MODEL "
-          "and DSARP_LLM_KEY in the environment of the web server",
+          "and DSARP_LLM_KEY in the environment of the web server (for a model on a GPU node: source "
+          "~/.dsarp/llm.env before starting the web server)",
           outputs=("plans/advice_cache.json",), requires=("plan",), network=True,
-          options=(Option("groups", "--groups", "int", None, "only the first N groups (empty = all)", minimum=1),),
-          resources=Resources(1, "4G", "01:00:00")),
+          options=(Option("groups", "--groups", "int", None, "only the first N groups (empty = all)", minimum=1),
+                   Option("workers", "--workers", "int", None, "groups at the same time (empty = DSARP_LLM_WORKERS "
+                          "or 1; about 8 for a model on a GPU node)", minimum=1)),
+          resources=Resources(1, "4G", "04:00:00")),
     Stage("explain", "Explain", "7", "Step-by-step report of the recommended plans",
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
