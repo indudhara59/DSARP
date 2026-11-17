@@ -264,6 +264,58 @@ def test_llm_client_adapts_to_newer_models():
         srv.shutdown()
 
 
+
+def test_llm_client_retries_answers_cut_off_by_reasoning():
+    """A reasoning model that spends its whole budget answers empty (finish reason "length"): the client retries
+    with a larger budget and low reasoning effort; a server without reasoning effort gets it dropped; inline
+    <think> blocks of open models are removed."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from dsarp.search.llm import LLMError, OpenAICompatible
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body)
+            if "reasoning_effort" in body and self.server.no_effort:
+                self.send_response(400)
+                msg = json.dumps({"error": {"message": "Unrecognized request argument: reasoning_effort"}})
+            elif body.get("max_completion_tokens", 0) < 20000:
+                self.send_response(200)
+                msg = json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+            else:
+                self.send_response(200)
+                msg = json.dumps({"choices": [{"message": {"content": "<think>x</think> ok"}, "finish_reason": "stop"}]})
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(msg.encode())
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    srv.no_effort = False
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/v1"
+    try:
+        c = OpenAICompatible(url, "m")
+        c._newer_api = True
+        assert c.complete("s", "p") == "ok"
+        assert [b["max_completion_tokens"] for b in seen] == [6000, 24000]
+        assert seen[1]["reasoning_effort"] == "low" and "reasoning_effort" not in seen[0]
+        seen.clear()
+        srv.no_effort = True
+        c = OpenAICompatible(url, "m", reasoning="medium")
+        c._newer_api = True
+        assert c.complete("s", "p") == "ok"
+        assert "reasoning_effort" not in seen[-1]
+        c = OpenAICompatible(url, "m", max_budget=6000)
+        c._newer_api = True
+        with pytest.raises(LLMError, match="whole token budget"):
+            c.complete("s", "p")
+    finally:
+        srv.shutdown()
+
 @needs_jdk
 def test_review_fails_visibly_when_nothing_answers(billing, monkeypatch, capsys):
     import sys
@@ -284,3 +336,32 @@ def test_review_fails_visibly_when_nothing_answers(billing, monkeypatch, capsys)
     assert main() == 1
     assert "unsupported model" in capsys.readouterr().err
     assert (res / "plans" / "review_cache.json").exists()
+
+
+def test_build_output_copies_are_recognised(tmp_path):
+    """Designite run on a built checkout also lists copies in target/ and WEB-INF/: the real source is kept and
+    ingest warns; a package that is called build is not mistaken for build output."""
+    from dsarp.paths import is_build_output_path as b
+    from dsarp.detectors import designite
+    assert b("/u/s/apps/x/target/x/WEB-INF/src/java/org/a/C.java", "org.a")
+    assert b("/u/s/apps/x/target/classes/org/a/C.java", "org.a")
+    assert not b("/u/s/apps/x/src/main/java/org/a/C.java", "org.a")
+    assert not b("/u/s/m/src/main/java/org/a/build/C.java", "org.a.build")
+    assert not b("/u/s/m/target/generated-sources/antlr/org/a/C.java", "org.a")
+    pd.DataFrame({"Project": "s", "Package": ["org.a", "org.a", "org.a"], "Class": ["C", "C", "Old"],
+                  "File": ["/u/s/x/target/x/WEB-INF/src/java/org/a/C.java", "/u/s/x/src/main/java/org/a/C.java",
+                           "/u/s/x/target/classes/org/a/Old.java"]}).to_csv(tmp_path / "TypeMetrics.csv", index=False)
+    comp = designite.load_components(tmp_path)
+    assert comp.set_index("name").loc["org.a.C", "file_path_abs"] == "/u/s/x/src/main/java/org/a/C.java"
+    st = comp.attrs["build_output"]
+    assert (st["build_rows"], st["duplicated_classes"], st["only_in_build_output"]) == (2, 1, 1)
+    w = designite.build_output_warning(tmp_path, st)
+    assert "build output" in w and "1 classes are counted more than once" in w
+
+
+def test_parallel_requests_keep_the_order():
+    import time as _t
+    from dsarp.search.llm import parallel
+    out = list(parallel(lambda x: (_t.sleep(0.01 * (5 - x)), x)[1], list(range(5)), workers=4))
+    assert out == [0, 1, 2, 3, 4]
+    assert list(parallel(lambda x: x * 2, [1, 2], workers=1)) == [2, 4]

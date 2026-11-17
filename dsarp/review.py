@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 
-from .search.llm import LLMError, extract_json
+from .search.llm import LLMError, extract_json, parallel
 
 VERDICTS = ("sensible", "questionable", "wrong")
 OVERALL = ("accept", "caution", "reject")
@@ -66,6 +67,7 @@ class Reviewer:
                 self.cache = {}
         self.calls = 0
         self.errors: list[str] = []
+        self._lock = threading.Lock()
         self._save_cache()                      # the output exists from the start, also when nothing is reviewed
 
     # ------------------------------------------------------------------ prompt
@@ -126,9 +128,10 @@ class Reviewer:
                 self.log(f"  review failed: {e}")
                 self.errors.append(str(e))
                 return None
-            self.calls += 1
-            self.cache[key] = answer
-            self._save_cache()
+            with self._lock:
+                self.calls += 1
+                self.cache[key] = answer
+                self._save_cache()
         return self.parse(answer, len(plan["operations"]))
 
     @staticmethod
@@ -164,8 +167,12 @@ def _acceptable(p: dict) -> bool:
         and (p.get("benefit") or 0) > 0 and (p.get("score") or 0) > 0
 
 
-def review_plans(results: str | Path, llm, groups: int | None = None, apply: bool = True, log=print) -> dict:
-    """Review the recommended plan of every group in ``plans/plans.json`` and update it."""
+def review_plans(results: str | Path, llm, groups: int | None = None, apply: bool = True, log=print,
+                 workers: int | None = None) -> dict:
+    """Review the recommended plan of every group in ``plans/plans.json`` and update it.
+
+    ``workers`` groups are reviewed at the same time (default ``DSARP_LLM_WORKERS``, else 1); a local
+    vLLM server answers many requests together, a hosted API may limit the request rate."""
     from .plan.facts import RepoFacts
     from .program import ProgramModel
     r = Path(results)
@@ -177,10 +184,12 @@ def review_plans(results: str | Path, llm, groups: int | None = None, apply: boo
     if groups:
         todo = todo[:groups]
     stats = {"reviewed": 0, "accept": 0, "caution": 0, "reject": 0, "replaced": 0, "dropped": 0, "failed": 0}
-    for g in todo:
+
+    def one(g) -> tuple[list[str], str | None]:
+        counts: list[str] = []
         original = g.get("review", {}).get("original") or g.get("recommended")
         if not original:
-            continue
+            return counts, None
         by_name = {p["name"]: p for p in g["plans"]}
         order = [by_name[original]] + [p for p in sorted(g["plans"], key=lambda p: -(p.get("score") or 0))
                                        if p["name"] != original and _acceptable(p)]
@@ -192,7 +201,7 @@ def review_plans(results: str | Path, llm, groups: int | None = None, apply: boo
             seen.add(key)
             res = rv.review(g, p)
             if res is None:
-                stats["failed"] += 1
+                counts.append("failed")
                 tried.append({"plan": p["name"], "overall": None})
                 chosen = p                       # no usable answer: keep this plan as the planner ranked it
                 break
@@ -202,10 +211,10 @@ def review_plans(results: str | Path, llm, groups: int | None = None, apply: boo
                 break
             if len(tried) >= MAX_TRIES:
                 break
-        stats["reviewed"] += 1
+        counts.append("reviewed")
         last = next((t for t in tried if t.get("plan") == (chosen or {}).get("name")), tried[-1] if tried else {})
         if last.get("overall"):
-            stats[last["overall"]] += 1
+            counts.append(last["overall"])
         g["review"] = {"model": getattr(llm, "model", getattr(llm, "name", "")), "original": original,
                        "tried": tried}
         if apply:
@@ -213,15 +222,21 @@ def review_plans(results: str | Path, llm, groups: int | None = None, apply: boo
                 g["recommended"] = None
                 why = "; ".join(f"{t['plan']}: {t.get('reason', '')}" for t in tried if t.get("overall") == "reject")
                 g["no_plan_reason"] = f"the design review rejected every acceptable plan ({why})"
-                stats["dropped"] += 1
+                counts.append("dropped")
             else:
                 if chosen["name"] != original:
-                    stats["replaced"] += 1
+                    counts.append("replaced")
                 g["recommended"] = chosen["name"]
                 g.pop("no_plan_reason", None)
         verdict = last.get("overall") or "no answer"
-        log(f"{g['group_id']}: {original} -> {verdict}"
-            + (f"; now {g['recommended']}" if apply and g.get("recommended") != original else ""))
+        return counts, (f"{g['group_id']}: {original} -> {verdict}"
+                        + (f"; now {g['recommended']}" if apply and g.get("recommended") != original else ""))
+
+    for counts, line in parallel(one, todo, workers):
+        for k in counts:
+            stats[k] += 1
+        if line:
+            log(line)
     plans["review"] = {**stats, "model": getattr(llm, "model", ""), "llm_calls": rv.calls, "applied": apply,
                        "first_error": rv.errors[0] if rv.errors else None}
     pf.write_text(json.dumps(plans, indent=1, default=str))

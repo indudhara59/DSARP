@@ -161,6 +161,9 @@ class Planner:
         self.groups = pd.read_csv(triage_dir / "groups.csv", keep_default_na=False)
         self.reported_by = _reported_by(triage_dir)
         self.scopes = json.loads((triage_dir / "scopes.json").read_text())
+        self.rf.detector_note = detector_note(triage_dir.parent)
+        if self.rf.detector_note:
+            self.log("note: " + self.rf.detector_note)
         self.backend, self.time_limit = backend, time_limit
         self.log(f"facts ready in {time.time() - t0:.1f} s: {len(self.rf.prod)} production classes, "
                  f"{len(self.rf.edges)} class dependencies, baseline smells "
@@ -476,6 +479,25 @@ def why_rejected(plans: list[dict]) -> str:
                      f"{p.get('new_smells')}, normalised change cost {p.get('cost_normalised')})")
     return (f"the best of {len(cands)} candidate plans ({p['name']}, {len(p['operations'])} steps, removes "
             f"{round(100 * p.get('benefit', 0))}% of the smell) is not safe to recommend: " + "; ".join(parts))
+
+
+def detector_note(results_dir: Path) -> str:
+    """A note for the reasons of skipped groups when a detector analysed build output besides the sources."""
+    n = 0
+    try:
+        man = json.loads((results_dir / "manifest.json").read_text())
+        n = sum(v.get("duplicated_classes", 0) or v.get("build_rows", 0) for v in (man.get("build_output") or {}).values())
+    except (OSError, ValueError):
+        pass
+    if not n and (results_dir / "components.csv").exists():          # results ingested by an older version
+        from .. import paths
+        c = pd.read_csv(results_dir / "components.csv", keep_default_na=False, low_memory=False)
+        c = c[c["kind"] == "class"]
+        n = sum(paths.is_build_output_path(f, p) for f, p in zip(c["file_path"], c["package"]) if f)
+    if not n:
+        return ""
+    return (f"Designite also analysed build output (copies in target/ or WEB-INF/), "
+            f"so {n} classes were counted more than once")
 
 
 def _reported_by(triage_dir: Path) -> dict[str, set[str]]:

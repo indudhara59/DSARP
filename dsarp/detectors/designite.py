@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .. import paths
 from ..config import DetectorInput
 from ..model import DetectorResult, Level, Smell, SmellType
 
@@ -118,7 +119,32 @@ def load_components(folder: Path) -> pd.DataFrame:
         if src in df.columns:
             out[dst] = pd.to_numeric(df[src], errors="coerce")
     out["tool"] = TOOL
-    return out.drop_duplicates(subset=["name"], keep="first")
+    # A detector run on a built checkout also sees copies of the sources in build output
+    # (target/classes, an exploded WEB-INF/src, ...): keep the real source file of each class.
+    build = [paths.is_build_output_path(f, p) if f else False for f, p in zip(out["file_path_abs"], out["package"])]
+    out["_build"] = build
+    dup = out["name"].duplicated(keep=False)
+    stats = {"rows": int(len(out)), "build_rows": int(sum(build)),
+             "duplicated_classes": int(out.loc[dup, "name"].nunique()),
+             "only_in_build_output": int(out.groupby("name")["_build"].all().sum()),
+             "example": next((f for f, b in zip(out["file_path_abs"], build) if b), "")}
+    out = (out.sort_values("_build", kind="stable").drop_duplicates(subset=["name"], keep="first")
+           .drop(columns="_build").sort_index())
+    out.attrs["build_output"] = stats
+    return out
+
+
+def build_output_warning(folder: Path, stats: dict) -> str | None:
+    """A warning when Designite analysed build output besides the sources (counts are then inflated)."""
+    if not stats or not (stats.get("build_rows") or stats.get("duplicated_classes")):
+        return None
+    msg = (f"{folder}: Designite analysed build output as well as the sources: {stats['build_rows']} of "
+           f"{stats['rows']} class entries are in build folders (e.g. {stats['example'] or 'n/a'}), "
+           f"{stats['duplicated_classes']} classes are counted more than once")
+    if stats.get("only_in_build_output"):
+        msg += f" and {stats['only_in_build_output']} exist only in build output (left over from older code)"
+    return msg + (". Its feature concentration, god component and scattered functionality reports count these "
+                  "copies; run Designite on a clean checkout (dsarp detect does) for exact results.")
 
 
 def _resolver(components: pd.DataFrame):
@@ -145,6 +171,9 @@ def load(inp: DetectorInput) -> DetectorResult:
     components = load_components(folder)
     if components.empty:
         warnings.append(f"{folder}: TypeMetrics.csv missing; class metrics and file paths unavailable")
+    w = build_output_warning(folder, components.attrs.get("build_output", {}))
+    if w:
+        warnings.append(w)
     run = inp.module or folder.name
     smells: list[Smell] = []
     counter = 0

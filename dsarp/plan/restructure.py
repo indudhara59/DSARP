@@ -42,7 +42,8 @@ from collections import Counter, defaultdict
 import networkx as nx
 
 from . import solver as slv
-from .extra import FC_LCC, FC_MIN_TYPES, GOD_CLASSES, ExtraFacts, extra, fc_present, scattered_methods
+from .extra import (FC_LCC, FC_MIN_TYPES, GOD_CLASSES, ExtraFacts, extra, fc_present, scattered_methods,
+                    scattered_test_members)
 from .facts import (EDGE_COST, FIT_RATIO, MIN_FIT, NEW_EDGE_COST, RepoFacts, current_package_pairs, move_cost,
                     tokens)
 from .generator import Plan
@@ -205,6 +206,12 @@ def _key(p: Plan) -> list:
     return sorted((o.get("class", ""), o.get("to_package", "")) for o in p.operations)
 
 
+def _why_detector(rf: RepoFacts) -> str:
+    note = getattr(rf, "detector_note", "")
+    return f"; the report comes from a different view of the code: {note}" if note else \
+        "; the detector analysed a different version of the code"
+
+
 # ------------------------------------------------------------------------ god component
 
 def split_god(rf: RepoFacts, gid: str, pkg: str, time_limit: float = 60.0, backend: str = "auto",
@@ -214,8 +221,8 @@ def split_god(rf: RepoFacts, gid: str, pkg: str, time_limit: float = 60.0, backe
     size = sum(1 for t, p in xf.type_pkg.items() if p == pkg and t not in xf.generated)
     if size <= GOD_CLASSES:
         return [], {"classes": size, "limit": GOD_CLASSES,
-                    "skipped": f"{pkg} has {size} types (limit {GOD_CLASSES}, tests and nested classes counted) at "
-                               "this commit; the detector analysed a different version of the code"}
+                    "skipped": f"{pkg} has {size} types at this commit (a god component needs more than "
+                               f"{GOD_CLASSES}, tests and nested classes counted)" + _why_detector(rf)}
     k = min(max_parts, max(1, math.ceil(size / GOD_CLASSES)))
     strict, info = split_units(rf, gid, pkg, "god", time_limit, backend, max_new=k)
     relaxed, _ = split_units(rf, gid, pkg, "god", time_limit, backend, max_new=k, strict=False)
@@ -303,8 +310,14 @@ def split_units(rf: RepoFacts, gid: str, pkg: str, mode: str, time_limit: float 
         u["size"] = u["n"]                     # Designite counts every type: production, test, nested
     info["size"] = sum(u["size"] for u in units)
     if mode == "fc" and (not units or not fc_present(info["classes"], info["sets"])):
-        return [], {**info, "skipped": f"LCC of {pkg} is {info['lcc']} at this commit (limit {FC_LCC}): "
-                                      "its classes are related enough"}
+        n = info.get("classes", 0)
+        if n < FC_MIN_TYPES:
+            why = (f"{pkg} has only {n} types at this commit (feature concentration needs at least "
+                   f"{FC_MIN_TYPES}, tests and nested classes counted)" + _why_detector(rf))
+        else:
+            why = (f"LCC of {pkg} is {info['lcc']} at this commit ({info['sets']} related sets in {n} types; "
+                   f"the smell needs at least {FC_LCC}): its classes are related enough")
+        return [], {**info, "skipped": why}
     if getattr(rf, "_pairs", None) is None:
         rf._pairs = current_package_pairs(rf)
     unit_of = {c: i for i, u in enumerate(units) for c in u["classes"]}
@@ -547,8 +560,13 @@ def consolidate(rf: RepoFacts, gid: str, concern: list[str], accessors: set[str]
     info = {"methods": len(methods), "concern_classes": sorted(classes), "reporting_packages": sorted(acc)[:20],
             "per_package": dict(per_pkg.most_common(10)), "methods_list": methods}
     if not any(v > 1 for v in per_pkg.values()):
-        return [], {**info, "skipped": "no package has more than one method that uses classes of these "
-                                       "packages together at this commit"}
+        tests = scattered_test_members(xf, acc, concern_set)
+        why = ("no package has more than one method that uses classes of these packages together in its "
+               "production code at this commit")
+        if tests:
+            why += (f"; {len(tests)} test methods do (e.g. {tests[0]}), which the detector counted: "
+                    "test code is not a target of an architectural refactoring")
+        return [], {**info, "skipped": why, "test_methods": len(tests)}
     plans, why_blocked = [], {}
     for q in sorted(concern_set):
         t0 = time.time()

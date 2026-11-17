@@ -10,12 +10,16 @@
   and ``implements`` as the relations, DSARP reproduces 336 of the 537 related
   sets Designite reports for Tika (the Designite output is from a later Tika
   version).
-* **Scattered functionality** (Designite): methods that access two or more
+* **Scattered functionality** (Designite): methods that use two or more
   other packages together, more than once. Designite's exact filter is not
   published (re-implementing the published rule agrees poorly with its output),
-  so the smell is measured directly: how many methods of the reporting
+  so the smell is measured directly: how many members of the reporting
   packages still use the *concern classes* (the classes of the reported
-  packages they access) spread over two or more packages.
+  packages they use) spread over two or more packages. Every kind of use by a
+  member counts (calls, field accesses, object creation, method references and
+  types in fields, parameters, return values, local variables, type arguments,
+  ``throws`` clauses and annotations); only test code is left out,
+  because an architectural refactoring does not target it.
 * **Cyclic dependency between classes** and **hub-like classes**: the same
   rules as for packages (:mod:`dsarp.detect`) on the class graph.
 
@@ -38,6 +42,9 @@ from .. import detect as det
 
 REL_KINDS = {"field_type", "extends", "implements"}          # association, aggregation, composition, inheritance
 ACCESS_KINDS = {"call", "field_access", "new", "method_ref"}
+# every kind of use by a member (scattered functionality); not import, extends or implements (class level)
+USE_KINDS = ACCESS_KINDS | {"type_ref", "local_type", "param_type", "return_type", "type_arg", "throws",
+                            "annotation", "field_type"}
 FC_LCC = 0.2                                                  # Designite's threshold (LCC >= 0.2)
 FC_MIN_TYPES = 6        # Designite never reports packages with fewer types (checked on 242 reports, 5 repositories)
 GOD_CLASSES = det.PIPELINE.god_classes                        # more than 30 classes
@@ -58,7 +65,7 @@ class Snapshot:
     prod_top: set[str]                        # production top-level classes (after the plan)
     class_edges: set[tuple[str, str]]         # dependencies between production top-level classes
     rel_pairs: set[frozenset]                 # related type pairs (feature concentration)
-    method_targets: dict[str, set[str]]       # production method -> top-level classes it accesses
+    method_targets: dict[str, set[str]]       # production member -> top-level classes it uses
     method_owner: dict[str, str]              # production method -> top-level owner (after the plan)
     generated: set[str] = field(default_factory=set)
     test_edges: set[tuple[str, str]] = field(default_factory=set)   # test top-level class -> production class
@@ -95,7 +102,7 @@ class ExtraFacts:
         known = set(self.type_pkg) - self.generated
         self.rel_pairs = {frozenset((a, b)) for a, b in zip(rel["source_type"], rel["target_type"])
                           if a in known and b in known}
-        acc = d[d["kind"].isin(ACCESS_KINDS) & d["source"].str.contains("#", regex=False)]
+        acc = d[d["kind"].isin(USE_KINDS) & d["source"].str.contains("#", regex=False)]
         mt: dict[str, set[str]] = defaultdict(set)
         owner: dict[str, str] = {}
         for src, st, tt in zip(acc["source"], acc["source_type"], acc["target_type"]):
@@ -215,7 +222,7 @@ def snapshot_from_compile(res, production_files: set[str]) -> Snapshot:
             te.add((a, b))
         if a in prod_top and b in prod_top and a != b:
             edges.add((a, b))
-            if kind in ACCESS_KINDS and "#" in src:
+            if kind in USE_KINDS and "#" in src:
                 mt[src].add(b)
                 owner[src] = a
     return Snapshot(type_pkg, top, tests, prod_top, edges, rel, dict(mt), owner, set(), te)
@@ -305,6 +312,22 @@ def scattered_methods(xf: ExtraFacts, accessors: set[str], concern_pkgs: set[str
             methods.append(m)
             classes |= hit
     return sorted(methods), classes
+
+
+def scattered_test_members(xf: ExtraFacts, accessors: set[str], concern_pkgs: set[str]) -> list[str]:
+    """Test members of the reporting packages that use classes of 2+ concern packages (other than their own)."""
+    rf = xf.rf
+    d = rf.model.deps
+    d = d[d["kind"].isin(USE_KINDS) & d["source"].str.contains("#", regex=False)]
+    hit: dict[str, set[str]] = defaultdict(set)
+    for src, st, tt in zip(d["source"], d["source_type"], d["target_type"]):
+        s_top, t_top = xf.top.get(st), xf.top.get(tt)
+        if s_top not in xf.tests or t_top not in rf.prod:
+            continue
+        own, tp = xf.type_pkg.get(s_top), rf.package.get(t_top)
+        if own in accessors and tp in concern_pkgs and tp != own:
+            hit[src].add(tp)
+    return sorted(m for m, p in hit.items() if len(p) >= 2)
 
 
 def extra(rf) -> ExtraFacts:
