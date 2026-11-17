@@ -65,6 +65,8 @@ class Reviewer:
             except json.JSONDecodeError:
                 self.cache = {}
         self.calls = 0
+        self.errors: list[str] = []
+        self._save_cache()                      # the output exists from the start, also when nothing is reviewed
 
     # ------------------------------------------------------------------ prompt
     def _pkg_view(self, pkg: str, n: int = 14) -> str:
@@ -122,6 +124,7 @@ class Reviewer:
                 answer = self.llm.complete(SYSTEM, text)
             except LLMError as e:
                 self.log(f"  review failed: {e}")
+                self.errors.append(str(e))
                 return None
             self.calls += 1
             self.cache[key] = answer
@@ -219,6 +222,7 @@ def review_plans(results: str | Path, llm, groups: int | None = None, apply: boo
         verdict = last.get("overall") or "no answer"
         log(f"{g['group_id']}: {original} -> {verdict}"
             + (f"; now {g['recommended']}" if apply and g.get("recommended") != original else ""))
-    plans["review"] = {**stats, "model": getattr(llm, "model", ""), "llm_calls": rv.calls, "applied": apply}
+    plans["review"] = {**stats, "model": getattr(llm, "model", ""), "llm_calls": rv.calls, "applied": apply,
+                       "first_error": rv.errors[0] if rv.errors else None}
     pf.write_text(json.dumps(plans, indent=1, default=str))
     return plans["review"]

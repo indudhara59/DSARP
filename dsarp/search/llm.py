@@ -52,31 +52,64 @@ class OpenAICompatible:
     name: str = "openai"
     calls: int = field(default=0)
 
+    def _body(self, system: str, prompt: str) -> bytes:
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        if getattr(self, "_newer_api", False):
+            # newer models (reasoning models): no temperature, max_completion_tokens instead of max_tokens,
+            # with room for the tokens the model spends on reasoning before it answers
+            return json.dumps({"model": self.model, "max_completion_tokens": max(self.max_tokens, 1500) * 4,
+                               "messages": msgs}).encode()
+        return json.dumps({"model": self.model, "temperature": self.temperature, "max_tokens": self.max_tokens,
+                           "messages": msgs}).encode()
+
     def complete(self, system: str, prompt: str) -> str:
-        body = json.dumps({"model": self.model, "temperature": self.temperature, "max_tokens": self.max_tokens,
-                           "messages": [{"role": "system", "content": system},
-                                        {"role": "user", "content": prompt}]}).encode()
-        req = urllib.request.Request(self.url.rstrip("/") + "/chat/completions", data=body,
-                                     headers={"Content-Type": "application/json",
-                                              **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
         data = None
-        for attempt in range(4):
+        switched = False
+        attempt = 0
+        while True:
+            req = urllib.request.Request(self.url.rstrip("/") + "/chat/completions", data=self._body(system, prompt),
+                                         headers={"Content-Type": "application/json",
+                                                  **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     data = json.loads(r.read())
                 break
             except urllib.error.HTTPError as e:
-                if e.code in (429, 500, 502, 503, 504) and attempt < 3:
-                    time.sleep(5 * (attempt + 1))         # rate limit or busy server: wait and retry
+                detail = _error_text(e)
+                if e.code == 400 and not switched and not getattr(self, "_newer_api", False) and re.search(
+                        r"temperature|max_tokens|max_completion_tokens|unsupported|not supported", detail, re.I):
+                    self._newer_api, switched = True, True       # remembered for all further requests
                     continue
-                raise LLMError(f"language model request failed: HTTP {e.code} {e.reason}") from e
+                if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                    attempt += 1
+                    time.sleep(5 * attempt)                       # rate limit or busy server: wait and retry
+                    continue
+                raise LLMError(f"language model request failed: HTTP {e.code} {e.reason}"
+                               + (f": {detail}" if detail else "")) from e
             except Exception as e:  # network or JSON errors
                 raise LLMError(f"language model request failed: {e}") from e
         self.calls += 1
         try:
-            return data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError) as e:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
             raise LLMError(f"unexpected answer: {str(data)[:200]}") from e
+        if not text:
+            raise LLMError("empty answer (the model used its whole token budget; try another model)")
+        return text
+
+
+def _error_text(e) -> str:
+    """The error message an OpenAI-compatible server sends with an HTTP error (shortened)."""
+    try:
+        raw = e.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        d = json.loads(raw)
+        msg = (d.get("error") or {}).get("message") if isinstance(d.get("error"), dict) else d.get("error") or d.get("message")
+        return str(msg or raw)[:300]
+    except ValueError:
+        return raw.strip()[:300]
 
 
 @dataclass

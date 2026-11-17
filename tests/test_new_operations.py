@@ -221,3 +221,66 @@ def test_open_source_designitejava_output_is_read(tmp_path):
     res = ADAPTERS["designite"](DetectorInput(tool="designite", path=tmp_path))
     kinds = sorted((s.smell_type.value, s.level.value, tuple(s.members)) for s in res.smells)
     assert kinds == [("cyclic_dependency", "class", ("com.b.Order",)), ("hub_like_dependency", "class", ("com.b.Hub",))]
+
+
+def test_llm_client_adapts_to_newer_models():
+    """Newer models reject temperature/max_tokens with HTTP 400; the client switches to max_completion_tokens."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from dsarp.search.llm import LLMError, OpenAICompatible
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(sorted(body))
+            if "temperature" in body or "max_tokens" in body:
+                msg = json.dumps({"error": {"message": "Unsupported parameter: 'max_tokens' is not supported "
+                                                       "with this model. Use 'max_completion_tokens' instead."}})
+                self.send_response(400)
+            elif self.headers.get("Authorization") != "Bearer k":
+                msg = json.dumps({"error": {"message": "invalid key"}})
+                self.send_response(401)
+            else:
+                msg = json.dumps({"choices": [{"message": {"content": "ok"}}]})
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(msg.encode())
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/v1"
+    try:
+        c = OpenAICompatible(url, "m", "k")
+        assert c.complete("s", "p") == "ok" and c.complete("s", "p") == "ok"
+        assert seen[0] == ["max_tokens", "messages", "model", "temperature"]
+        assert seen[1] == seen[2] == ["max_completion_tokens", "messages", "model"]   # remembered
+        with pytest.raises(LLMError, match="invalid key"):
+            OpenAICompatible(url, "m", "wrong").complete("s", "p")
+    finally:
+        srv.shutdown()
+
+
+@needs_jdk
+def test_review_fails_visibly_when_nothing_answers(billing, monkeypatch, capsys):
+    import sys
+    from dsarp.cli import main
+    from dsarp.search import llm as L
+    _, res = billing
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    (res / "plans").mkdir(exist_ok=True)
+    (res / "plans" / "plans.json").write_text(json.dumps(p.run(10), default=str))
+
+    class Down:
+        model = "down"
+
+        def complete(self, *a):
+            raise L.LLMError("language model request failed: HTTP 400 Bad Request: unsupported model")
+    monkeypatch.setattr(L, "from_env", lambda *a, **k: Down())
+    monkeypatch.setattr(sys, "argv", ["dsarp", "review", str(res)])
+    assert main() == 1
+    assert "unsupported model" in capsys.readouterr().err
+    assert (res / "plans" / "review_cache.json").exists()

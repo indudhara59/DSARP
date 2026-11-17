@@ -326,6 +326,10 @@ def _cmd_review(args: argparse.Namespace) -> int:
         print(f"{d.name}: reviewed {st['reviewed']} plans with {st['model']} ({st['llm_calls']} new calls): "
               f"{st['accept']} accepted, {st['caution']} with caution, {st['reject']} rejected; "
               f"{st['replaced']} replaced by another plan, {st['dropped']} without a plan, {st['failed']} unanswered")
+        if st["failed"] and st["failed"] >= st["reviewed"]:
+            print(f"ERROR: the language model did not answer any request; first error: {st.get('first_error')}",
+                  file=sys.stderr)
+            return 1
         if not args.dry_run:
             from .explain import explain, write
             from .plan.facts import RepoFacts
@@ -351,6 +355,10 @@ def _cmd_advise(args: argparse.Namespace) -> int:
         st = advise_groups(d, llm, groups=args.groups)
         print(f"{d.name}: {st['groups']} groups without a verified plan; advice for {st['advised']}, "
               f"{st['rejected']} discarded, {st['failed']} unanswered ({st['llm_calls']} new calls)")
+        if st["failed"] and st["failed"] >= st["groups"]:
+            print(f"ERROR: the language model did not answer any request; first error: {st.get('first_error')}",
+                  file=sys.stderr)
+            return 1
         from .explain import explain, write
         from .plan.facts import RepoFacts
         from .program import ProgramModel
