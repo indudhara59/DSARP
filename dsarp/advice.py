@@ -49,6 +49,8 @@ class Advisor:
         self.cache_file = cache_file
         self.cache = json.loads(cache_file.read_text()) if cache_file and cache_file.exists() else {}
         self.calls = 0
+        if cache_file:
+            cache_file.write_text(json.dumps(self.cache, indent=0))      # output exists also when nothing is asked
         self.known = set(rf.package.values()) | set(rf.package) | set(rf.model.types["type"])
 
     def _facts(self, g: dict) -> str:
@@ -118,12 +120,14 @@ def advise_groups(results: str | Path, llm, groups: int | None = None, log=print
     if groups:
         todo = todo[:groups]
     stats = {"groups": 0, "advised": 0, "rejected": 0, "failed": 0}
+    first_error = None
     for g in todo:
         stats["groups"] += 1
         try:
             res = adv.advise(g)
         except LLMError as e:
             stats["failed"] += 1
+            first_error = first_error or str(e)
             log(f"{g['group_id']}: no answer ({e})")
             continue
         if "directions" in res:
@@ -136,6 +140,6 @@ def advise_groups(results: str | Path, llm, groups: int | None = None, log=print
             g["advice_rejected"] = res["rejected"]
             stats["rejected"] += 1
             log(f"{g['group_id']}: advice discarded ({res['rejected']})")
-    plans["advice"] = {**stats, "model": getattr(llm, "model", ""), "llm_calls": adv.calls}
+    plans["advice"] = {**stats, "model": getattr(llm, "model", ""), "llm_calls": adv.calls, "first_error": first_error}
     pf.write_text(json.dumps(plans, indent=1, default=str))
     return plans["advice"]
