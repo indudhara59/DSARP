@@ -400,6 +400,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(pr)
             if rest[2:] == ["overview"]:
                 return self._json(R.overview(res))
+            if rest[2:] == ["numbers"]:
+                return self._json(R.numbers(res))
             if len(rest) == 4 and rest[2] == "group":
                 if not GID_RE.match(rest[3]):
                     return self._err(400, "bad group id")

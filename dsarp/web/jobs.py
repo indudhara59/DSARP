@@ -315,8 +315,25 @@ class JobStore:
 
     # -- status of Slurm jobs ----------------------------------------------
     def poll(self, force: bool = False) -> None:
-        if not force and time.time() - self._last_poll < 5:
+        """Update the states of Slurm jobs. Pages never wait for Slurm (squeue/sacct can take seconds on a
+        busy login node): without ``force`` the query runs in a background thread at most every 10 seconds
+        and the pages show the last known states."""
+        if force:
+            self._poll_now()
             return
+        if time.time() - self._last_poll < 10 or getattr(self, "_polling", False):
+            return
+        self._last_poll = time.time()
+        self._polling = True
+
+        def work():
+            try:
+                self._poll_now()
+            finally:
+                self._polling = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_now(self) -> None:
         self._last_poll = time.time()
         with self.lock:
             active = [j for j in self.jobs.values() if j.mode == "slurm" and j.status in ACTIVE and j.slurm_id]

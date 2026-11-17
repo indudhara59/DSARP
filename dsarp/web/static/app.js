@@ -312,6 +312,39 @@ function renderRunAll() {
 
 /* ---------- results dashboard ---------- */
 async function viewResults(name) {
+  // Numbers only: read from a small summary the server caches next to the results, so the page loads fast.
+  const [pr, nb] = await Promise.all([api("/api/projects/" + encodeURIComponent(name)), api(`/api/projects/${encodeURIComponent(name)}/numbers`)]);
+  S.proj = pr; const n = encodeURIComponent(name);
+  let h = header(pr, "res");
+  const kpi = (v, label) => `<div class="kpi"><b>${v === undefined || v === null ? "–" : esc(String(v))}</b><span>${esc(label)}</span></div>`;
+  const lab = k => String(k).replace(/_/g, " ").replace(":class", " (classes)");
+  if (!nb.triage && !nb.plans && !nb.detectors) { $("#view").innerHTML = h + `<div class="empty">No results yet. Run the pipeline first (<a href="#/p/${n}">Pipeline</a>).</div>`; return; }
+  h += `<div class="row" style="margin-bottom:14px"><span class="muted small">Key numbers only. The full results with every plan step by step are in report.html (stage HTML report).</span><span class="sp"></span>
+    ${nb.report ? `<a class="btn" href="/api/projects/${n}/file/report.html" target="_blank" rel="noopener">Open report.html</a>` : ""}</div>`;
+  const D = nb.detectors || {}, T = nb.triage || {}, P = nb.plans || {}, V = nb.verify, C = nb.combined, O = P.outcomes || {};
+  h += `<div class="card sec"><h2>Smells and groups</h2><div class="kpis">
+    ${kpi(D.smells, "smells reported")}${Object.entries(D.by_tool || {}).map(([t, v]) => kpi(v, "by " + t)).join("")}
+    ${kpi((T.decisions || {}).keep, "kept after triage")}${kpi((T.decisions || {}).drop, "dropped by triage")}
+    ${kpi(P.groups ?? T.groups, "groups planned")}${kpi(P.with_plan, "groups with a plan")}</div></div>`;
+  if (P.groups) {
+    h += `<div class="card sec"><h2>Outcome of every group</h2><div class="kpis">${Object.entries(O).map(([k, v]) => kpi(v, k)).join("")}</div>
+      <div style="overflow:auto;margin-top:12px"><table><tr><th style="text-align:left">smell type</th><th>groups</th>${Object.keys(O).map(k => `<th>${esc(k)}</th>`).join("")}</tr>
+      ${Object.entries(P.per_type || {}).map(([t, c]) => `<tr><td>${esc(lab(t))}</td><td>${int(c.groups)}</td>${Object.keys(O).map(k => `<td>${int(c[k] || 0)}</td>`).join("")}</tr>`).join("")}</table></div>
+      <div class="small muted" style="margin-top:6px">Removed and reduced are measured on the compiled code after Verify; before Verify, groups with a plan show as "planned (not verified)".${P.api_policy ? ` Public API policy: ${esc(P.api_policy)} (${int(P.frozen_classes || 0)} classes kept in place).` : ""}</div></div>`;
+  }
+  if (P.review) h += `<div class="card sec"><h2>Design review <small>${esc(P.review.model || "")}</small></h2><div class="kpis">${kpi(P.review.reviewed, "plans reviewed")}${kpi(P.review.accept, "accepted")}${kpi(P.review.caution, "with caution")}${kpi(P.review.reject, "rejected")}${kpi(P.review.replaced, "replaced by another plan")}</div></div>`;
+  if (V) h += `<div class="card sec"><h2>Verification on the code</h2><div class="kpis">${kpi(V.plans, "plans verified")}${kpi(V.compile_all_steps, "compile with all steps")}${kpi(`${V.steps_kept}/${V.steps}`, "steps that compile")}${kpi(V.equal_to_simulation, "equal to the simulation")}${kpi(V.next_best_used, "next-best plan used")}</div></div>`;
+  if (C) {
+    const ks = [...new Set([...Object.keys(C.before || {}), ...Object.keys(C.after || {})])].sort();
+    h += `<div class="card sec"><h2>Combined plan for the whole repository</h2><div class="kpis">${kpi(C.plans_applied, "plans applied together")}${kpi(C.operations, "operations")}${kpi(C.compiles ? "yes" : "no", "compiles")}${kpi(C.removed, "smells removed")}${kpi(C.left_out, "plans left out")}</div>
+      <table style="margin-top:12px"><tr><th style="text-align:left">smell (whole repository)</th><th>before</th><th>after</th></tr>${ks.map(k => `<tr><td>${esc(lab(k))}</td><td>${int((C.before || {})[k] || 0)}</td><td>${int((C.after || {})[k] || 0)}</td></tr>`).join("")}</table></div>`;
+  }
+  if (P.advice) h += `<div class="card sec"><h2>Design advice <small>not verified</small></h2><div class="kpis">${kpi(P.advice.groups, "groups without a plan")}${kpi(P.advice.advised, "with advice")}${kpi(P.advice.rejected, "advice discarded")}</div></div>`;
+  if (nb.history) h += `<div class="card sec"><h2>Compared with the later history</h2><div class="kpis">${kpi(nb.history.later_commits, "later commits")}${kpi(nb.history.checked, "steps checked")}${Object.entries(nb.history.results || {}).map(([k, v]) => kpi(v, k)).join("")}</div></div>`;
+  $("#view").innerHTML = h;
+}
+
+async function viewResultsFull(name) {   // full charts and tables (not shown for now; see viewResults)
   const [pr, ov] = await Promise.all([api("/api/projects/" + encodeURIComponent(name)), api(`/api/projects/${encodeURIComponent(name)}/overview`)]);
   S.proj = pr; const n = encodeURIComponent(name), A = ov.available || {};
   let h = header(pr, "res");
