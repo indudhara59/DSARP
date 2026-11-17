@@ -66,8 +66,12 @@ class OpenAICompatible:
             if effort and not getattr(self, "_no_effort", False):
                 body["reasoning_effort"] = effort
             return json.dumps(body).encode()
-        return json.dumps({"model": self.model, "temperature": self.temperature,
-                           "max_tokens": budget or self.max_tokens, "messages": msgs}).encode()
+        body = {"model": self.model, "temperature": self.temperature, "max_tokens": budget or self.max_tokens,
+                "messages": msgs}
+        effort = effort or self.reasoning
+        if effort and not getattr(self, "_no_effort", False):
+            body["reasoning_effort"] = effort      # e.g. gpt-oss on vLLM; dropped if the server rejects it
+        return json.dumps(body).encode()
 
     def _post(self, body: bytes) -> dict:
         switched = False

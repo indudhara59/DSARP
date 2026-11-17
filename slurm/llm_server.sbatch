@@ -8,7 +8,8 @@
 #   cd /scratch/<project>/<user>
 #   apptainer pull vllm.sif docker://vllm/vllm-openai:latest
 #   export HF_HOME=$PWD/hf
-#   apptainer exec vllm.sif hf download Qwen/Qwen3.6-27B          # about 55 GB
+#   apptainer exec vllm.sif hf download openai/gpt-oss-120b       # about 65 GB (OpenAI's open-weight model)
+#   (optional) apptainer exec vllm.sif hf download Qwen/Qwen3.6-27B   # about 55 GB, an alternative
 #
 # Start (from the DSARP folder):
 #
@@ -25,11 +26,16 @@
 # network, and the key keeps other users from using your GPUs. Stop with `scancel <jobid>`.
 #
 # Options (environment variables):
-#   DSARP_LLM_MODEL   model id or path            (default Qwen/Qwen3.6-27B)
+#   DSARP_LLM_MODEL   model id or path            (default openai/gpt-oss-120b; also openai/gpt-oss-20b,
+#                                                  Qwen/Qwen3.6-27B)
+#   DSARP_LLM_REASONING  reasoning effort of gpt-oss: low, medium, high (default medium)
 #   DSARP_LLM_GPUS    GPUs, as tensor parallelism (default 4; must match --gres below)
 #   DSARP_LLM_PORT    port                        (default 8000)
 #   DSARP_LLM_CTX     maximum context length      (default 32768)
 #   VLLM_EXTRA        further vllm serve options  (default: --reasoning-parser qwen3 for Qwen models)
+#
+# gpt-oss runs on A100 with vLLM's Triton attention and Marlin MXFP4 kernels; tensor parallelism 4
+# uses the whole node for many requests at once.
 
 #SBATCH -J dsarp-llm
 #SBATCH -p gpu
@@ -44,7 +50,7 @@ set -euo pipefail
 
 : "${VLLM_SIF:?set VLLM_SIF to the vLLM container image (see the setup above)}"
 : "${HF_HOME:?set HF_HOME to the folder the model was downloaded to}"
-MODEL=${DSARP_LLM_MODEL:-Qwen/Qwen3.6-27B}
+MODEL=${DSARP_LLM_MODEL:-openai/gpt-oss-120b}
 GPUS=${DSARP_LLM_GPUS:-4}
 PORT=${DSARP_LLM_PORT:-8000}
 CTX=${DSARP_LLM_CTX:-32768}
@@ -53,6 +59,12 @@ case "$MODEL" in
   *) DEFAULT_EXTRA="" ;;
 esac
 EXTRA=${VLLM_EXTRA-$DEFAULT_EXTRA}
+# reasoning models count their reasoning in the token budget: give them room
+case "$MODEL" in
+  *gpt-oss*) MAX_TOKENS=8000; REASONING_LINE="export DSARP_LLM_REASONING=${DSARP_LLM_REASONING:-medium}" ;;
+  *Qwen3*|*qwen3*) MAX_TOKENS=8000; REASONING_LINE="" ;;
+  *) MAX_TOKENS=1500; REASONING_LINE="" ;;
+esac
 mkdir -p logs "$HOME/.dsarp"
 chmod 700 "$HOME/.dsarp"
 
@@ -88,6 +100,8 @@ export DSARP_LLM_MODEL=$MODEL
 export DSARP_LLM_KEY=$KEY
 export DSARP_LLM_TIMEOUT=600
 export DSARP_LLM_WORKERS=8
+export DSARP_LLM_MAX_TOKENS=$MAX_TOKENS
+$REASONING_LINE
 EOF
         echo "[$(date -Is)] ready: source ~/.dsarp/llm.env"
         break

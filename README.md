@@ -417,8 +417,12 @@ times as much), `DSARP_LLM_REASONING` (`low`, `medium`, `high`),
 (4 × A100 40 GB) as an OpenAI-compatible endpoint. Every DSARP stage that uses
 a language model then talks to it directly: no API key from outside, no
 request limits, and the same model weights for every run, which makes the
-results reproducible. The default model is `Qwen/Qwen3.6-27B` (Apache 2.0) in
-full precision on the four GPUs.
+results reproducible. The default model is OpenAI's open-weight
+`openai/gpt-oss-120b` (Apache 2.0, a reasoning model; vLLM runs it on A100s
+with its Marlin MXFP4 kernels) on the four GPUs, with medium reasoning effort
+(`DSARP_LLM_REASONING`). Alternatives: `openai/gpt-oss-20b` (smaller, faster)
+and `Qwen/Qwen3.6-27B`. OpenAI's hosted models (the GPT models on the
+university gateway) have no published weights and cannot run on the cluster.
 
 One-time setup on a login node (compute nodes have no internet):
 
@@ -427,7 +431,7 @@ module load tools Apptainer
 cd /scratch/<project>/<user>
 apptainer pull vllm.sif docker://vllm/vllm-openai:latest
 export HF_HOME=$PWD/hf
-apptainer exec vllm.sif hf download Qwen/Qwen3.6-27B      # about 55 GB; older images: huggingface-cli download
+apptainer exec vllm.sif hf download openai/gpt-oss-120b   # about 65 GB; older images: huggingface-cli download
 ```
 
 Each time you need it:
