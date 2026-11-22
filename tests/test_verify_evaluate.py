@@ -145,6 +145,15 @@ def test_verify_cli_and_report(project, capsys):
     assert main(["verify", str(project), "--repo", str(PROJECT)]) == 0
     rec = json.loads((project / "verify" / "verification.json").read_text())
     assert rec and rec[0]["compiles"]
+    # the same in two shards, merged: the same groups and results
+    (project / "verify" / "verification.json").unlink()
+    assert main(["verify", str(project), "--repo", str(PROJECT), "--shard", "0/2"]) == 0
+    assert main(["verify", str(project), "--repo", str(PROJECT), "--shard", "1/2"]) == 0
+    assert (project / "verify" / "verification-shard0of2.json").exists()
+    assert main(["verify", str(project), "--merge"]) == 0
+    merged = json.loads((project / "verify" / "verification.json").read_text())
+    assert [r["group_id"] for r in merged] == [r["group_id"] for r in rec]
+    assert [r["status"] for r in merged] == [r["status"] for r in rec]
     assert main(["report", str(project)]) == 0
     page = (project / "report.html").read_text()
     assert page.startswith("<!DOCTYPE html>") and "Verification on the code" in page and "<h3>" in page
@@ -256,3 +265,39 @@ def test_new_errors_ignores_names_imported_from_libraries(tmp_path):
     assert len(cmp.new_errors(before, after, repo_symbols={"Event"}, repo_packages={"p", "p.q"})) == 1
     assert cmp.new_errors(before, after, repo_symbols={"Event"}, repo_packages={"p", "p.q"},
                           root=tmp_path).empty
+
+
+@needs_jdk
+def test_moved_public_class_keeps_a_compiling_deprecated_stub(project):
+    v = Verifier(project, PROJECT, log=lambda *_: None, compat="stubs", build_tool="none")
+    group = {"group_id": "G-stub", "type": "cyclic_dependency", "core": ["com.acme.core", "com.acme.util"],
+             "central": ""}
+    plan = {"name": "manual", "operations": [{**MOVE_ENGINE, "check": {"edits": [
+        {"edit": "make_public", "elements": ["com.acme.core.Engine#runs"]}]}}]}
+    rec = v.verify_plan(group, plan)
+    assert rec["kept"] == 1 and rec["compat"]["stubs"] == ["com.acme.core.Engine"] and rec["compat"]["failed"] == []
+    stub = (project / "verify" / "G-stub" / "compat.patch").read_text()
+    assert "core/src/main/java/com/acme/core/Engine.java" in stub
+    assert "@Deprecated" in stub and "public class Engine extends com.acme.util.Engine" in stub
+    assert rec["api_breaks"]["count"] < rec["api_breaks_without_stubs"]
+    assert rec["compat_patch_applies"] is True
+    # the stub adds a dependency from the old package to the new one: measured, not hidden
+    assert rec["compat"]["target_removed_with_stubs"] in (True, False)
+
+
+@needs_jdk
+def test_rewriter_updates_class_names_in_resources_and_osgi_exports(project, tmp_path):
+    rw = Rewriter(ProgramModel(project / "model"))
+    op = {"op": "move_class", "class": "com.acme.core.Engine", "from_package": "com.acme.core",
+          "to_package": "com.acme.core.engine"}
+    with Workspace(PROJECT, tmp_path / "ws") as ws:
+        res_dir = ws.path / "core/src/main/resources"
+        res_dir.mkdir(parents=True, exist_ok=True)
+        (res_dir / "app.properties").write_text("engine=com.acme.core.Engine\nother=com.acme.core.EngineFactory\n")
+        (ws.path / "core/core.bnd").write_text("Export-Package: com.acme.core;version=1.0, com.acme.util\n")
+        res = rw.apply(ws.path, [op], [{"edits": [{"edit": "make_public", "elements": ["com.acme.core.Engine#runs"]}]}])
+        props = (res_dir / "app.properties").read_text()
+        assert "engine=com.acme.core.engine.Engine" in props
+        assert "other=com.acme.core.EngineFactory" in props                 # a different class is left alone
+        assert "com.acme.core.engine,com.acme.core;version=1.0" in (ws.path / "core/core.bnd").read_text()
+        assert "core/src/main/resources/app.properties" in res.changed

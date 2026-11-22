@@ -525,6 +525,8 @@ def move_cost(rf: RepoFacts, c: str, target: str, aff: float) -> float:
     The per-user term makes widely used classes (like ``ParseContext`` in a
     code base) expensive to move: in practice they are the last to move."""
     users = rf.users.get(c, len(rf.dependents(c)))
+    if aff is None:
+        aff = min(max(rf.evidence(c, target), 0.0), 1.0)
     cost = 1.0 + 4.0 * (1.0 - aff) + 0.2 * users
     if rf.api.get(c):
         cost += 5.0

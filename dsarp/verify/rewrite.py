@@ -777,11 +777,192 @@ class Rewriter:
                 q = p.with_name(rename[base])
                 p.rename(q)
                 res.moved[wf] = str(Path(wf).with_name(rename[base]))
+        # 4. other text resources naming the classes (properties, YAML, templates, ...)
+        for rf in self._resource_files(repo):
+            if rf in self.wiring_files:
+                continue
+            p = repo / rf
+            try:
+                text = _read_text(p)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not any(c in text for c in rename):
+                continue
+            new = fq_re.sub(lambda m: rename[m.group(1)], text)
+            if new != text:
+                _write_text(p, new)
+                res.changed.add(rf)
+        # 5. OSGi bundles: a new package next to an explicitly exported one is exported too
+        self._export_new_packages(repo, moves, res)
         res.notes += [f"moved {c} -> {n}" for c, n in rename.items()]
+
+    RESOURCE_EXT = {".properties", ".yaml", ".yml", ".json", ".conf", ".cfg", ".ftl", ".vm", ".jsp", ".tag",
+                    ".xml", ".xsd", ".tld", ".factories", ".imports", ".groovy", ".kts", ".gradle"}
+    SKIP_DIRS = {".git", "target", "build", "out", "bin", "node_modules", ".gradle", ".idea", ".mvn"}
+
+    def _resource_files(self, repo: Path) -> list[str]:
+        """Text files outside Java code that may name classes (cached per working copy)."""
+        cache = self.__dict__.setdefault("_res_cache", {})
+        key = str(repo)
+        if key not in cache:
+            import os
+            out = []
+            for dp, dns, fns in os.walk(repo):
+                dns[:] = [d for d in dns if d not in self.SKIP_DIRS and not d.startswith(".")]
+                for fn in fns:
+                    if Path(fn).suffix in self.RESOURCE_EXT or fn == "MANIFEST.MF" or fn.endswith(".bnd"):
+                        full = Path(dp) / fn
+                        if full.stat().st_size < 2_000_000:
+                            out.append(full.relative_to(repo).as_posix())
+            cache[key] = out
+        return cache[key]
+
+    def _export_new_packages(self, repo: Path, moves: list[dict], res: ApplyResult) -> None:
+        existing = set(self.type_pkg.values())
+        pairs = {(o["from_package"], o["to_package"]) for o in moves if o["to_package"] not in existing}
+        if not pairs:
+            return
+        for rf in self._resource_files(repo):
+            name = Path(rf).name
+            if not (name in ("pom.xml", "MANIFEST.MF") or name.endswith(".bnd")):
+                continue
+            p = repo / rf
+            text = _read_text(p)
+            if "Export-Package" not in text:
+                continue
+            new = _export_packages(text, pairs, xml=name == "pom.xml")
+            if new != text:
+                _write_text(p, new)
+                res.changed.add(rf)
+                res.notes.append(f"exported new packages in {rf}")
+
+    # ------------------------------------------------------------------ compatibility stubs
+    def stubbable(self, cls: str) -> bool:
+        from ..plan.api import api_index
+        return api_index(self.model).stubbable(cls)
+
+    def compat_stubs(self, repo: str | Path, ops: list[dict], res: ApplyResult) -> dict[str, str]:
+        """Deprecated stubs at the old place of moved public types (path in the repository -> source).
+
+        A stub keeps the old name: ``@Deprecated public class Old extends new.Old`` with constructors that
+        forward to the moved class, or ``@Deprecated public interface Old extends new.Old``. Static members
+        and member types stay reachable through the old name; code that implements or extends the old type
+        keeps compiling. Not covered: code that assigns an object typed as the new class to a variable of the
+        old type. Stubs are meant for one release and are delivered separately (compat.patch)."""
+        repo = Path(repo)
+        out: dict[str, str] = {}
+        for o in ops:
+            if o.get("op") != "move_class" or not self.stubbable(o["class"]):
+                continue
+            old_file = self.type_file.get(o["class"])
+            new_file = res.moved.get(old_file)
+            if not old_file or not new_file or not (repo / new_file).exists() or (repo / old_file).exists():
+                continue
+            text = _read_text(repo / new_file)
+            stub = _stub_source(text, o["class"], f"{o['to_package']}.{o['class'].rsplit('.', 1)[-1]}",
+                                o["from_package"], o["to_package"])
+            if stub:
+                out[old_file] = stub
+        return out
 
     def files_after(self, res: ApplyResult) -> list[str]:
         out = [res.moved.get(f, f) for f in self.java_files]
         return out + [c for c in res.created if c.endswith(".java")]
+
+
+_HEAD = re.compile(r"^[ \t]*((?:@[\w.]+(?:\([^)]*\))?\s+)*)((?:(?:public|protected|private|abstract|static|final|"
+                   r"sealed|non-sealed|strictfp)\s+)*)(class|interface)\s+(\w+)", re.M)
+
+
+def _stub_source(text: str, old_fqn: str, new_fqn: str, old_pkg: str, new_pkg: str) -> str | None:
+    """Source of a deprecated stub for a moved top-level class or interface, or None when it cannot be made."""
+    simple = old_fqn.rsplit(".", 1)[-1]
+    body = _strip_comments_and_strings(text)
+    m = next((x for x in _HEAD.finditer(body) if x.group(4) == simple), None)
+    if not m or "sealed" in m.group(2).split() and "non-sealed" not in m.group(2) or "final" in m.group(2).split():
+        return None
+    kind = m.group(3)
+    brace = body.find("{", m.end())
+    if brace < 0:
+        return None
+    head = body[m.start():brace]
+    tp_full, tp_names = Rewriter._type_params(head, simple)
+    imports = re.findall(r"^\s*import\s+(?:static\s+)?[\w.*]+\s*;", text, re.M)
+    lines = [f"package {old_pkg};", ""]
+    lines += [i.strip() for i in imports]
+    if new_pkg != old_pkg:
+        lines.append(f"import {new_pkg}.*;")
+    lines += ["", "/**", f" * Moved to {{@link {new_fqn}}}.", " *",
+              f" * @deprecated use {{@link {new_fqn}}}; this stub keeps existing code compiling and will be",
+              " *             removed in a later release.", " */", "@Deprecated"]
+    if kind == "interface":
+        lines.append(f"public interface {simple}{tp_full} extends {new_fqn}{tp_names} {{")
+    else:
+        abstract = "abstract " if "abstract" in m.group(2).split() else ""
+        lines.append(f"public {abstract}class {simple}{tp_full} extends {new_fqn}{tp_names} {{")
+        end = _close(body, brace, "{", "}")
+        inner = body[brace + 1:end]
+        depth, i, ctors = 0, 0, []
+        while i < len(inner):                       # constructors at the top level of the class body
+            ch = inner[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif depth == 0:
+                cm = re.match(r"((?:public|protected)\s+)(?:<[^>]*>\s*)?" + re.escape(simple) + r"\s*\(", inner[i:])
+                if cm and (i == 0 or not (inner[i - 1].isalnum() or inner[i - 1] in "_$.")):
+                    p0 = i + cm.end() - 1
+                    p1 = _close(inner, p0, "(", ")")
+                    params = inner[p0 + 1:p1]
+                    rest = inner[p1 + 1:]
+                    th = re.match(r"\s*(throws\s+[\w.,\s<>]+?)\s*\{", rest)
+                    names = []
+                    for prm in _split_args(params):
+                        prm = prm.strip()
+                        if prm:
+                            names.append(re.findall(r"[\w$]+", prm)[-1])
+                    ctors.append(f"    {cm.group(1).strip()} {simple}({' '.join(params.split())})"
+                                 f"{' ' + th.group(1).strip() if th else ''} {{\n        super({', '.join(names)});\n    }}")
+                    i = p1
+            i += 1
+        lines += ctors
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _export_packages(text: str, pairs: set[tuple[str, str]], xml: bool) -> str:
+    """Add each new package before its old package in Export-Package lists that name the old one explicitly
+    (a wildcard such as ``org.a.*`` already covers sub-packages)."""
+    if xml:
+        blocks = [(m.start(1), m.end(1)) for m in re.finditer(r"<Export-Package>(.*?)</Export-Package>", text, re.S)]
+    else:
+        blocks = [(m.start(1), m.end(1)) for m in
+                  re.finditer(r"^Export-Package:(.*?)(?=^\S|\Z)", text, re.S | re.M)]
+    for a, b in reversed(blocks):
+        block = text[a:b]
+        flat = re.sub(r"\\\n|\n ", "", block)
+        for old, new in sorted(pairs):
+            if re.search(r"(?<![\w.])" + re.escape(new) + r"(?![\w])", flat):
+                continue
+            if any(new.startswith(w[:-1]) for w in re.findall(r"[\w.]+\.\*", flat)):
+                continue
+            block = re.sub(r"(?<![\w.!])(" + re.escape(old) + r")(?![\w.])", new + r",\1", block, count=1)
+        text = text[:a] + block + text[b:]
+    return text
+
+
+def _close(text: str, start: int, op: str, cl: str) -> int:
+    """Index of the bracket that closes the one at ``start`` in code without comments and strings."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == op:
+            depth += 1
+        elif text[i] == cl:
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(text)
 
 
 def _imports(text: str, fqn: str) -> bool:

@@ -258,7 +258,8 @@ def test_combined_plan_applies_all_groups_together(shop):
     (res / "plans" / "plans.json").write_text(json.dumps(out, default=str))
     v = Verifier(res, repo, log=lambda *_: None)
     v.run()
-    r = Combiner(v, log=lambda *_: None).run()
+    assert Combiner(v, log=lambda *_: None).candidates() == []       # not built here: no accepted fixes
+    r = Combiner(v, log=lambda *_: None, only_accepted=False).run()
     assert r["compiles"] and len(r["plans_applied"]) >= 3, r
     assert r["removed"] >= 3
     wb, wa = r["whole_repository"]["before"], r["whole_repository"]["after"]
@@ -269,9 +270,17 @@ def test_combined_plan_applies_all_groups_together(shop):
 @needs_jdk
 def test_api_limit_blocks_plans_that_move_public_classes(shop):
     _, res = shop
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=0, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=0, log=lambda *_: None,
+                compat="none")
     row = next(r for _, r in p.groups.iterrows() if kind_of(r["type"], r["level"]) == "god_component")
     out = p.plan_group(row)
     assert all(x["checks"].get("api_breaks", 0) > 0 for x in out["plans"] if x.get("operations"))
     assert out["recommended"] is None
     assert "public types and members" in out["no_plan_reason"]
+    # with compatibility stubs, moved public classes keep their old name: the split is possible again
+    p2 = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=0, log=lambda *_: None)
+    out2 = p2.plan_group(row)
+    assert out2["recommended"] is not None
+    rec = next(x for x in out2["plans"] if x["name"] == out2["recommended"])
+    assert rec["checks"]["api_breaks"] == 0 and rec["checks"]["api_covered_by_stubs"] > 0
+

@@ -115,6 +115,46 @@ def _move(rf: RepoFacts, xf: ExtraFacts, c: str, to: str, aff: float | None, new
 
 
 NEW_CYCLE_COST = 20.0
+MERGE_MAX_TYPES = 8          # a package this small may be merged into the package it is entangled with
+MERGE_CANDIDATES = 3
+
+
+def merge_plans(rf: RepoFacts, gid: str, core: list[str]) -> list[Plan]:
+    """Merge a small package of a package cycle into the cycle package it is most entangled with.
+
+    Arcan's catalogue lists merging as a fix for cycles between packages that belong together. Every class of
+    the small package (with its tests) moves; candidates need at most ``MERGE_MAX_TYPES`` classes, the same
+    build module and a class name that does not exist in the target package. The simulation and the checks
+    decide like for every other plan; moving the whole package is a bigger change, so the score's cost term
+    weighs it."""
+    xf = extra(rf)
+    core = [p for p in core if p in rf.pkg_classes]
+    links: dict[tuple[str, str], int] = defaultdict(int)
+    for (a, b), e in rf.edges.items():
+        pa, pb = rf.package.get(a), rf.package.get(b)
+        if pa in core and pb in core and pa != pb:
+            links[(pa, pb)] += e.weight
+            links[(pb, pa)] += e.weight
+    cands = []
+    for p in core:
+        cls_p = sorted(rf.pkg_classes[p])
+        if not 1 <= len(cls_p) <= MERGE_MAX_TYPES or len(rf.pkg_modules.get(p, ())) != 1:
+            continue
+        targets = [q for q in core if q != p and links.get((p, q)) and rf.pkg_modules.get(q) == rf.pkg_modules[p]
+                   and not (rf.simple_names.get(p, set()) & rf.simple_names.get(q, set()))
+                   and not any(rf.fixed(c) for c in cls_p)]
+        if targets:
+            q = max(targets, key=lambda x: (links[(p, x)], -len(rf.pkg_classes[x])))
+            cands.append((len(cls_p), -links[(p, q)], p, q))
+    out = []
+    for _, _, p, q in sorted(cands)[:MERGE_CANDIDATES]:
+        ops = [_move(rf, xf, c, q, round(min(max(rf.evidence(c, q), 0.0), 1.0), 3), False,
+                     f"merge {p} into {q}: the two packages depend on each other")
+               for c in sorted(rf.pkg_classes[p])]
+        cost = sum(split_cost(rf, c) for c in rf.pkg_classes[p])
+        out.append(_plan(gid, f"merge_{p.rsplit('.', 1)[-1]}_into_{q.rsplit('.', 1)[-1]}", None, cost, 0.0,
+                         {"merge": p, "into": q}, ops, 0.0, status="heuristic"))
+    return out
 
 
 def _order_constraints(m: slv.LinearModel, nodes: list[str], cost: dict, now: set[tuple[str, str]] | None = None,

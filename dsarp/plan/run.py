@@ -150,8 +150,9 @@ class Planner:
     def __init__(self, model_dir: str | Path, triage_dir: str | Path, backend: str = "auto",
                  time_limit: float = 60.0, log=print, affinity: str | Path | None = None,
                  search: str = "auto", search_time: float = 120.0, llm=None, api_policy: str = "balanced",
-                 max_api_breaks: int | None = -1):
+                 max_api_breaks: int | None = -1, compat: str = "stubs"):
         self.log = log
+        self.compat = compat
         # -1: the default of the API policy; None: no limit
         self.max_api_breaks = MAX_API_BREAKS.get(api_policy) if max_api_breaks == -1 else max_api_breaks
         t0 = time.time()
@@ -268,8 +269,9 @@ class Planner:
     def _summarise(self, checks, ops: list[dict]) -> dict:
         """Checks of a plan's steps, with the public API it breaks; over the limit, the plan is blocked."""
         summ = summarise(checks)
-        api = api_breaks(self.model, ops)
+        api = api_breaks(self.model, ops, self.compat)
         summ["api_breaks"] = api["count"]
+        summ["api_covered_by_stubs"] = api["covered_by_stubs"]
         summ["api_examples"] = api["examples"]
         lim = self.max_api_breaks
         if lim is not None and api["count"] > lim:
@@ -399,6 +401,9 @@ class Planner:
         pm = PlanModel(self.rf, gf)
         t0 = time.time()
         plans = pm.plans(time_limit=self.time_limit, backend=self.backend)
+        if t == "cyclic_dependency":
+            from .restructure import merge_plans
+            plans += merge_plans(self.rf, gid, gf.core)
         out["solve_seconds"] = round(time.time() - t0, 1)
         central = row["central"] if t != "cyclic_dependency" else ""
         best = None
@@ -475,7 +480,7 @@ class Planner:
             results.append(r)
         return {"groups": results, "backends": slv.available_backends(), "weights": WEIGHTS,
                 "affinity_model": self.affinity, "search": self.search, "api_policy": self.rf.api_policy,
-                "max_api_breaks": self.max_api_breaks,
+                "max_api_breaks": self.max_api_breaks, "compat": self.compat,
                 "frozen_classes": len(self.rf.frozen),
                 "llm": getattr(self.llm, "name", "none") if self.llm else "none",
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}

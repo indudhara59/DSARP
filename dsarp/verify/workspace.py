@@ -49,6 +49,20 @@ class Workspace:
         _git(self.path, "reset", "-q")
         return out
 
+    def stage(self) -> None:
+        """Remember the current state (git index), so that a later diff shows only what changed since."""
+        _git(self.path, "add", "-A")
+
+    def diff_since_stage(self) -> str:
+        _git(self.path, "add", "-A", "-N")
+        out = _git(self.path, "diff", "--stat", "--patch").stdout
+        return out
+
+    def apply(self, patch: str | Path) -> bool:
+        r = subprocess.run(["git", "-C", str(self.path), "apply", str(Path(patch).resolve())],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+
     def apply_check(self, patch: str | Path) -> bool:
         """Whether a patch applies to this (clean) working copy, as ``git apply`` on a checkout would."""
         r = subprocess.run(["git", "-C", str(self.path), "apply", "--check", str(Path(patch).resolve())],

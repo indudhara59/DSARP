@@ -5,7 +5,7 @@
 #
 # Building with Maven/Gradle (DSARP_BUILD=auto) runs offline on compute nodes:
 # download the dependencies once on a login node, e.g.
-#   (cd $DSARP_WORK/tika && mvn -q dependency:go-offline)      # uses ~/.m2 or -Dmaven.repo.local
+#   dsarp prepare-build results/<name> --workdir $DSARP_WORK     # with DSARP_MAVEN_REPO on scratch
 #
 # Usage:
 #   sbatch --array=1-$(wc -l < configs.list) -A <project> slurm/verify_array.sbatch

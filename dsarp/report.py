@@ -222,10 +222,27 @@ def build(results: str | Path) -> str:
             if api.get("count"):
                 parts.append(f"<li>public API changed for code outside the repository: {api['count']} "
                              f"({api.get('types', 0)} types, {api.get('members', 0)} members)</li>")
+            cp = v.get("compat") or {}
+            if cp.get("stubs") or cp.get("failed"):
+                keep = cp.get("target_removed_with_stubs")
+                parts.append(f"<li>compatibility stubs (compat.patch, deprecated, for one release): "
+                             f"{len(cp.get('stubs', []))} classes keep their old name"
+                             + (f", {len(cp['failed'])} could not be stubbed" if cp.get("failed") else "")
+                             + f"; public API changed without stubs: {v.get('api_breaks_without_stubs', '?')}"
+                             + ("" if keep is None else
+                                "; with the stubs in place the smell is " + ("also removed" if keep else
+                                                                            "still there until they are removed"))
+                             + "</li>")
             if "patch_applies" in v:
                 parts.append(f"<li>patch applies to a clean checkout: "
                              f"<span class='{'ok' if v['patch_applies'] else 'bad'}'>"
                              f"{'yes' if v['patch_applies'] else 'no'}</span></li>")
+            if v.get("confirmed_by") or v.get("still_reported_by"):
+                parts.append("<li>detectors on the changed code: "
+                             + (f"<span class='ok'>no longer reported by {', '.join(v.get('confirmed_by', []))}</span>"
+                                if v.get("confirmed_by") else "")
+                             + (f" <span class='bad'>still reported by {', '.join(v['still_reported_by'])}</span>"
+                                if v.get("still_reported_by") else "") + "</li>")
             parts.append(f"<li><b>accepted fix: <span class='{'ok' if v.get('accepted') else 'bad'}'>"
                          f"{'yes' if v.get('accepted') else 'no'}</span></b>"
                          + (f" ({html.escape(v.get('why_not_accepted', ''))})" if v.get("why_not_accepted") else "")
