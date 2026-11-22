@@ -62,7 +62,7 @@ def billing(tmp_path_factory):
 def test_move_instance_method_breaks_the_class_cycle(billing):
     from dsarp.verify.run import Verifier
     repo, res = billing
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     row = next(r for _, r in p.groups.iterrows() if kind_of(r["type"], r["level"]) == "cyclic_dependency:class")
     out = p.plan_group(row)
     rec = next(x for x in out["plans"] if x["name"] == out["recommended"])
@@ -161,7 +161,7 @@ def test_rating_agreement():
 def test_rating_sheet_and_agreement(billing, tmp_path):
     from dsarp.evaluate.rating import agreement, sheet
     _, res = billing
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     (res / "plans").mkdir(exist_ok=True)
     (res / "plans" / "plans.json").write_text(json.dumps(p.run(10), default=str))
     f = sheet(res, 10)
@@ -322,7 +322,7 @@ def test_review_fails_visibly_when_nothing_answers(billing, monkeypatch, capsys)
     from dsarp.cli import main
     from dsarp.search import llm as L
     _, res = billing
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     (res / "plans").mkdir(exist_ok=True)
     (res / "plans" / "plans.json").write_text(json.dumps(p.run(10), default=str))
 

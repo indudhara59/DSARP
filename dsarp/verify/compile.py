@@ -153,6 +153,54 @@ def package_graph(res: CompileResult, production_files: set[str]) -> tuple[nx.Di
     return g, dict(counts)
 
 
+def class_graph(res: CompileResult, production_files: set[str]) -> nx.DiGraph:
+    """Dependencies between top-level production classes of the compiled code."""
+    t = res.types
+    t = t[t["file"].isin(production_files)]
+    top = dict(zip(t["type"], t["top_level"]))
+    d = res.deps
+    s = d["source"].str.split("#").str[0].map(top)
+    g_ = d["target"].str.split("#").str[0].map(top)
+    d = d.assign(st=s, tt=g_).dropna(subset=["st", "tt"])
+    g = nx.DiGraph()
+    g.add_nodes_from(set(top.values()))
+    g.add_edges_from((a, b) for a, b in set(zip(d["st"], d["tt"])) if a != b)
+    return g
+
+
+def new_smells(before: CompileResult, after: CompileResult, prod_before: set[str], prod_after: set[str],
+               renamed: dict[str, str]) -> list[dict]:
+    """Smells of the compiled code after a plan that were not there before (moved classes mapped back).
+
+    Classes and packages newly on a dependency cycle, and packages newly unstable, hub-like or god components.
+    A smell that only changed its members (a cycle that got smaller) is not new."""
+    back = {v: k for k, v in renamed.items()}
+    sb, sa = detect(before, prod_before), detect(after, prod_after)
+    out = []
+
+    def central(df, kind):
+        return set(df.loc[df["type"] == kind, "central"])
+
+    def on_cycle(df):
+        c = df[df["type"] == "cyclic_dependency"]
+        return set().union(*[set(m) for m in c["members"]]) if len(c) else set()
+
+    new_pkgs = sorted(on_cycle(sa) - on_cycle(sb))
+    if new_pkgs:
+        out.append({"type": "cyclic_dependency", "level": "package", "elements": new_pkgs})
+    for kind in ("unstable_dependency", "hub_like_dependency", "god_component"):
+        n = sorted(central(sa, kind) - central(sb, kind))
+        if n:
+            out.append({"type": kind, "level": "package", "elements": n})
+    cyc = lambda g: set().union(*[c for c in nx.strongly_connected_components(g) if len(c) > 1] or [set()])
+    cb = cyc(class_graph(before, prod_before))
+    ca = {back.get(c, c) for c in cyc(class_graph(after, prod_after))}
+    n = sorted(ca - cb)
+    if n:
+        out.append({"type": "cyclic_dependency", "level": "class", "elements": n})
+    return out
+
+
 def detect(res: CompileResult, production_files: set[str], th: det.Thresholds = det.PIPELINE) -> pd.DataFrame:
     g, counts = package_graph(res, production_files)
     return det.detect(g, None, counts, None, th)

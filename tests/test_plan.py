@@ -128,7 +128,7 @@ def test_checks_list_follow_up_edits(project):
 
 @needs_jdk
 def test_planner_writes_results(project, tmp_path):
-    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     result = planner.run(5)
     g = result["groups"][0]
     assert g["type"] == "cyclic_dependency" and g["recommended"]

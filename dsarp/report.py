@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .outcome import outcome
+from .outcome import accepted, outcome
 
 CSS = """
 body{font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#1d2125}
@@ -137,13 +137,26 @@ def build(results: str | Path) -> str:
              ("not a smell at this commit", counts["not a smell at this commit"]),
              ("with a usable plan", f"{usable}/{real}")]
     if verify:
-        cards += [("removed (verified)", counts["removed"]), ("reduced (verified)", counts["reduced"]),
-                  ("not applicable on the code", counts["not applicable"])]
+        acc = sum(1 for g in groups if accepted(vmap.get(g["group_id"])))
+        built = sum(1 for v in verify if (v.get("build") or {}).get("status") not in (None, "not built"))
+        cards += [("accepted fixes", f"{acc}/{len(verify)}"),
+                  ("removed (verified)", counts["removed"]), ("reduced (verified)", counts["reduced"]),
+                  ("break the build or tests", counts["breaks the build"] + counts["breaks tests"]
+                   + counts["tests did not finish"]),
+                  ("make it worse", counts["makes it worse"]),
+                  ("not applicable on the code", counts["not applicable"]),
+                  ("built with the project's build", f"{built}/{len(verify)}")]
     cards += [("no safe plan", counts["no safe plan"]), ("needs a design change", counts["needs a design change"])]
     parts.append("<div class='cards'>" + "".join(f"<div class='card'><b>{html.escape(str(v))}</b>{k}</div>"
                                                 for k, v in cards) + "</div>")
-    parts.append("<p>Outcomes: <b>removed</b> / <b>reduced</b>: verified on the compiled code; <b>not applicable</b>: "
-                 "every step of every plan tried broke the build; <b>no safe plan</b>: candidates exist but each "
+    parts.append("<p><b>Accepted fix</b>: the smell is removed or reduced on the compiled code, the project's own "
+                 "build compiles the change (libraries included), the tests that use a changed class and passed "
+                 "before still pass, no new smell appears, the patch applies to a clean checkout and at most "
+                 f"{html.escape(str(plans.get('max_api_breaks', 'the limit of')))} public types and members change. "
+                 "Outcomes: <b>removed</b> / <b>reduced</b>: on the compiled code (an accepted fix only if all the "
+                 "checks above hold); <b>breaks the build</b> / <b>breaks tests</b> / <b>tests did not finish</b>: "
+                 "the project's build or tests; <b>makes it worse</b>: new smells on the compiled code; "
+                 "<b>not applicable</b>: every step of every plan tried broke the build; <b>no safe plan</b>: candidates exist but each "
                  "would create new smells, be blocked or cost more than it removes; <b>needs a design change</b>: "
                  "the operations DSARP can verify cannot fix it; <b>not a smell at this commit</b>: the detector "
                  "counted tests, generated code, libraries or sub-packages.</p>")
@@ -160,9 +173,14 @@ def build(results: str | Path) -> str:
                    if name else "",
                    "steps": f"{v['kept']}/{v['operations']} kept" if v else (len(p["operations"]) if p else ""),
                    "score": p.get("score", "") if p else "",
+                   "accepted": ("yes" if v.get("accepted") else "no") if v else "",
+                   "checked by": (v.get("build") or {}).get("check", "") if v else "",
+                   "public API changed": (v.get("api_breaks") or {}).get("count", "") if v else
+                   ((p or {}).get("checks") or {}).get("api_breaks", ""),
                    "smell before → after (verified)": (f"{_brief(v.get('target_before'))} → "
                                                        f"{_brief(v.get('target_after'))}") if v.get("target_after") else "",
-                   "reason": "" if name else (g.get("skipped") or g.get("no_plan_reason") or "")})
+                   "reason": (v.get("why_not_accepted", "") if v else "") if name else
+                   (g.get("skipped") or g.get("no_plan_reason") or "")})
     parts.append(_table(pd.DataFrame(ov)))
     if report_md:
         parts.append("<h2>Plans step by step</h2>")
@@ -188,11 +206,30 @@ def build(results: str | Path) -> str:
                     f"{html.escape(str(t['plan']))}: {t.get('kept')}/{t.get('operations')} steps compile"
                     + (", smell removed" if t.get("target_removed") else "") for t in v["tried"])
                     + f" → kept <b>{html.escape(str(v['plan']))}</b></li>")
-            if "build" in v:
-                b = v["build"]
-                parts.append(f"<li>build ({html.escape(b['tool'])}, {b['tests_selected']} tests selected): "
-                             f"<span class='{'ok' if b['ok'] else 'bad'}'>{'passed' if b['ok'] else 'failed'}</span>"
-                             f" (baseline {'passed' if b['baseline_ok'] else 'failed'})</li>")
+            b = v.get("build") or {}
+            if b:
+                good = b.get("status") in ("builds", "builds and tests pass")
+                parts.append(f"<li>project build and tests: <span class='{'ok' if good else 'bad'}'>"
+                             f"{html.escape(str(b.get('status')))}</span>: {html.escape(str(b.get('reason', '')))}"
+                             + (f" ({b.get('tests_selected')} tests selected)" if b.get("tests_selected") else "")
+                             + "</li>")
+            if v.get("new_smells"):
+                parts.append("<li>new smells on the compiled code: <span class='bad'>" + "; ".join(
+                    f"{html.escape(n['level'])} {html.escape(n['type'].replace('_', ' '))}: "
+                    f"{html.escape(', '.join(n['elements'][:5]))}" + (" …" if len(n["elements"]) > 5 else "")
+                    for n in v["new_smells"]) + "</span></li>")
+            api = v.get("api_breaks") or {}
+            if api.get("count"):
+                parts.append(f"<li>public API changed for code outside the repository: {api['count']} "
+                             f"({api.get('types', 0)} types, {api.get('members', 0)} members)</li>")
+            if "patch_applies" in v:
+                parts.append(f"<li>patch applies to a clean checkout: "
+                             f"<span class='{'ok' if v['patch_applies'] else 'bad'}'>"
+                             f"{'yes' if v['patch_applies'] else 'no'}</span></li>")
+            parts.append(f"<li><b>accepted fix: <span class='{'ok' if v.get('accepted') else 'bad'}'>"
+                         f"{'yes' if v.get('accepted') else 'no'}</span></b>"
+                         + (f" ({html.escape(v.get('why_not_accepted', ''))})" if v.get("why_not_accepted") else "")
+                         + "</li>")
             parts.append("</ul>")
             if v.get("dropped_operations"):
                 parts.append("<p>Dropped steps (they broke the build):</p>" + _table(pd.DataFrame(

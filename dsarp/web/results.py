@@ -119,7 +119,14 @@ def numbers(res: Path) -> dict:
                          "steps_kept": sum(int(v.get("kept") or 0) for v in vj),
                          "steps": sum(int(v.get("operations") or 0) for v in vj),
                          "equal_to_simulation": sum(1 for v in vj if v.get("prediction_matches")),
-                         "next_best_used": sum(1 for v in vj if v.get("fallback_from"))}
+                         "next_best_used": sum(1 for v in vj if v.get("fallback_from")),
+                         "accepted": sum(1 for v in vj if v.get("accepted")),
+                         "built": sum(1 for v in vj if (v.get("build") or {}).get("status") not in (None, "not built")),
+                         "build_or_tests_fail": sum(1 for v in vj if (v.get("build") or {}).get("status") in
+                                                    ("breaks the build", "breaks tests", "tests did not finish")),
+                         "new_smells": sum(1 for v in vj if v.get("new_smells_count")),
+                         "over_api_limit": sum(1 for v in vj if "public types and members" in
+                                               (v.get("why_not_accepted") or ""))}
     comb = _json(res / "combined" / "combined.json") or {}
     if comb.get("whole_repository"):
         out["combined"] = {"plans_applied": len(comb.get("plans_applied", [])), "operations": comb.get("operations"),

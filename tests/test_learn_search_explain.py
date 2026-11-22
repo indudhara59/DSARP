@@ -155,7 +155,7 @@ def test_search_uses_and_validates_llm_suggestions(project):
 
 
 def test_planner_with_search_and_explanation(project):
-    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=10,
+    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=10, max_api_breaks=None,
                       search="always", search_time=10, log=lambda *_: None)
     result = planner.run(2)
     g = result["groups"][0]
@@ -171,7 +171,7 @@ def test_planner_with_search_and_explanation(project):
 
 
 def test_explanation_summary_is_reviewed(project):
-    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=10,
+    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=10, max_api_breaks=None,
                       search="never", log=lambda *_: None)
     result = planner.run(1)
     bad = explain(result, planner.rf, Scripted(["Move com.acme.nowhere.Phantom to fix it."]))

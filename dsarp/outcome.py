@@ -5,8 +5,9 @@ from __future__ import annotations
 DESIGN = ("design change", "no dependency on the cycle can be removed", "Arcan's rule", "cannot verify",
           "have no related package")
 NOT_A_SMELL = ("at this commit", "in the production code", "the detector also counted")
-ORDER = ("removed", "reduced", "no effect", "not applicable", "planned (not verified)", "no safe plan",
-         "needs a design change", "not a smell at this commit")
+ORDER = ("removed", "reduced", "makes it worse", "breaks the build", "breaks tests", "tests did not finish",
+         "no effect", "not applicable", "planned (not verified)", "no safe plan", "needs a design change",
+         "not a smell at this commit")
 
 
 def quality(r: dict) -> tuple:
@@ -14,7 +15,9 @@ def quality(r: dict) -> tuple:
     tb, ta = r.get("target_before") or {}, r.get("target_after") or {}
     improved = any(isinstance(v, (int, float)) and isinstance(ta.get(k), (int, float)) and ta[k] < v
                    for k, v in tb.items() if k != "present")
-    return (r.get("kept", 0) > 0 and bool(r.get("compiles")), bool(r.get("target_removed")), improved,
+    failed = r.get("status") in ("breaks the build", "breaks tests", "tests did not finish", "made_worse")
+    return (bool(r.get("accepted")), not failed, r.get("kept", 0) > 0 and bool(r.get("compiles")),
+            bool(r.get("target_removed")), improved,
             bool(r.get("prediction_matches")), r.get("kept", 0) / max(1, r.get("operations", 1)),
             r.get("score") or 0)
 
@@ -24,7 +27,13 @@ def verified_status(v: dict) -> str:
     if st is None:
         st = ("not_applicable" if not v.get("kept") else "removed" if v.get("target_removed") else
               "reduced" if quality(v)[2] else "no_effect")
-    return {"not_applicable": "not applicable", "no_effect": "no effect"}.get(st, st)
+    return {"not_applicable": "not applicable", "no_effect": "no effect", "made_worse": "makes it worse"}.get(st, st)
+
+
+def accepted(v: dict | None) -> bool:
+    """A verified plan that removed or reduced the smell, built and passed its tests, created no new smell, applies
+    as a patch and stays within the public-API limit."""
+    return bool(v and v.get("accepted"))
 
 
 def reason(g: dict) -> str:
