@@ -155,3 +155,40 @@ def test_moves_respect_exported_packages(project):
     assert not rf.is_exported("com.acme.core.internal") and rf.is_exported("com.acme.core")
     assert not rf.visible_after_move("com.acme.core.Engine", "com.acme.core.internal")
     assert rf.visible_after_move("com.acme.core.Engine", "com.acme.util")
+
+
+def test_package_cycles_get_a_merge_candidate(project):
+    planner = Planner(project / "model", project / "triage", backend="highs", time_limit=20, max_api_breaks=None,
+                      log=lambda *_: None)
+    row = next(r for _, r in planner.groups.iterrows() if r["type"] == "cyclic_dependency")
+    out = planner.plan_group(row)
+    merges = [x for x in out["plans"] if x["name"].startswith("merge_")]
+    assert merges, [x["name"] for x in out["plans"]]
+    m = merges[0]
+    assert m["operations"] and all(o["op"] == "move_class" for o in m["operations"])
+    assert len({o["to_package"] for o in m["operations"]}) == 1          # the whole package goes to one place
+    assert "simulation" in m and "score" in m                           # evaluated like every other plan
+
+
+def test_sensitivity_of_weights_and_thresholds(project, tmp_path):
+    import shutil as sh
+    from dsarp.evaluate import sensitivity as sens
+    from dsarp.plan.run import WEIGHTS
+    res = tmp_path / "res"
+    sh.copytree(project / "model", res / "model")
+    sh.copytree(project / "triage", res / "triage")
+    planner = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None,
+                      log=lambda *_: None)
+    write(planner.run(5), res / "plans")
+    pj = json.loads((res / "plans" / "plans.json").read_text())
+    g = pj["groups"][0]
+    assert sens.recommend(g["plans"], WEIGHTS) == g["recommended"]       # re-ranking reproduces the planner
+    s = sens.run(res, replan_groups=1, time_limit=10, log=lambda *_: None)
+    assert s["groups_with_plans"] == 1 and len(s["weights"]) == len(sens.WEIGHT_KEYS) * len(sens.FACTORS)
+    w = pd.read_csv(res / "evaluation" / "sensitivity_weights.csv")
+    assert set(w["weight"]) == set(sens.WEIGHT_KEYS) and (w["groups"] == 1).all()
+    t = pd.read_csv(res / "evaluation" / "sensitivity_thresholds_summary.csv")
+    assert {"MIN_FIT", "FIT_RATIO"} <= set(t["parameter"])
+    assert "Score weights" in (res / "evaluation" / "sensitivity.md").read_text()
+    from dsarp.plan import facts
+    assert facts.MIN_FIT == 0.05                                           # constants restored afterwards

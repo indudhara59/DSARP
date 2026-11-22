@@ -379,6 +379,18 @@ def _cmd_llm_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_sensitivity(args: argparse.Namespace) -> int:
+    from .evaluate.sensitivity import run
+    for d in map(Path, args.results):
+        print(f"{d.name}:")
+        s = run(d, replan_groups=args.replan, time_limit=args.time_limit)
+        worst = sorted(s["weights"].items(), key=lambda kv: kv[1])[:3]
+        print(f"  {s['groups_with_plans']} groups; least stable weight settings: "
+              + ", ".join(f"{k} {v:.0%}" for k, v in worst))
+        print(f"  written: {d / 'evaluation' / 'sensitivity.md'}")
+    return 0
+
+
 def _cmd_prepare_build(args: argparse.Namespace) -> int:
     import json
 
@@ -403,7 +415,19 @@ def _cmd_prepare_build(args: argparse.Namespace) -> int:
 def _cmd_verify(args: argparse.Namespace) -> int:
     import json
 
-    from .verify.run import Verifier
+    from .verify.run import Verifier, merge_shards
+    if args.merge:
+        for d in map(Path, args.results):
+            out = merge_shards(d)
+            print(f"{d.name}: {len(out)} verified groups merged into {d / 'verify' / 'verification.json'}")
+        return 0
+    shard = None
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        if not 0 <= i < n:
+            print("ERROR --shard: use i/n with 0 <= i < n", file=sys.stderr)
+            return 1
+        shard = (i, n)
     for d in map(Path, args.results):
         if not (d / "plans" / "plans.json").exists():
             print(f"ERROR {d}: no plans (run dsarp plan)", file=sys.stderr)
@@ -418,6 +442,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         v = Verifier(d, repo, memory=args.memory, classpath=args.classpath, build_tool=args.build,
                      max_api_breaks=(-1 if args.max_api_breaks is None else
                                      None if args.max_api_breaks < 0 else args.max_api_breaks),
+                     allow_untested=args.allow_untested, shard=shard,
                      run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
         v.run(args.groups, set(args.group) if args.group else None)
         print(f"  written: {d / 'verify'}")
@@ -454,7 +479,8 @@ def _cmd_combine(args: argparse.Namespace) -> int:
         repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
         print(f"\n{d.name}:")
         v = Verifier(d, repo, memory=args.memory, classpath=args.classpath)
-        r = Combiner(v).run(args.max_compiles, _detector_cmds(args), args.build)
+        r = Combiner(v, only_accepted=not args.include_unaccepted).run(args.max_compiles, _detector_cmds(args),
+                                                                        args.build)
         if "whole_repository" in r:
             b, a = r["whole_repository"]["before"], r["whole_repository"]["after"]
             print(f"  {len(r['plans_applied'])} plans applied together ({r['operations']} operations), compiles: "
@@ -553,7 +579,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                           affinity=affinity, search=args.search, search_time=args.search_time, llm=llm,
                           api_policy=args.api_policy,
                           max_api_breaks=(-1 if args.max_api_breaks is None else
-                                          None if args.max_api_breaks < 0 else args.max_api_breaks))
+                                          None if args.max_api_breaks < 0 else args.max_api_breaks),
+                          compat=args.compat)
         if affinity:
             print(f"  learned affinity: {affinity}")
         types = set(args.types.split(",")) if args.types else None
@@ -640,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--max-api-breaks", type=int, help="public types and members a recommended plan may change for "
                     "users of the library (default: 10 with strict, 30 with balanced, no limit with off; "
                     "a negative number: no limit)")
+    pl.add_argument("--compat", default="stubs", choices=["stubs", "none"],
+                    help="stubs (default): moved public classes keep a deprecated stub at the old place (delivered as "
+                         "compat.patch), so they do not count as API breaks; none: every move counts")
     pl.add_argument("--explain", action="store_true", help="also write plans/report.md")
     pl.set_defaults(func=_cmd_plan)
 
@@ -713,6 +743,8 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--max-compiles", type=int, default=12, help="compiler runs for dropping plans that break the build")
     co.add_argument("--memory", default="4g")
     co.add_argument("--classpath", default="")
+    co.add_argument("--include-unaccepted", action="store_true", help="also combine verified plans that are not "
+                    "accepted fixes (e.g. not built); default: accepted fixes only")
     co.add_argument("--build", default="auto", choices=["none", "auto", "maven", "gradle"],
                     help="build the affected modules with the project's build and run the tests that use a changed "
                          "class (default: auto; none = compiler check only)")
@@ -722,6 +754,14 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--arcan-cmd", help="command to run Arcan ({repo}, {out})")
     co.add_argument("--designite-cmd", help="command to run Designite ({repo}, {out})")
     co.set_defaults(func=_cmd_combine)
+
+    se = sub.add_parser("sensitivity", help="evaluation: how much the recommendations depend on the score weights "
+                        "(all groups) and the thresholds (a sample of groups planned again)")
+    se.add_argument("results", nargs="+")
+    se.add_argument("--replan", type=int, default=0, help="groups to plan again for the thresholds (default 0: "
+                    "weights only)")
+    se.add_argument("--time-limit", type=float, default=30.0, help="solver seconds per group when planning again")
+    se.set_defaults(func=_cmd_sensitivity)
 
     pb = sub.add_parser("prepare-build", help="download the build's dependencies once (online, on a login node) so "
                         "that verify and combine can build and test offline on compute nodes")
@@ -741,6 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="build the affected modules with the project's build (offline) and run the tests that use "
                          "a changed class, before and after the plan (default: auto; none = compiler check only, "
                          "no plan is then an accepted fix)")
+    ve.add_argument("--shard", help="i/n: verify only every n-th group starting at i (parallel Slurm jobs); "
+                    "then run dsarp verify --merge")
+    ve.add_argument("--merge", action="store_true", help="merge the results of all shards into verification.json")
+    ve.add_argument("--allow-untested", action="store_true", help="accept fixes that build but that no test runs "
+                    "(default: a fix needs at least one test of the changed code or its module)")
     ve.add_argument("--max-api-breaks", type=int, help="public types and members an accepted fix may change "
                     "(default: the limit the plans were made with; negative = no limit)")
     ve.add_argument("--no-tests", action="store_true", help="with --build: compile only")

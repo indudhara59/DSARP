@@ -509,6 +509,48 @@ local repository; the home folder is too small). When the original code does
 not build offline, the plans are reported as *not built* and none is an
 accepted fix.
 
+**Compatibility stubs** (`dsarp plan --compat stubs`, the default). Moving a
+public class renames it for every user of the library. For each moved public
+class or interface that can be subclassed, the verification writes a
+deprecated stub at the old place (`@Deprecated public class Old extends
+new.Old` with forwarding constructors, or an interface that extends the new
+one), compiles it with the plan and keeps it only if it compiles; the stubs
+are delivered separately as `compat.patch`, to be removed one release later.
+Existing code that creates, extends, implements or calls static members
+through the old name keeps compiling; code that assigns an object typed as the
+new class to a variable of the old type does not. Final classes, enums,
+records, annotations and classes without a callable constructor cannot be
+stubbed and still count as API changes. The stubs add a dependency from the
+old package to the new one, so the smell is measured again with them in place
+(`target_removed_with_stubs`): a cycle fixed by a move usually stays until the
+stubs are removed. On two Struts groups, the public API changed dropped from
+319 to 1 and from 8 to 1 elements with stubs.
+
+**Test selection.** The tests that depend on a changed class directly or
+through up to two other classes; when a changed class is named in
+configuration files (XML, services, properties), also every test of its build
+module, since such behaviour is reached through configuration; when no test
+depends on the changed classes, every test of the affected modules. A plan
+that builds but that no test runs is not an accepted fix (`--allow-untested`
+accepts it; the reason is reported).
+
+**Resources and bundles.** Besides Java code (fully qualified names in code,
+strings and Javadoc) and the wiring files of the program model, the rewriter
+updates class names in other text resources (properties, YAML, JSON,
+templates, Gradle and Groovy files; not documentation), and adds a new package next to the
+old one in OSGi `Export-Package` lists (pom.xml, `.bnd`, `MANIFEST.MF`) that
+name the old package explicitly.
+
+**Confirmation by the detectors.** With detector commands in the
+configuration (web interface: *run the configured detectors*, on by default),
+Arcan and Designite run on every accepted fix; the report shows whether they
+still report the smell (`confirmed_by`, `still_reported_by`).
+
+**Parallel verification.** Building and testing every plan takes hours on a
+large repository. `--shard i/n` verifies every n-th group, so n Slurm jobs
+share the work (`slurm/verify_shards.sbatch`); `dsarp verify --merge`
+collects the results.
+
 Patches contain the files' own line endings. A few repositories store some
 files with Windows line endings (Struts: 58 Java files, with `* text=auto`
 in `.gitattributes`); patches touching them apply to a git checkout of the
@@ -518,6 +560,7 @@ commit, but not to a copy whose files were converted to Unix line endings (use
 | File in `verify/<group>/` | Content |
 |---|---|
 | `plan.patch` | the change as a git patch (apply with `git apply`) |
+| `compat.patch` | deprecated stubs for moved public classes (apply after `plan.patch`; optional) |
 | `rewrite.yml` | OpenRewrite recipe for the moves (`org.openrewrite.java.ChangeType`) |
 | `operations.json` | steps kept and dropped |
 | `new_errors.csv`, `new_errors_full_plan.csv` | compiler errors caused by the plan |
@@ -556,8 +599,11 @@ dsarp combine results/tika --workdir work                      # non-conflicting
 dsarp combine results/tika --workdir work --build auto --config configs/tika.yaml   # + tests, + real detectors
 ```
 
-The verified plans of all groups whose smell was removed or reduced are
-combined: a plan is left out if it changes a class another selected plan
+The **accepted fixes** of all groups are combined (`--include-unaccepted`:
+every plan that removed or reduced its smell). The set is chosen **exactly**:
+the solver picks the most valuable set of plans (2 per removed smell, 1 per
+reduced one) without conflicts or pairwise interference, then the chosen
+plans are checked again as a whole: a plan is left out if it changes a class another selected plan
 changes, or if the whole-repository simulation shows that it weakens another
 plan or creates new smells together with them. The selection is applied to
 one copy of the code and compiled (plans that break the build together are
@@ -615,6 +661,24 @@ in a separate file so raters are not influenced. `rating agreement` reports
 the share of sensible steps per rater and smell type, Cohen's (two raters) or
 Fleiss' kappa (more), the majority verdict, and each rater's agreement with
 the language-model review.
+
+### 7e. Sensitivity of the recommendations
+
+```bash
+dsarp sensitivity results/tika                 # score weights: all groups ranked again (seconds)
+dsarp sensitivity results/tika --replan 20     # + thresholds: 20 sampled groups planned again
+```
+
+The weights of the score (new smells 0.25, other smells removed 0.05, change
+cost 0.30, widened members 0.01, public API 0.20) and the thresholds (fit rule
+`MIN_FIT` 0.05 and `FIT_RATIO` 0.3, new-package cost 3, largest package to
+merge 8, core API 20 users) were set by hand. Every plan stores the parts of
+its score, so the plans of all groups are ranked again with each weight set to
+0, halved and doubled; for the thresholds, a sample of groups (spread over the
+smell types) is planned again with each value changed. `evaluation/sensitivity.md`
+lists how many recommendations stay the same, change, appear or disappear,
+and how similar the operations stay. On the first Struts groups, the new-smell
+weight matters most: without it, 4 of 6 recommendations change.
 
 ### 8. Report and evaluation
 
@@ -789,6 +853,54 @@ Detector output of the study repositories is not stored in this repository.
 7. **Web interface**: run stages locally, in the container or as Slurm jobs, live flowchart and logs, results dashboard and group pages. Done.
 8. **All smell types**: god components and feature concentration (package splits), scattered functionality (gathering a concern), class cycles and hub-like classes (static member moves, interfaces, imports, dead code). Done.
 9. **Accuracy**: rules calibrated against Designite, public API kept in place, fit rule, move instance method, combined plan, detectors at the commit and on the result, history and expert-rating evaluation, design advice. Done.
+
+10. **Acceptance and robustness** (0.12-0.13): accepted fixes only after the project's build and tests,
+    new smells on the compiled code, public API counted and limited, patches checked; compatibility stubs,
+    test selection through configuration and modules, resources and OSGi exports, merging packages,
+    sensitivity analysis, detector confirmation of accepted fixes, exact combined plan, sharded verification.
+
+## Limitations and threats to validity
+
+What DSARP cannot do, and what the results do not show; each point names the
+mitigation and how to measure it.
+
+1. **Evidence.** The acceptance rules (version 0.12) were tested on fixtures
+   and single Struts groups, not yet on whole repositories with the projects'
+   builds. Until then, earlier numbers (compiler check only) are not accepted
+   fixes. *Measure:* accepted fixes per repository after Prepare build and
+   Verify.
+2. **Public API.** Fixing structure in a library usually renames public types.
+   Stubs keep old code compiling for one release, but the change still
+   reaches users when the stubs are removed, and while they exist a moved
+   class's cycle usually remains (`target_removed_with_stubs`). *Measure:* API
+   changes with and without stubs per plan.
+3. **Operations.** DSARP moves classes and members, extracts interfaces,
+   splits, gathers and merges packages, and deletes unused deprecated members.
+   It does not split a class's responsibilities, introduce facades or
+   mediators, or change build modules; those groups get a reason and, if
+   wanted, unverified design advice. *Measure:* share of groups with
+   "needs a design change" or "no safe plan".
+4. **Behaviour.** Passing tests show only what the tests check. Coverage is
+   not measured; the selection follows code and configuration references, so
+   behaviour reached through reflection or generated code may be missed.
+   *Mitigation:* module tests as a fallback, untested changes are not
+   accepted.
+5. **Rewriting.** Class names built at run time (string concatenation,
+   reflection on computed names) and generated code are not rewritten; the
+   build and tests catch some of these, not all.
+6. **Hand-set weights and thresholds**, calibrated on Tika and Struts.
+   *Measure:* `dsarp sensitivity` on a third system (Karaf, Cassandra).
+7. **Smells are metrics.** Removing a smell is not proof of a better design;
+   developers may keep a cycle or a large package on purpose. *Measure:*
+   expert rating (kappa) and the later history; both are small samples.
+8. **Detectors.** Results depend on how the detectors were run (tests, build
+   copies, other code versions): DSARP's own detection approximates Arcan and
+   Designite; only re-running them on the changed code (accepted fixes)
+   confirms a fix the way they see it. Arcan needs its jar and licence.
+9. **Scope and cost.** Java only, Maven or Gradle; repositories that do not
+   build offline on the cluster yield no accepted fixes; verification with
+   builds takes hours (use shards); the language-model stages need GPU time
+   or a hosted API.
 
 Known limitations: the compile check compiles the whole repository at once,
 so it does not see build-module boundaries (use `--build`); history moves are

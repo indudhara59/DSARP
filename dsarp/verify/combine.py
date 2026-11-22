@@ -68,8 +68,10 @@ def packages_of(rf, ops: list[dict]) -> set[str]:
 
 
 class Combiner:
-    def __init__(self, verifier: Verifier, log=print):
-        self.v, self.log = verifier, log
+    def __init__(self, verifier: Verifier, log=print, only_accepted: bool = True):
+        """``only_accepted``: combine only accepted fixes (default); otherwise every plan that removed or
+        reduced its smell on the compiled code (for comparison, or when nothing could be built)."""
+        self.v, self.log, self.only_accepted = verifier, log, only_accepted
         self.rf, self.sim = verifier.rf, verifier.sim
         r = verifier.results
         self.plans = json.loads((r / "plans" / "plans.json").read_text())
@@ -81,6 +83,8 @@ class Combiner:
         for g in self.plans["groups"]:
             v = self.verified.get(g["group_id"])
             if not v or verified_status(v) not in ("removed", "reduced"):
+                continue
+            if self.only_accepted and "accepted" in v and not v["accepted"]:   # only accepted fixes
                 continue
             ops_file = self.v.results / "verify" / g["group_id"] / "operations.json"
             if not ops_file.exists():
@@ -124,11 +128,65 @@ class Combiner:
         cache[key] = out
         return out
 
+    def _exact_order(self, cands: list) -> tuple[list, list[dict], list[dict]]:
+        """The largest-value set of plans without conflicts (shared classes) or pairwise interference (one plan
+        lowers the other's effect, or the two create new smells together), chosen exactly with the solver;
+        weight 2 for a removed smell, 1 for a reduced one, plus the plan's score as a tie-breaker. Returns the
+        chosen candidates (best first) and the pairs that excluded the others."""
+        from ..plan import solver as slv
+        n = len(cands)
+        alone = [self._effect(g, ops)[0] for g, ops, _ in cands]
+        news = [self.new_smells(ops) for _, ops, _ in cands]
+        pk = [packages_of(self.rf, ops) | set(g.get("core", [])) for g, ops, _ in cands]
+        bad: dict[tuple[int, int], dict] = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                gi, oi, _ = cands[i]
+                gj, oj, _ = cands[j]
+                clash = touched(oi) & touched(oj)
+                if clash:
+                    bad[(i, j)] = {"kind": "conflict", "classes": sorted(clash)[:5]}
+                    continue
+                if not (pk[i] & pk[j]):
+                    continue
+                both = oi + oj
+                if self._effect(gi, both)[0] + 1e-9 < alone[i] or self._effect(gj, both)[0] + 1e-9 < alone[j]:
+                    bad[(i, j)] = {"kind": "interfering", "reason": "together, one plan lowers the other's effect"}
+                elif self.new_smells(both) - news[i] - news[j]:
+                    bad[(i, j)] = {"kind": "interfering", "reason": "together they create new smells"}
+        weight = [(2.0 if verified_status(v) == "removed" else 1.0) + 0.01 * max(v.get("score") or 0, 0)
+                  for _, _, v in cands]
+        m = slv.LinearModel()
+        x = [m.binary(f"x{i}") for i in range(n)]
+        for (i, j) in bad:
+            m.add({x[i]: 1, x[j]: 1}, ub=1)
+        m.minimize({x[i]: -weight[i] for i in range(n)})
+        sol = slv.solve(m, time_limit=60.0)
+        pick = {i for i in range(n) if sol.ok and sol.value(x[i]) > 0.5} if n else set()
+        if n and not sol.ok:
+            pick = set(range(n))                     # fall back to the greedy checks below
+        chosen = sorted(pick, key=lambda i: -weight[i])
+        conflicts, interfering = [], []
+        for i in range(n):
+            if i in pick:
+                continue
+            why = [(a if b == i else b, info) for (a, b), info in bad.items() if i in (a, b) and (a if b == i else b) in pick]
+            if not why:
+                continue
+            other, info = why[0]
+            gid = cands[i][0]["group_id"]
+            if info["kind"] == "conflict":
+                conflicts.append({"group_id": gid, "classes": info["classes"], "with": [cands[other][0]["group_id"]]})
+            else:
+                interfering.append({"group_id": gid, "reason": f"{info['reason']} ({cands[other][0]['group_id']})"})
+        return [cands[i] for i in chosen], conflicts, interfering
+
     def select(self) -> dict:
         chosen, combined, conflicts, interfering = [], [], [], []
         own: dict[str, float] = {}
         t0 = time.time()
-        for g, ops, v in self.candidates():
+        ordered, conflicts, interfering = self._exact_order(self.candidates())
+        for g, ops, v in ordered:                     # the solver's choice, checked again as a whole
             gid = g["group_id"]
             clash = touched(ops) & touched(combined)
             if clash:

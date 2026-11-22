@@ -107,6 +107,8 @@ STAGES: tuple[Stage, ...] = (
                           "public API that must not move", ("balanced", "strict", "off")),
                    Option("max_api_breaks", "--max-api-breaks", "int", None, "public types and members a plan may "
                           "change (empty = 10 strict, 30 balanced, no limit off; -1 = no limit)"),
+                   Option("compat", "--compat", "choice", "stubs", "deprecated stubs keep moved public classes "
+                          "compiling for users (compat.patch)", ("stubs", "none")),
                    Option("explain", "--explain", "bool", True, "also write plans/report.md"),
                    Option("llm", "--llm", "choice", "none", "language model for suggestions", ("none", "openai"))),
           resources=Resources(16, "32G", "12:00:00")),
@@ -134,6 +136,12 @@ STAGES: tuple[Stage, ...] = (
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
           resources=Resources(1, "4G", "00:30:00")),
+    Stage("sensitivity", "Sensitivity", "E2", "How much the recommendations depend on the score weights (all "
+          "groups) and on the thresholds (a sample of groups planned again)",
+          outputs=("evaluation/sensitivity.md",), requires=("plan",),
+          options=(Option("replan", "--replan", "int", 20, "groups to plan again for the thresholds (0 = weights "
+                          "only)", minimum=0),),
+          resources=Resources(8, "32G", "08:00:00")),
     Stage("prepare_build", "Prepare build", "8a", "Download the project's build dependencies once (runs on the "
           "login node, which has the internet), so that Verify and Combined plan can build and run tests offline",
           outputs=("verify/build_ready.json",), requires=("checkout",), network=True,
@@ -148,8 +156,8 @@ STAGES: tuple[Stage, ...] = (
                           ("none", "auto", "maven", "gradle")),
                    Option("max_compiles", "--max-compiles", "int", 30, "compiler runs for delta debugging", minimum=1),
                    Option("memory", "--memory", "text", "4g", "Java heap"),
-                   Option("detectors", "@config", "bool", False, "also run the configured detectors on every plan "
-                          "(slow; the combined plan runs them once)")),
+                   Option("detectors", "@config", "bool", True, "run the configured detectors (Arcan, Designite) "
+                          "on accepted fixes to confirm them")),
           resources=Resources(8, "32G", "12:00:00")),
     Stage("combine", "Combined plan", "8b", "Non-conflicting verified plans applied together, compiled once; "
           "smells of the whole repository before and after",
@@ -272,6 +280,7 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
         "advise": ["advise", res],
         "explain": ["explain", res],
         "prepare_build": ["prepare-build", res, "--workdir", work],
+        "sensitivity": ["sensitivity", res],
         "verify": ["verify", res, "--workdir", work],
         "combine": ["combine", res, "--workdir", work],
         "evaluate": ["evaluate", res],

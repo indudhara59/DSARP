@@ -113,15 +113,18 @@ def test_only_built_tested_harmless_plans_are_accepted_fixes():
 
 def test_public_api_breaks_are_counted_like_an_api_checker():
     model = SimpleNamespace(
-        types=pd.DataFrame({"type": ["com.a.Order", "com.a.Order.Line", "com.a.Util", "com.a.Client"],
-                            "top_level": ["com.a.Order", "com.a.Order", "com.a.Util", "com.a.Client"],
-                            "api": [True, True, False, True]}),
+        types=pd.DataFrame({"type": ["com.a.Order", "com.a.Order.Line", "com.a.Util", "com.a.Client", "com.a.Kind"],
+                            "top_level": ["com.a.Order", "com.a.Order", "com.a.Util", "com.a.Client", "com.a.Kind"],
+                            "api": [True, True, False, True, True], "kind": ["class", "class", "class", "class", "enum"],
+                            "final": [False, False, False, True, False]}),
         members=pd.DataFrame({"member": ["com.a.Order#total()", "com.a.Order#id", "com.a.Order#calc(int)",
                                          "com.a.Order.Line#qty()", "com.a.Util#help()",
                                          "com.a.Client#run(com.a.Order)", "com.a.Client#stop()"],
                               "owner": ["com.a.Order", "com.a.Order", "com.a.Order", "com.a.Order.Line", "com.a.Util",
                                         "com.a.Client", "com.a.Client"],
-                              "api": [True, True, False, True, False, True, True]}))
+                              "api": [True, True, False, True, False, True, True],
+                              "kind": ["method", "field", "method", "method", "method", "method", "method"],
+                              "visibility": ["public"] * 7}))
     idx = ApiIndex(model)
     # moving a public class: the class, its public nested class and their public members (5)
     assert idx.breaks([{"op": "move_class", "class": "com.a.Order", "to_package": "com.b"}])["count"] == 5
@@ -132,6 +135,11 @@ def test_public_api_breaks_are_counted_like_an_api_checker():
     assert idx.breaks([{"op": "extract_interface", "client": "com.a.Client", "provider": "com.a.Order",
                         "methods": []}])["count"] == 1
     assert idx.breaks([{"op": "remove_unused_import"}])["count"] == 0
+    # a deprecated stub at the old place covers a movable public class, not a final class or an enum
+    assert idx.stubbable("com.a.Order") and not idx.stubbable("com.a.Client") and not idx.stubbable("com.a.Kind")
+    st = idx.breaks([{"op": "move_class", "class": "com.a.Order"}, {"op": "move_class", "class": "com.a.Kind"}],
+                    compat="stubs")
+    assert (st["count"], st["covered_by_stubs"]) == (1, 1)
 
 
 def _comp(types, deps):
@@ -184,3 +192,49 @@ def test_planner_blocks_plans_over_the_api_limit():
                          "api_limit": "it changes 120 public types and members that code outside the repository "
                                       "may use (3 types, 117 members; limit 30)"}}]
     assert "120 public types and members" in why_rejected(plans)
+
+
+def test_untested_changes_are_not_accepted_fixes():
+    st, ok, why = final_status(_verified(build={"status": "builds", "reason": "no tests"},
+                                         test_scope="none"), 30)
+    assert (st, ok) == ("removed", False) and "no test runs the changed code" in why
+    assert final_status(_verified(build={"status": "builds"}), 30, allow_untested=True)[1]
+
+
+def test_tests_are_selected_by_use_configuration_or_module():
+    types = pd.DataFrame({
+        "type": ["a.Svc", "a.Helper", "a.Other", "a.SvcTest", "a.HelperUserTest", "a.OtherTest", "b.Lonely", "b.Thing"],
+        "top_level": ["a.Svc", "a.Helper", "a.Other", "a.SvcTest", "a.HelperUserTest", "a.OtherTest", "b.Lonely",
+                      "b.Thing"],
+        "is_test": [False, False, False, True, True, True, False, False],
+        "build_module": ["core"] * 6 + ["web", "web"],
+        "wiring_refs": [0, 0, 1, 0, 0, 0, 0, 0]})
+    deps = pd.DataFrame({"source_type": ["a.SvcTest", "a.Helper", "a.HelperUserTest", "a.OtherTest"],
+                         "target_type": ["a.Svc", "a.Svc", "a.Helper", "a.Other"]})
+    model = SimpleNamespace(types=types, deps=deps)
+    tests, scope = bld.select_tests_scoped(model, {"a.Svc"})
+    assert tests == ["a.HelperUserTest", "a.SvcTest"] and scope == "uses the changed classes"   # two hops
+    tests, scope = bld.select_tests_scoped(model, {"a.Other"})
+    assert set(tests) == {"a.SvcTest", "a.HelperUserTest", "a.OtherTest"} and "configuration" in scope
+    assert bld.select_tests_scoped(model, {"b.Lonely"}) == ([], "none")
+    types.loc[types["type"] == "a.OtherTest", "build_module"] = "web"
+    tests, scope = bld.select_tests_scoped(model, {"b.Lonely"})
+    assert tests == ["a.OtherTest"] and scope.startswith("whole module")
+
+
+def test_combined_plan_selection_is_exact():
+    from dsarp.verify import combine as cb
+    c = object.__new__(cb.Combiner)
+    c.rf = SimpleNamespace(package={"a.X": "a", "a.Y": "a", "b.Z": "b", "c.W": "c"})
+    c._effect = lambda g, ops: (1.0, None)
+    c.new_smells = lambda ops: set()
+    mv = lambda cls: {"op": "move_class", "class": cls, "from_package": cls.split(".")[0], "to_package": "z"}
+    v = lambda st, sc: {"status": st, "score": sc, "kept": 1, "compiles": True, "target_removed": st == "removed"}
+    # A conflicts with B and C (shared class a.X); B and C are independent: greedy by score takes A only,
+    # the exact choice takes B + C
+    cands = [({"group_id": "A", "core": []}, [mv("a.X"), mv("b.Z")], v("removed", 0.9)),
+             ({"group_id": "B", "core": []}, [mv("a.X")], v("removed", 0.5)),
+             ({"group_id": "C", "core": []}, [mv("b.Z"), mv("c.W")], v("removed", 0.4))]
+    chosen, conflicts, _ = c._exact_order(cands)
+    assert [g["group_id"] for g, _, _ in chosen] == ["B", "C"]
+    assert conflicts and conflicts[0]["group_id"] == "A"

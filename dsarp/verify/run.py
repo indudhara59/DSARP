@@ -18,6 +18,7 @@ For each group with a recommended plan:
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import time
@@ -47,18 +48,23 @@ class Verifier:
     def __init__(self, results: str | Path, repo: str | Path, workdir: str | Path | None = None,
                  memory: str = "4g", classpath: str = "", build_tool: str = "auto", run_tests: bool = True,
                  max_compiles: int = 30, detector_cmds: dict[str, str] | None = None, log=print,
-                 max_api_breaks: int | None = -1):
+                 max_api_breaks: int | None = -1, compat: str | None = None, allow_untested: bool = False,
+                 shard: tuple[int, int] | None = None):
         self.results, self.repo = Path(results), Path(repo)
         self.workdir = Path(workdir) if workdir else self.results / "verify" / "work"
         self.memory, self.classpath, self.log = memory, classpath, log
         self.build_tool, self.run_tests, self.max_compiles = build_tool, run_tests, max_compiles
         self._base_builds: dict[tuple, object] = {}      # builds of the original code, per modules and tests
+        pf = self.results / "plans" / "plans.json"
+        meta = json.loads(pf.read_text()) if pf.exists() else {}
         if max_api_breaks == -1:                          # the limit the plans were made with
             from ..plan.run import MAX_API_BREAKS
-            pf = self.results / "plans" / "plans.json"
-            meta = json.loads(pf.read_text()) if pf.exists() else {}
             max_api_breaks = meta.get("max_api_breaks", MAX_API_BREAKS.get(meta.get("api_policy", "balanced")))
         self.max_api_breaks = max_api_breaks
+        self.compat = meta.get("compat", "none") if compat is None else compat
+        self.allow_untested = allow_untested
+        self.shard = shard                                # (i, n): verify every n-th group starting at i
+        self.tag = f"-shard{shard[0]}of{shard[1]}" if shard else ""
         self.detector_cmds = detector_cmds or {}
         self.model = ProgramModel(self.results / "model")
         self.meta = json.loads((self.results / "model" / "model.json").read_text())
@@ -81,9 +87,10 @@ class Verifier:
         if self._baseline is None:
             t0 = time.time()
             # compile a clean copy at the analysed commit (the checkout itself may have local changes)
-            with Workspace(self.repo, self.workdir / "baseline", self.meta.get("commit")) as ws:
+            with Workspace(self.repo, self.workdir / f"baseline{self.tag}", self.meta.get("commit")) as ws:
                 self._baseline = cmp.compile_tree(ws.path, self.rw.java_files, self.roots,
-                                                  self.results / "verify" / "baseline", self.classpath, self.memory)
+                                                  self.results / "verify" / f"baseline{self.tag}", self.classpath,
+                                                  self.memory)
             self.log(f"baseline compile: {len(self._baseline.errors)} errors (missing libraries) "
                      f"in {time.time() - t0:.0f} s")
         return self._baseline
@@ -100,6 +107,48 @@ class Verifier:
                              self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
                              set(renamed.values()) | set(res.created_types), self.packages, ws.path)
         return new.empty, res, comp, new
+
+    def _compat(self, ws: Workspace, group: dict, res, kept_ops: list[dict], out: Path) -> dict:
+        """Deprecated stubs for moved public classes: written, compiled with the plan, kept when they compile;
+        the group's smell is measured again with them (they add dependencies from the old package)."""
+        stubs = self.rw.compat_stubs(ws.path, kept_ops, res)
+        info = {"stubs": [], "failed": [], "target_removed_with_stubs": None, "new_smells_with_stubs": None}
+        if not stubs:
+            return info
+        by_file = {f: c for c in [o["class"] for o in kept_ops if o.get("op") == "move_class"]
+                   for f in [self.rw.type_file.get(c)] if f in stubs}
+        ws.stage()
+        for f, text in stubs.items():
+            _write_stub(ws.path / f, text)
+        files = self.rw.files_after(res) + list(stubs)
+
+        def new_errs(comp):
+            renamed = _renamed(kept_ops)
+            return cmp.new_errors(self.baseline().errors, comp.errors, res.moved, renamed,
+                                  self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
+                                  set(renamed.values()) | set(res.created_types), self.packages, ws.path)
+
+        comp = cmp.compile_tree(ws.path, files, self.roots, out / "attempt_compat", self.classpath, self.memory)
+        new = new_errs(comp)
+        bad = set(new["file"]) & set(stubs)
+        if len(new) and set(new["file"]) - set(stubs):         # stubs broke other code: keep none
+            bad = set(stubs)
+        if bad:
+            for f in bad:
+                (ws.path / f).unlink(missing_ok=True)
+            files = [f for f in files if f not in bad]
+            comp = cmp.compile_tree(ws.path, files, self.roots, out / "attempt_compat", self.classpath, self.memory)
+        info["stubs"] = sorted(by_file[f] for f in stubs if f not in bad)
+        info["failed"] = sorted(by_file[f] for f in bad)
+        if info["stubs"]:
+            (out / "compat.patch").write_text(ws.diff_since_stage())
+            res_c = copy.copy(res)
+            res_c.created = list(res.created) + [f for f in stubs if f not in bad]
+            m = self.measure(group, res_c, comp, kept_ops)
+            info["target_removed_with_stubs"] = m["target_removed"]
+            info["target_after_with_stubs"] = m["target_after"]
+            info["new_smells_with_stubs"] = m["new_smells_count"]
+        return info
 
     def _production_after(self, res, ops) -> set[str]:
         prod = {res.moved.get(f, f) for f in self.prod_files}
@@ -157,16 +206,25 @@ class Verifier:
             rec["patch_lines"] = patch.count("\n")
             rec["files_changed"] = len(res.changed) + len(res.created)
             rec["notes"] = res.notes[:50]
-            rec["api_breaks"] = api_breaks(self.model, kept_ops) if kept_ops else {"count": 0}
+            stubbed: set[str] = set()
+            if kept_ops and self.compat == "stubs":
+                rec["compat"] = self._compat(ws, group, res, kept_ops, out)
+                stubbed = set(rec["compat"]["stubs"])
+            rec["api_breaks"] = (api_breaks(self.model, kept_ops, self.compat, stubbed) if kept_ops else {"count": 0})
+            rec["api_breaks_without_stubs"] = (api_breaks(self.model, kept_ops)["count"] if kept_ops else 0)
             ws.reset()
             if kept_ops:
                 rec["patch_applies"] = ws.apply_check(out / "plan.patch")
+                if (out / "compat.patch").exists() and rec["patch_applies"]:
+                    rec["compat_patch_applies"] = ws.apply(out / "plan.patch") and ws.apply_check(out / "compat.patch")
+                    ws.reset()
             # the project's own build and the tests that use a changed class, on the original code and after
             if kept_ops:
                 changed = {o.get("class") or o.get("owner") or o.get("from_class") or o.get("provider")
                            for o in kept_ops} - {None}
                 changed |= {interface_name(o) for o in kept_ops if o["op"] == "extract_interface"}
-                tests = bld.select_tests(self.model, changed) if self.run_tests else []
+                tests, scope = bld.select_tests_scoped(self.model, changed) if self.run_tests else ([], "not run")
+                rec["test_scope"] = scope
                 modules = sorted({self.file_module.get(f, "") for f in
                                   [self.rw.type_file.get(c, "") for c in changed]} - {""})
                 if self.build_tool == "none":
@@ -182,16 +240,18 @@ class Verifier:
                     after_b = bld.build(ws.path, modules, tests, self.build_tool)
                     rec["build"] = {"modules": modules, "tests_selected": len(tests),
                                     **bld.compare(self._base_builds[key], after_b)}
-            # detectors
-            for tool, command in self.detector_cmds.items():
-                if not kept_ops:
-                    continue
-                d = run_detector(tool, command, ws.path, out / f"{tool}-after", groups=[group])
-                rec.setdefault("detectors", {})[tool] = d
-                if d.get("ok") and d.get("groups", {}).get(gid) is False:
-                    rec.setdefault("confirmed_by", []).append(tool)
+            rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
+                                                                                   self.allow_untested)
+            # the real detectors confirm accepted fixes (running them on every plan would take too long)
+            if rec["accepted"] and self.detector_cmds:
+                for tool, command in self.detector_cmds.items():
+                    d = run_detector(tool, command, ws.path, out / f"{tool}-after", groups=[group])
+                    rec.setdefault("detectors", {})[tool] = d
+                    if d.get("ok") and d.get("groups", {}).get(gid) is False:
+                        rec.setdefault("confirmed_by", []).append(tool)
+                    elif d.get("ok") and d.get("groups", {}).get(gid) is True:
+                        rec.setdefault("still_reported_by", []).append(tool)
         rec["seconds"] = round(time.time() - t0, 1)
-        rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks)
         (out / "verification.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
 
@@ -265,7 +325,8 @@ class Verifier:
             for f in src.iterdir():
                 if f.is_file():
                     shutil.copy2(f, top / f.name)
-        rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks)
+        rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
+                                                                               self.allow_untested)
         (self.results / "verify" / g["group_id"] / "verification.json").write_text(
             json.dumps(rec, indent=1, default=str))
         return rec
@@ -275,8 +336,12 @@ class Verifier:
         self.baseline()
         out = []
         todo = [g for g in plans["groups"] if g.get("recommended") and (not only or g["group_id"] in only)]
-        for g in todo[:groups] if groups else todo:
+        todo = todo[:groups] if groups else todo
+        if self.shard:
+            todo = todo[self.shard[0]::self.shard[1]]
+        for g in todo:
             rec = self.verify_group(g)
+            (self.results / "verify" / g["group_id"] / "result.json").write_text(json.dumps(rec, indent=1, default=str))
             yn = {True: "yes", False: "no", None: "-"}
             self.log(f"{g['group_id']}: plan {rec['plan']}"
                      + (f" (fallback from {rec['fallback_from']})" if rec.get("fallback_from") else "")
@@ -287,6 +352,9 @@ class Verifier:
                      + f"; status {rec['status']}" + (" (accepted fix)" if rec.get("accepted") else "")
                      + f" [{rec['seconds']:.0f} s]")
             out.append(rec)
+        if self.shard:          # the shards are merged afterwards (dsarp verify --merge)
+            (self.results / "verify" / f"verification{self.tag}.json").write_text(json.dumps(out, indent=1, default=str))
+            return out
         # keep earlier results of groups that were not verified in this run
         prev_file = self.results / "verify" / "verification.json"
         if only and prev_file.exists():
@@ -299,12 +367,33 @@ class Verifier:
         return out
 
 
+def merge_shards(results: str | Path) -> list[dict]:
+    """Collect the results of every verified group (``verify/<group>/result.json``, written by every run and
+    shard) into ``verify/verification.json`` and ``verify/summary.csv``, in the order of the plans."""
+    results = Path(results)
+    plans = json.loads((results / "plans" / "plans.json").read_text())
+    out = []
+    for g in plans["groups"]:
+        f = results / "verify" / g["group_id"] / "result.json"
+        if g.get("recommended") and f.exists():
+            out.append(json.loads(f.read_text()))
+    pd.DataFrame([{k: v for k, v in r.items() if not isinstance(v, (dict, list))} for r in out]).to_csv(
+        results / "verify" / "summary.csv", index=False)
+    (results / "verify" / "verification.json").write_text(json.dumps(out, indent=1, default=str))
+    return out
+
+
 FALLBACK_PLANS = 2       # further plans verified when the recommended one does not fully work
 
 
 def _acceptable(p: dict) -> bool:
     return bool(p.get("operations")) and (p.get("checks") or {}).get("status") != "blocked" \
         and (p.get("benefit") or 0) > 0 and (p.get("score") or 0) > 0
+
+
+def _write_stub(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def _complete(r: dict) -> bool:
@@ -321,7 +410,7 @@ def _improved(r: dict) -> bool:
                for k, v in tb.items() if k != "present")
 
 
-def final_status(r: dict, max_api_breaks: int | None = None) -> tuple[str, bool, str]:
+def final_status(r: dict, max_api_breaks: int | None = None, allow_untested: bool = False) -> tuple[str, bool, str]:
     """(status, accepted, why not accepted) of a verified plan.
 
     Status: ``not_applicable`` (no step could be applied), a build failure (``breaks the build``,
@@ -345,6 +434,8 @@ def final_status(r: dict, max_api_breaks: int | None = None) -> tuple[str, bool,
     why = []
     if b.get("status") in (None, "not built"):
         why.append(b.get("reason") or "not built with the project's build")
+    elif b.get("status") == "builds" and not allow_untested:
+        why.append("no test runs the changed code (" + (r.get("test_scope") or b.get("reason") or "no tests") + ")")
     if r.get("patch_applies") is False:
         why.append("the patch does not apply to a clean checkout")
     api = (r.get("api_breaks") or {}).get("count", 0)

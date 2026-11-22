@@ -42,16 +42,35 @@ class BuildResult:
                 "log_tail": self.log_tail[-3000:]}
 
 
-def select_tests(model: ProgramModel, changed: set[str], hops: int = 1) -> list[str]:
+MAX_TESTS = 2000
+
+
+def select_tests(model: ProgramModel, changed: set[str], hops: int = 2) -> list[str]:
     """Test classes that depend on a changed class (directly or through ``hops`` other classes)."""
+    return select_tests_scoped(model, changed, hops)[0]
+
+
+def select_tests_scoped(model: ProgramModel, changed: set[str], hops: int = 2) -> tuple[list[str], str]:
+    """Tests to run for a change, and why they were chosen.
+
+    * ``uses the changed classes``: test classes that depend on a changed class, directly or through up to
+      ``hops`` other classes;
+    * plus, when a changed class is named in configuration (wiring) files, every test of its module, since
+      such behaviour is reached through configuration, not through code references;
+    * when no test depends on the changed classes: every test of the affected modules
+      (``whole module (no test uses the changed classes)``);
+    * ``none``: the affected modules have no tests at all."""
     t = model.types
+    flag = lambda col: dict(zip(t["type"], t[col].astype(str).str.lower().isin(["true", "1"])))
     top = dict(zip(t["type"], t["top_level"]))
-    is_test = dict(zip(t["type"], t["is_test"].astype(str).str.lower().isin(["true", "1"])))
+    is_test = flag("is_test")
+    module = dict(zip(t["type"], t["build_module"].fillna("").astype(str))) if "build_module" in t else {}
+    wired = dict(zip(t["type"], pd.to_numeric(t.get("wiring_refs", 0), errors="coerce").fillna(0)))
     d = model.deps
     pairs = pd.DataFrame({"s": d["source_type"].map(top), "t": d["target_type"].map(top)}).dropna().drop_duplicates()
     users: dict[str, set[str]] = {}
-    for s, tt in zip(pairs["s"], pairs["t"]):
-        users.setdefault(tt, set()).add(s)
+    for s_, tt in zip(pairs["s"], pairs["t"]):
+        users.setdefault(tt, set()).add(s_)
     frontier, seen = set(changed), set(changed)
     for _ in range(hops + 1):
         nxt = set()
@@ -60,7 +79,18 @@ def select_tests(model: ProgramModel, changed: set[str], hops: int = 1) -> list[
         nxt -= seen
         seen |= nxt
         frontier = nxt
-    return sorted(c for c in seen if is_test.get(c))
+    direct = {c for c in seen if is_test.get(c) and top.get(c, c) == c}
+    mods = {module.get(c, "") for c in changed}
+    module_tests = {c for c, m in module.items() if m in mods and is_test.get(c) and top.get(c) == c}
+    scope = "uses the changed classes"
+    if any(wired.get(c, 0) > 0 for c in changed):
+        direct |= module_tests
+        scope = "uses the changed classes + module tests (classes named in configuration)"
+    if not direct:
+        direct, scope = module_tests, "whole module (no test uses the changed classes)"
+    if not direct:
+        return [], "none"
+    return sorted(direct)[:MAX_TESTS], scope
 
 
 def detect_tool(repo: Path, tool: str = "auto") -> str | None:
@@ -247,6 +277,8 @@ def compare(base: BuildResult, after: BuildResult) -> dict:
         out.update(status="breaks tests", reason="the selected tests no longer run")
     elif after.error and not after.failing and after.tests:
         out.update(status="breaks tests", reason=after.error)
+    elif after.tests and after.tests_run == 0:
+        out.update(status="builds", reason="the selected tests did not run any test case")
     elif after.tests:
         out.update(status="builds and tests pass",
                    reason=f"{after.tests_run} tests ran" + (f"; {len(base.failing)} failed already before"

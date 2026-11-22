@@ -13,6 +13,12 @@ qualified name and signature. A plan breaks such a user when it
 Counting types and members (rather than classes) follows the way API
 compatibility checkers such as japicmp report changes, so the numbers can be
 compared with theirs. Adding an interface, a class or a member is not a break.
+
+With compatibility stubs (``compat="stubs"``), a moved public class or
+interface that a deprecated stub at the old place can stand in for is not
+counted: existing code keeps compiling for a deprecation period. Final
+classes, enums, records, annotations and classes without a constructor a
+subclass can call cannot be stubbed and still count.
 """
 
 from __future__ import annotations
@@ -39,11 +45,35 @@ class ApiIndex:
         for mem, owner, api in zip(m["member"], m["owner"], m["api"]):
             if _flag(api):
                 self.members_of[owner].append(mem)
+        self.kind = dict(zip(t["type"], t["kind"]))
+        self.final = dict(zip(t["type"], (_flag(x) for x in t["final"])))
+        self.top = dict(zip(t["type"], t["top_level"]))
+        self.ctors: dict[str, list[str]] = defaultdict(list)
+        c = m[m["kind"] == "constructor"]
+        for owner, vis in zip(c["owner"], c["visibility"]):
+            self.ctors[owner].append(str(vis))
 
-    def breaks(self, ops: list[dict]) -> dict:
-        types, members = set(), set()
+    def stubbable(self, cls: str) -> bool:
+        """A public top-level class or interface that a deprecated subtype at the old place can stand in for."""
+        if not self.type_api.get(cls) or self.top.get(cls) != cls or self.final.get(cls, True):
+            return False
+        if self.kind.get(cls) == "interface":
+            return True
+        if self.kind.get(cls) != "class":
+            return False
+        vis = self.ctors.get(cls, [])
+        return not vis or any(v in ("public", "protected") for v in vis)
+
+    def breaks(self, ops: list[dict], compat: str = "none", stubbed: set[str] | None = None) -> dict:
+        """API breaks of the operations. ``compat="stubs"``: moved types that can be stubbed do not count
+        (``stubbed``: the types actually stubbed, when known from the verification)."""
+        types, members, covered = set(), set(), set()
         for o in ops:
             k = o.get("op")
+            if k == "move_class" and compat == "stubs" and (
+                    o["class"] in stubbed if stubbed is not None else self.stubbable(o["class"])):
+                covered.add(o["class"])
+                continue
             if k == "move_class":
                 for ty in self.nested.get(o["class"], [o["class"]]):
                     if self.type_api.get(ty):
@@ -62,11 +92,10 @@ class ApiIndex:
                             if "(" in sig and prov and prov in sig.split("(", 1)[1]:
                                 members.add(mem)
         return {"count": len(types) + len(members), "types": len(types), "members": len(members),
-                "examples": sorted(types)[:3] + sorted(members)[:3]}
+                "covered_by_stubs": len(covered), "examples": sorted(types)[:3] + sorted(members)[:3]}
 
 
-def api_breaks(model, ops: list[dict]) -> dict:
-    """Public types and members whose name or signature the operations change (see the module docstring)."""
+def api_index(model) -> ApiIndex:
     idx = model.__dict__.get("_api_index")
     if idx is None:
         idx = ApiIndex(model)
@@ -74,4 +103,9 @@ def api_breaks(model, ops: list[dict]) -> dict:
             model.__dict__["_api_index"] = idx
         except (AttributeError, TypeError):
             pass
-    return idx.breaks(ops)
+    return idx
+
+
+def api_breaks(model, ops: list[dict], compat: str = "none", stubbed: set[str] | None = None) -> dict:
+    """Public types and members whose name or signature the operations change (see the module docstring)."""
+    return api_index(model).breaks(ops, compat, stubbed)
