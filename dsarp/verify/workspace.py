@@ -49,6 +49,12 @@ class Workspace:
         _git(self.path, "reset", "-q")
         return out
 
+    def apply_check(self, patch: str | Path) -> bool:
+        """Whether a patch applies to this (clean) working copy, as ``git apply`` on a checkout would."""
+        r = subprocess.run(["git", "-C", str(self.path), "apply", "--check", str(Path(patch).resolve())],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+
     def remove(self) -> None:
         if self.git:
             _git(self.repo, "worktree", "remove", "--force", str(self.path), check=False)

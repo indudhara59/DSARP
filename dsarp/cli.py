@@ -379,6 +379,27 @@ def _cmd_llm_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prepare_build(args: argparse.Namespace) -> int:
+    import json
+
+    from .verify import build as bld
+    status = 0
+    for d in map(Path, args.results):
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        print(f"{d.name}: downloading build dependencies for {repo} (this needs the internet) ...")
+        r = bld.prepare(repo, args.build)
+        print(f"  {r.tool}: {'ready, the verification can build offline' if r.ok else 'FAILED'} [{r.seconds:.0f} s]")
+        (d / "verify").mkdir(parents=True, exist_ok=True)
+        (d / "verify" / "build_ready.json").write_text(json.dumps(
+            {"tool": r.tool, "ok": r.ok, "repo": str(repo), "seconds": r.seconds, "log_tail": r.log_tail[-3000:]},
+            indent=1))
+        if not r.ok:
+            print(r.log_tail, file=sys.stderr)
+            status = 1
+    return status
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     import json
 
@@ -395,6 +416,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         cmds = _detector_cmds(args)
         print(f"\n{d.name}:")
         v = Verifier(d, repo, memory=args.memory, classpath=args.classpath, build_tool=args.build,
+                     max_api_breaks=(-1 if args.max_api_breaks is None else
+                                     None if args.max_api_breaks < 0 else args.max_api_breaks),
                      run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
         v.run(args.groups, set(args.group) if args.group else None)
         print(f"  written: {d / 'verify'}")
@@ -528,7 +551,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         llm = _llm(args.llm)
         planner = Planner(model, triage_dir, backend=args.backend, time_limit=args.time_limit,
                           affinity=affinity, search=args.search, search_time=args.search_time, llm=llm,
-                          api_policy=args.api_policy)
+                          api_policy=args.api_policy,
+                          max_api_breaks=(-1 if args.max_api_breaks is None else
+                                          None if args.max_api_breaks < 0 else args.max_api_breaks))
         if affinity:
             print(f"  learned affinity: {affinity}")
         types = set(args.types.split(",")) if args.types else None
@@ -612,6 +637,9 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--api-policy", default="balanced", choices=["balanced", "strict", "off"],
                     help="public API that plans must not move (balanced: widely used public classes; strict: also "
                          "all public classes used from other build modules; off: only protected_api)")
+    pl.add_argument("--max-api-breaks", type=int, help="public types and members a recommended plan may change for "
+                    "users of the library (default: 10 with strict, 30 with balanced, no limit with off; "
+                    "a negative number: no limit)")
     pl.add_argument("--explain", action="store_true", help="also write plans/report.md")
     pl.set_defaults(func=_cmd_plan)
 
@@ -685,8 +713,9 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--max-compiles", type=int, default=12, help="compiler runs for dropping plans that break the build")
     co.add_argument("--memory", default="4g")
     co.add_argument("--classpath", default="")
-    co.add_argument("--build", default="none", choices=["none", "auto", "maven", "gradle"],
-                    help="also build the affected modules and run the tests that use a changed class")
+    co.add_argument("--build", default="auto", choices=["none", "auto", "maven", "gradle"],
+                    help="build the affected modules with the project's build and run the tests that use a changed "
+                         "class (default: auto; none = compiler check only)")
     co.add_argument("--config", help="repository configuration (its detector 'command' entries are run on the "
                                      "original and the combined code)")
     co.add_argument("--data-root", default=None)
@@ -694,14 +723,26 @@ def build_parser() -> argparse.ArgumentParser:
     co.add_argument("--designite-cmd", help="command to run Designite ({repo}, {out})")
     co.set_defaults(func=_cmd_combine)
 
+    pb = sub.add_parser("prepare-build", help="download the build's dependencies once (online, on a login node) so "
+                        "that verify and combine can build and test offline on compute nodes")
+    pb.add_argument("results", nargs="+")
+    pb.add_argument("--workdir", default="work", help="folder with the checkouts")
+    pb.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
+    pb.add_argument("--build", default="auto", choices=["auto", "maven", "gradle"])
+    pb.set_defaults(func=_cmd_prepare_build)
+
     ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
     ve.add_argument("results", nargs="+")
     ve.add_argument("--workdir", default="work", help="folder with the checkouts")
     ve.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
     ve.add_argument("--groups", type=int, help="verify only the first N groups with a plan")
     ve.add_argument("--group", action="append", help="verify this group id (repeatable)")
-    ve.add_argument("--build", default="none", choices=["none", "auto", "maven", "gradle"],
-                    help="also build the affected modules and run the selected tests (offline)")
+    ve.add_argument("--build", default="auto", choices=["none", "auto", "maven", "gradle"],
+                    help="build the affected modules with the project's build (offline) and run the tests that use "
+                         "a changed class, before and after the plan (default: auto; none = compiler check only, "
+                         "no plan is then an accepted fix)")
+    ve.add_argument("--max-api-breaks", type=int, help="public types and members an accepted fix may change "
+                    "(default: the limit the plans were made with; negative = no limit)")
     ve.add_argument("--no-tests", action="store_true", help="with --build: compile only")
     ve.add_argument("--max-compiles", type=int, default=30, help="compiler runs for delta debugging per plan")
     ve.add_argument("--memory", default="4g")

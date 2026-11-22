@@ -105,6 +105,8 @@ STAGES: tuple[Stage, ...] = (
                    Option("types", "--types", "text", "", "only these smell types (comma-separated)"),
                    Option("api_policy", "--api-policy", "choice", "balanced",
                           "public API that must not move", ("balanced", "strict", "off")),
+                   Option("max_api_breaks", "--max-api-breaks", "int", None, "public types and members a plan may "
+                          "change (empty = 10 strict, 30 balanced, no limit off; -1 = no limit)"),
                    Option("explain", "--explain", "bool", True, "also write plans/report.md"),
                    Option("llm", "--llm", "choice", "none", "language model for suggestions", ("none", "openai"))),
           resources=Resources(16, "32G", "12:00:00")),
@@ -132,11 +134,17 @@ STAGES: tuple[Stage, ...] = (
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
           resources=Resources(1, "4G", "00:30:00")),
-    Stage("verify", "Verify", "8", "Apply plans to the code, compile, delta-debug, re-detect, write patches",
+    Stage("prepare_build", "Prepare build", "8a", "Download the project's build dependencies once (runs on the "
+          "login node, which has the internet), so that Verify and Combined plan can build and run tests offline",
+          outputs=("verify/build_ready.json",), requires=("checkout",), network=True,
+          resources=Resources(4, "16G", "02:00:00")),
+    Stage("verify", "Verify", "8", "Apply plans to the code, compile, delta-debug, build and run the tests before "
+          "and after, re-detect, check new smells and broken public API, write patches",
           outputs=("verify/verification.json", "verify/summary.csv"), requires=("plan", "checkout"),
           optional_requires=("review",),
           options=(Option("groups", "--groups", "int", None, "only the first N groups (empty = all)", minimum=1),
-                   Option("build", "--build", "choice", "none", "also build and run selected tests",
+                   Option("build", "--build", "choice", "auto", "build with the project's build and run the tests "
+                          "that use a changed class (none = compiler check only: no accepted fixes)",
                           ("none", "auto", "maven", "gradle")),
                    Option("max_compiles", "--max-compiles", "int", 30, "compiler runs for delta debugging", minimum=1),
                    Option("memory", "--memory", "text", "4g", "Java heap"),
@@ -263,6 +271,7 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
         "review": ["review", res],
         "advise": ["advise", res],
         "explain": ["explain", res],
+        "prepare_build": ["prepare-build", res, "--workdir", work],
         "verify": ["verify", res, "--workdir", work],
         "combine": ["combine", res, "--workdir", work],
         "evaluate": ["evaluate", res],

@@ -238,8 +238,9 @@ class Combiner:
                 after_b = bld.build(ws.path, modules, tests, build_tool)
                 ws.reset()
                 base_b = bld.build(ws.path, modules, tests, build_tool)
-                result["build"] = {"tool": after_b.tool, "modules": modules, "tests_selected": len(tests),
-                                   "baseline_ok": base_b.ok, "ok": after_b.ok, "log_tail": after_b.log_tail[-3000:]}
+                cmpb = bld.compare(base_b, after_b)
+                result["build"] = {"modules": modules, "tests_selected": len(tests), **cmpb}
+                self.log(f"build: {cmpb['status']} ({cmpb.get('reason', '')})")
                 self.v.rw.apply(ws.path, all_ops, checks_of(kept))
             patch = ws.diff()
             (out_dir / "plan.patch").write_text(patch)

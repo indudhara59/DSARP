@@ -90,7 +90,7 @@ def shop(tmp_path_factory):
 
 
 def _plan(res, kind):
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     row = next(r for _, r in p.groups.iterrows() if kind_of(r["type"], r["level"]) == kind)
     return p, row, p.plan_group(row)
 
@@ -212,7 +212,7 @@ def test_review_replaces_rejected_plan_and_caches(shop, tmp_path):
     from dsarp.review import review_plans
     from dsarp.search.llm import Scripted
     _, res = shop
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     out = p.run(50)
     (res / "plans").mkdir(exist_ok=True)
     (res / "plans" / "plans.json").write_text(json.dumps(out, default=str))
@@ -252,7 +252,7 @@ def test_combined_plan_applies_all_groups_together(shop):
     from dsarp.verify.combine import Combiner
     from dsarp.verify.run import Verifier
     repo, res = shop
-    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, log=lambda *_: None)
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None, log=lambda *_: None)
     out = p.run(50)
     (res / "plans").mkdir(exist_ok=True)
     (res / "plans" / "plans.json").write_text(json.dumps(out, default=str))
@@ -264,3 +264,14 @@ def test_combined_plan_applies_all_groups_together(shop):
     wb, wa = r["whole_repository"]["before"], r["whole_repository"]["after"]
     assert wa.get("god_component", 0) < wb.get("god_component", 0)
     assert (res / "combined" / "plan.patch").read_text().strip()
+
+
+@needs_jdk
+def test_api_limit_blocks_plans_that_move_public_classes(shop):
+    _, res = shop
+    p = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=0, log=lambda *_: None)
+    row = next(r for _, r in p.groups.iterrows() if kind_of(r["type"], r["level"]) == "god_component")
+    out = p.plan_group(row)
+    assert all(x["checks"].get("api_breaks", 0) > 0 for x in out["plans"] if x.get("operations"))
+    assert out["recommended"] is None
+    assert "public types and members" in out["no_plan_reason"]

@@ -454,8 +454,9 @@ Another model: `DSARP_LLM_MODEL=<id>` when downloading and submitting.
 ### 7. Verification on the code
 
 ```bash
-dsarp verify results/tika --workdir work                  # compile check, delta debugging, re-detection, patches
-dsarp verify results/tika --workdir work --build auto     # also Maven/Gradle build + selected tests (offline)
+dsarp prepare-build results/tika --workdir work           # once, with internet (login node): build dependencies
+dsarp verify results/tika --workdir work                  # compile, delta debugging, build + tests, re-detection
+dsarp verify results/tika --workdir work --build none     # compiler check only (no plan is then an accepted fix)
 dsarp verify results/tika --arcan-cmd "java -jar arcan.jar -i {repo} -o {out}"   # also re-run a detector
 ```
 
@@ -465,18 +466,54 @@ qualified names rewritten in all Java and wiring files, imports added where
 classes of the old package used the moved class (and the other way round),
 members widened as listed by the checks (overriding methods too), deprecated
 members deleted with their Javadoc and annotations, unused imports removed,
-interfaces created and implemented. Then **all Java files are compiled** with
-the JDK compiler; errors that were not there before are caused by the plan
-(errors about library symbols the repository does not define are ignored).
-If there are new errors, **delta debugging** finds the steps that cause them
-and the plan is reduced to the steps that compile. If the recommended plan
-does not fully work on the code (steps dropped, or a result different from the
-simulation), up to two next-best acceptable plans of the group are verified
-as well and the best verified result is kept (`tried` in `verification.json`). The smells are then
-**detected again on the compiled code** and compared with the original code
-and with the prediction of the simulation. With `--build`, the affected
-modules are built and the tests that use a changed class are run (download
-the dependencies once on a login node; the build runs offline).
+interfaces created and implemented. Then all Java files are compiled with
+the JDK compiler, **without the libraries** (fast, and possible before the
+dependencies are downloaded); errors that were not there before are caused by
+the plan. If there are new errors, **delta debugging** finds the steps that
+cause them and the plan is reduced to the steps that compile. When no step
+remains, the plan is `not applicable` and is not counted as a fix.
+
+The compiler check alone is not enough evidence: it cannot see errors that
+involve library types, and it runs no tests. So the plan is then checked with
+**the project's own build** (Maven or Gradle, offline): the affected modules
+and the modules they need are compiled with their libraries, main and test
+code, and the **tests that use a changed class** (directly or through one other
+class) are run, on the original code and after the plan. Compiled classes are
+removed first, so that a class file of a moved source cannot hide a broken
+reference. A test that failed on the original code already is not blamed on
+the plan; a test run that hits its time limit (`DSARP_TEST_TIMEOUT`, default
+1800 s) is reported as *tests did not finish*, never as passed.
+
+The smells are then **detected again on the compiled code**: the target smell
+before and after, and **new smells**: classes and packages newly on a
+dependency cycle, packages newly unstable, hub-like or god components. The
+**public API** the plan changes for code outside the repository is counted as
+API checkers such as japicmp do: every public type it moves or whose signature
+changes and every public or protected member of it. Finally the patch is
+checked with `git apply --check` on a clean checkout.
+
+A verified plan is an **accepted fix** only if all of this holds: the smell is
+removed or reduced, the build compiles it, the selected tests that passed
+before still pass, no new smell appears, the patch applies, and at most
+`--max-api-breaks` public types and members change (default 30 with the
+`balanced` API policy, 10 with `strict`, no limit with `off`; the planner
+already blocks plans above the limit and makes every plan pay for what it
+breaks). Up to two next-best plans of a group are verified when the
+recommended one is not an accepted fix with every step kept, and the best
+result is kept (`tried` in `verification.json`).
+
+On the cluster, compute nodes have no internet: run `dsarp prepare-build`
+once on a login node (web interface: *Prepare build*), with
+`DSARP_MAVEN_REPO` pointing to a folder on the parallel file system (Maven's
+local repository; the home folder is too small). When the original code does
+not build offline, the plans are reported as *not built* and none is an
+accepted fix.
+
+Patches contain the files' own line endings. A few repositories store some
+files with Windows line endings (Struts: 58 Java files, with `* text=auto`
+in `.gitattributes`); patches touching them apply to a git checkout of the
+commit, but not to a copy whose files were converted to Unix line endings (use
+`git apply --ignore-whitespace` there).
 
 | File in `verify/<group>/` | Content |
 |---|---|
@@ -484,16 +521,18 @@ the dependencies once on a login node; the build runs offline).
 | `rewrite.yml` | OpenRewrite recipe for the moves (`org.openrewrite.java.ChangeType`) |
 | `operations.json` | steps kept and dropped |
 | `new_errors.csv`, `new_errors_full_plan.csv` | compiler errors caused by the plan |
-| `verification.json` | result: plan verified (and plans tried), compiles, kept/dropped, smell before/after, prediction, build, outcome |
+| `verification.json` | result: plan verified (and plans tried), compiles, kept/dropped, smell before/after, prediction, build and tests (before and after), new smells, public API changed, patch check, status, accepted, why not accepted |
 
 Every group ends with one **outcome** (report and web interface):
-`removed` / `reduced` (measured on the compiled code), `not applicable`
-(every step of every plan tried broke the build), `no safe plan`, `needs a
-design change` (the operations DSARP can verify cannot fix it) or `not a smell
-at this commit` (the detector counted tests, generated code, libraries or
-sub-packages).
+`removed` / `reduced` (measured on the compiled code; the report shows
+separately whether it is an accepted fix), `breaks the build`, `breaks tests`,
+`tests did not finish`, `makes it worse` (new smells), `no effect`, `not
+applicable` (every step of every plan tried broke the compiler check), `no
+safe plan`, `needs a design change` (the operations DSARP can verify cannot
+fix it) or `not a smell at this commit` (the detector counted tests,
+generated code, libraries or sub-packages).
 
-Results (compile check, no build; 6 groups per repository, 30 s solver and 60 s search):
+Earlier results with the compiler check only (version 0.6; no build, no tests, so these are not accepted fixes; 6 groups per repository, 30 s solver and 60 s search):
 
 | Repository | Plans | Steps kept | Smell removed (on the code) | Result equals simulation |
 |---|---|---|---|---|

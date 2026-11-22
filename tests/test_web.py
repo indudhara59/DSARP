@@ -33,7 +33,7 @@ def test_every_stage_builds_a_command(tmp_path):
     p = _paths(tmp_path)
     for st in STAGES:
         args = command(st.id, p)
-        assert args[0] == st.id
+        assert args[0] == st.id.replace("_", "-")
 
 
 def test_plan_options_become_flags(tmp_path):

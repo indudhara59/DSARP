@@ -31,6 +31,7 @@ from ..plan.facts import RepoFacts
 from ..plan.simulate import EXTRA_KINDS, Simulator, interface_name
 from ..program import ProgramModel
 from . import build as bld
+from ..plan.api import api_breaks
 from . import compile as cmp
 from .debug import Tester, keep_passing
 from .detectors import run_detector
@@ -44,12 +45,20 @@ def _flag(s: pd.Series) -> pd.Series:
 
 class Verifier:
     def __init__(self, results: str | Path, repo: str | Path, workdir: str | Path | None = None,
-                 memory: str = "4g", classpath: str = "", build_tool: str = "none", run_tests: bool = True,
-                 max_compiles: int = 30, detector_cmds: dict[str, str] | None = None, log=print):
+                 memory: str = "4g", classpath: str = "", build_tool: str = "auto", run_tests: bool = True,
+                 max_compiles: int = 30, detector_cmds: dict[str, str] | None = None, log=print,
+                 max_api_breaks: int | None = -1):
         self.results, self.repo = Path(results), Path(repo)
         self.workdir = Path(workdir) if workdir else self.results / "verify" / "work"
         self.memory, self.classpath, self.log = memory, classpath, log
         self.build_tool, self.run_tests, self.max_compiles = build_tool, run_tests, max_compiles
+        self._base_builds: dict[tuple, object] = {}      # builds of the original code, per modules and tests
+        if max_api_breaks == -1:                          # the limit the plans were made with
+            from ..plan.run import MAX_API_BREAKS
+            pf = self.results / "plans" / "plans.json"
+            meta = json.loads(pf.read_text()) if pf.exists() else {}
+            max_api_breaks = meta.get("max_api_breaks", MAX_API_BREAKS.get(meta.get("api_policy", "balanced")))
+        self.max_api_breaks = max_api_breaks
         self.detector_cmds = detector_cmds or {}
         self.model = ProgramModel(self.results / "model")
         self.meta = json.loads((self.results / "model" / "model.json").read_text())
@@ -148,20 +157,31 @@ class Verifier:
             rec["patch_lines"] = patch.count("\n")
             rec["files_changed"] = len(res.changed) + len(res.created)
             rec["notes"] = res.notes[:50]
-            # build and tests
-            if self.build_tool != "none" and kept_ops:
-                changed = {o.get("class") or o.get("owner") or o.get("provider") for o in kept_ops}
+            rec["api_breaks"] = api_breaks(self.model, kept_ops) if kept_ops else {"count": 0}
+            ws.reset()
+            if kept_ops:
+                rec["patch_applies"] = ws.apply_check(out / "plan.patch")
+            # the project's own build and the tests that use a changed class, on the original code and after
+            if kept_ops:
+                changed = {o.get("class") or o.get("owner") or o.get("from_class") or o.get("provider")
+                           for o in kept_ops} - {None}
                 changed |= {interface_name(o) for o in kept_ops if o["op"] == "extract_interface"}
                 tests = bld.select_tests(self.model, changed) if self.run_tests else []
                 modules = sorted({self.file_module.get(f, "") for f in
                                   [self.rw.type_file.get(c, "") for c in changed]} - {""})
-                ws.reset()
-                base_b = bld.build(ws.path, modules, tests, self.build_tool)
-                self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
-                after_b = bld.build(ws.path, modules, tests, self.build_tool)
-                rec["build"] = {"tool": after_b.tool, "modules": modules, "tests_selected": len(tests),
-                                "baseline_ok": base_b.ok, "ok": after_b.ok, "seconds": after_b.seconds,
-                                "command": " ".join(after_b.command), "log_tail": after_b.log_tail[-3000:]}
+                if self.build_tool == "none":
+                    rec["build"] = {"status": "not built", "check": "compiler only",
+                                    "reason": "the build was switched off (--build none): only the compiler check "
+                                              "of the sources was done"}
+                    self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
+                else:
+                    key = (tuple(modules), tuple(tests))
+                    if key not in self._base_builds:                 # the original code (workspace is clean)
+                        self._base_builds[key] = bld.build(ws.path, modules, tests, self.build_tool)
+                    self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
+                    after_b = bld.build(ws.path, modules, tests, self.build_tool)
+                    rec["build"] = {"modules": modules, "tests_selected": len(tests),
+                                    **bld.compare(self._base_builds[key], after_b)}
             # detectors
             for tool, command in self.detector_cmds.items():
                 if not kept_ops:
@@ -171,6 +191,7 @@ class Verifier:
                 if d.get("ok") and d.get("groups", {}).get(gid) is False:
                     rec.setdefault("confirmed_by", []).append(tool)
         rec["seconds"] = round(time.time() - t0, 1)
+        rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks)
         (out / "verification.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
 
@@ -204,7 +225,9 @@ class Verifier:
             tb = self.sim.target_measure(g_before, before, group["type"], core, central)
             ta = self.sim.target_measure(g_after, after, group["type"], core, central)
         predicted = self.sim.run(kept_ops, kind, core, central, ctx)
-        return {"target_before": _small(tb), "target_after": _small(ta), "target_removed": not ta.get("present", True),
+        news = cmp.new_smells(self.baseline(), comp, self.prod_files, prod_after, _renamed(all_ops))
+        return {"new_smells": news, "new_smells_count": sum(len(n["elements"]) for n in news),
+                "target_before": _small(tb), "target_after": _small(ta), "target_removed": not ta.get("present", True),
                 "predicted_after": _small(predicted.target_after),
                 "prediction_matches": _small(predicted.target_after) == _small(ta),
                 "smells_before": dict(Counter(before["type"])), "smells_after": dict(Counter(after["type"]))}
@@ -231,7 +254,8 @@ class Verifier:
         best = max(range(len(tried)), key=lambda i: (_quality(tried[i]), -i))
         rec = dict(tried[best])
         rec["tried"] = [{"plan": t["plan"], "compiles": t.get("compiles"), "kept": t.get("kept"),
-                         "operations": t.get("operations"), "target_removed": t.get("target_removed")}
+                         "operations": t.get("operations"), "target_removed": t.get("target_removed"),
+                         "status": t.get("status"), "accepted": t.get("accepted")}
                         for t in tried]
         rec["recommended_plan"] = g["recommended"]
         if best:
@@ -241,9 +265,7 @@ class Verifier:
             for f in src.iterdir():
                 if f.is_file():
                     shutil.copy2(f, top / f.name)
-        rec["status"] = ("not_applicable" if not rec.get("kept") else
-                         "removed" if rec.get("target_removed") else "reduced" if _quality(rec)[2] else
-                         "no_effect")
+        rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks)
         (self.results / "verify" / g["group_id"] / "verification.json").write_text(
             json.dumps(rec, indent=1, default=str))
         return rec
@@ -261,7 +283,8 @@ class Verifier:
                      + f": {rec['kept']}/{rec['operations']} operations compile "
                      f"({rec['reduction']}, {rec['compile_runs']} compiles); smell removed: "
                      f"{yn[rec.get('target_removed')]}; result equals simulation: {yn[rec.get('prediction_matches')]}"
-                     + (f"; build {'ok' if rec['build']['ok'] else 'FAILED'}" if "build" in rec else "")
+                     + f"; {rec.get('build', {}).get('status', 'not built')}"
+                     + f"; status {rec['status']}" + (" (accepted fix)" if rec.get("accepted") else "")
                      + f" [{rec['seconds']:.0f} s]")
             out.append(rec)
         # keep earlier results of groups that were not verified in this run
@@ -285,9 +308,49 @@ def _acceptable(p: dict) -> bool:
 
 
 def _complete(r: dict) -> bool:
-    """The plan works on the code as planned: every step compiles and the result is as simulated."""
-    return bool(r.get("compiles")) and r.get("kept") == r.get("operations") and r.get("kept", 0) > 0 \
-        and bool(r.get("target_removed") or r.get("prediction_matches"))
+    """The plan works on the code as planned: an accepted fix with every step kept."""
+    return bool(r.get("accepted")) and r.get("kept") == r.get("operations")
+
+
+BUILD_FAILURES = ("breaks the build", "breaks tests", "tests did not finish")
+
+
+def _improved(r: dict) -> bool:
+    tb, ta = r.get("target_before") or {}, r.get("target_after") or {}
+    return any(isinstance(v, (int, float)) and isinstance(ta.get(k), (int, float)) and ta[k] < v
+               for k, v in tb.items() if k != "present")
+
+
+def final_status(r: dict, max_api_breaks: int | None = None) -> tuple[str, bool, str]:
+    """(status, accepted, why not accepted) of a verified plan.
+
+    Status: ``not_applicable`` (no step could be applied), a build failure (``breaks the build``,
+    ``breaks tests``, ``tests did not finish``), ``made_worse`` (new smells on the compiled code),
+    ``removed``, ``reduced`` or ``no_effect``. A plan is an **accepted fix** only if it removed or reduced the
+    smell, the project's own build compiled it, the selected tests that passed before still pass, it created no
+    new smell, its patch applies to a clean checkout, and it breaks at most ``max_api_breaks`` public types and
+    members."""
+    if not r.get("kept"):
+        return "not_applicable", False, "no step of the plan could be applied without compile errors"
+    b = r.get("build") or {}
+    if b.get("status") in BUILD_FAILURES:
+        return b["status"], False, b.get("reason", "")
+    if r.get("new_smells_count"):
+        kinds = ", ".join(f"{len(n['elements'])} {n['level']} {n['type'].replace('_', ' ')}"
+                          for n in r.get("new_smells", []))
+        return "made_worse", False, f"new smells on the compiled code: {kinds}"
+    st = "removed" if r.get("target_removed") else "reduced" if _improved(r) else "no_effect"
+    if st == "no_effect":
+        return st, False, "the smell is unchanged on the compiled code"
+    why = []
+    if b.get("status") in (None, "not built"):
+        why.append(b.get("reason") or "not built with the project's build")
+    if r.get("patch_applies") is False:
+        why.append("the patch does not apply to a clean checkout")
+    api = (r.get("api_breaks") or {}).get("count", 0)
+    if max_api_breaks is not None and api > max_api_breaks:
+        why.append(f"it changes {api} public types and members (limit {max_api_breaks})")
+    return st, not why, "; ".join(why)
 
 
 def _renamed(ops: list[dict]) -> dict[str, str]:

@@ -45,6 +45,7 @@ import pandas as pd
 
 from ..program import ProgramModel
 from . import solver as slv
+from .api import api_breaks
 from .checks import Checker, summarise
 from .facts import GroupFacts, RepoFacts, group_facts
 from .generator import Plan, PlanModel
@@ -55,7 +56,11 @@ SUPPORTED = {("cyclic_dependency", "package"), ("unstable_dependency", "package"
              ("scattered_functionality", "package"), ("cyclic_dependency", "class"), ("hub_like_dependency", "class")}
 ORIGINAL = {("cyclic_dependency", "package"), ("unstable_dependency", "package"), ("hub_like_dependency", "package")}
 LARGE_GROUP = 25
-WEIGHTS = {"new_smell": 0.25, "side_removed": 0.05, "cost": 0.30, "cost_scale": 20.0, "made_public": 0.01}
+WEIGHTS = {"new_smell": 0.25, "side_removed": 0.05, "cost": 0.30, "cost_scale": 20.0, "made_public": 0.01,
+           "api_break": 0.20, "api_scale": 20.0}
+# public types and members a recommended plan may break for users of the library (None: no limit);
+# --max-api-breaks overrides it. Every plan also pays a score penalty for what it breaks.
+MAX_API_BREAKS = {"strict": 10, "balanced": 30, "off": None}
 
 
 def kind_of(smell_type: str, level: str) -> str:
@@ -133,8 +138,10 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict |
     side = max(len(sim.removed_smells) - (1 if benefit == 1.0 else 0), 0)
     scale = w["cost_scale"] * (1.0 + _size(sim, smell_type) / 5.0)   # bigger smells justify more change
     cost_n = plan.change_cost / (plan.change_cost + scale) if plan.change_cost else 0.0
+    api = check_summary.get("api_breaks", 0)
     total = (benefit - w["new_smell"] * new + w["side_removed"] * side - w["cost"] * cost_n
-             - w["made_public"] * check_summary.get("made_public", 0))
+             - w["made_public"] * check_summary.get("made_public", 0)
+             - w["api_break"] * api / (api + w["api_scale"]))
     return {"score": round(total, 4), "benefit": round(benefit, 4), "new_smells": round(new, 3),
             "other_smells_removed": side, "cost_normalised": round(cost_n, 4)}
 
@@ -142,8 +149,11 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict |
 class Planner:
     def __init__(self, model_dir: str | Path, triage_dir: str | Path, backend: str = "auto",
                  time_limit: float = 60.0, log=print, affinity: str | Path | None = None,
-                 search: str = "auto", search_time: float = 120.0, llm=None, api_policy: str = "balanced"):
+                 search: str = "auto", search_time: float = 120.0, llm=None, api_policy: str = "balanced",
+                 max_api_breaks: int | None = -1):
         self.log = log
+        # -1: the default of the API policy; None: no limit
+        self.max_api_breaks = MAX_API_BREAKS.get(api_policy) if max_api_breaks == -1 else max_api_breaks
         t0 = time.time()
         self.model = ProgramModel(model_dir)
         self.rf = RepoFacts.build(self.model, api_policy)
@@ -255,11 +265,24 @@ class Planner:
             return plans, info, {"level": "class"}
         raise ValueError(kind)
 
+    def _summarise(self, checks, ops: list[dict]) -> dict:
+        """Checks of a plan's steps, with the public API it breaks; over the limit, the plan is blocked."""
+        summ = summarise(checks)
+        api = api_breaks(self.model, ops)
+        summ["api_breaks"] = api["count"]
+        summ["api_examples"] = api["examples"]
+        lim = self.max_api_breaks
+        if lim is not None and api["count"] > lim:
+            summ["status"] = "blocked"
+            summ["api_limit"] = (f"it changes {api['count']} public types and members that code outside the "
+                                 f"repository may use ({api['types']} types, {api['members']} members; limit {lim})")
+        return summ
+
     def _evaluate(self, p: Plan, kind: str, core: list[str], central: str, ctx: dict) -> dict:
         sim = self.sim.run(p.operations, kind, core, central, ctx)
         after = {o["class"]: o["to_package"] for o in p.operations if o["op"] == "move_class"}
         checks = self.checker.check(p.operations, after)
-        summ = summarise(checks)
+        summ = self._summarise(checks, p.operations)
         sc = score(p, sim, summ, kind)
         entry = {k: v for k, v in asdict(p).items() if k not in ("operations", "size")}
         entry["model_size"] = {k: v for k, v in p.size.items() if k != "chosen"}
@@ -352,6 +375,8 @@ class Planner:
             if plans and not any(p.operations for p in plans):
                 out["skipped"] = info.get("why_none") or ("no change that the planner can make reduces the smell "
                                                           "without breaking a rule (see the model information)")
+            elif any((e.get("checks") or {}).get("api_limit") for e in out["plans"]):
+                out["no_plan_reason"] = why_rejected(out["plans"])     # plans exist, but break too much public API
             elif info.get("why_none"):
                 out["no_plan_reason"] = info["why_none"]
             else:
@@ -387,7 +412,7 @@ class Planner:
             sim = self.sim.run(p.operations, t, gf.core, central)
             after = {o["class"]: o["to_package"] for o in p.operations if o["op"] == "move_class"}
             checks = self.checker.check(p.operations, after)
-            summ = summarise(checks)
+            summ = self._summarise(checks, p.operations)
             sc = score(p, sim, summ, t)
             entry.update({"simulation": sim.as_dict(), "checks": summ, **sc})
             entry["operations"] = [{**o, "check": {"status": c.status, "notes": c.notes, "edits": c.edits}}
@@ -426,7 +451,7 @@ class Planner:
         sim = self.sim.run(p.operations, t, gf.core, central)
         after = {o["class"]: o["to_package"] for o in p.operations if o["op"] == "move_class"}
         checks = self.checker.check(p.operations, after)
-        summ = summarise(checks)
+        summ = self._summarise(checks, p.operations)
         entry = {k: v for k, v in asdict(p).items() if k not in ("operations", "size")}
         entry["model_size"] = p.size
         entry.update({"simulation": sim.as_dict(), "checks": summ, **score(p, sim, summ, t)})
@@ -450,6 +475,7 @@ class Planner:
             results.append(r)
         return {"groups": results, "backends": slv.available_backends(), "weights": WEIGHTS,
                 "affinity_model": self.affinity, "search": self.search, "api_policy": self.rf.api_policy,
+                "max_api_breaks": self.max_api_breaks,
                 "frozen_classes": len(self.rf.frozen),
                 "llm": getattr(self.llm, "name", "none") if self.llm else "none",
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}
@@ -466,7 +492,9 @@ def why_rejected(plans: list[dict]) -> str:
                 f"whole repository")
     p = max(useful, key=lambda x: (x.get("score", -9), x.get("benefit", 0)))
     parts = []
-    if (p.get("checks") or {}).get("status") == "blocked":
+    if (p.get("checks") or {}).get("api_limit"):
+        parts.append(p["checks"]["api_limit"])
+    if (p.get("checks") or {}).get("status") == "blocked" and (p.get("checks") or {}).get("blocked"):
         notes = [n for o in p["operations"] for n in (o.get("check") or {}).get("notes", [])
                  if (o.get("check") or {}).get("status") == "blocked"]
         parts.append(f"{p['checks']['blocked']} of its steps are blocked" + (f" ({notes[0]})" if notes else ""))
