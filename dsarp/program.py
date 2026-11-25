@@ -244,7 +244,8 @@ def _coverage(ingest_dir: Path, types: pd.DataFrame, repo: Path) -> dict:
 class ProgramModel:
     """Read access to a stored program model, with class and package graphs."""
 
-    def __init__(self, folder: str | Path):
+    def __init__(self, folder: str | Path, aligned: bool = True):
+        """``aligned``: use the bytecode alignment when ``dsarp align`` wrote a complete one (see ``align``)."""
         self.folder = Path(folder)
         read = lambda name: pd.read_csv(self.folder / name, low_memory=False, keep_default_na=False)  # noqa: E731
         self.files = read("files.csv")
@@ -260,6 +261,8 @@ class ProgramModel:
         for col in ("is_test", "is_test_module", "is_generated", "api", "protected", "exported_package"):
             if col in self.types:
                 self.types[col] = self.types[col].astype(str).str.lower().isin(["true", "1"])
+        from .align import apply_alignment
+        self.aligned = apply_alignment(self) if aligned else False
 
     def _type_filter(self, include_tests: bool, include_generated: bool) -> set[str]:
         t = self.types
@@ -281,6 +284,8 @@ class ProgramModel:
         """
         allowed = self._type_filter(include_tests, include_generated)
         d = self.deps
+        if getattr(self, "aligned", False):                 # what the bytecode (Arcan) shows
+            d = d[d["in_bytecode"].astype(bool)]
         if kinds:
             d = d[d["kind"].isin(kinds)]
         d = d[d["source_type"].isin(allowed) & d["target_type"].isin(allowed)]

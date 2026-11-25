@@ -160,6 +160,10 @@ STAGES: tuple[Stage, ...] = (
           outputs=("baseline/baseline.json",), requires=("prepare_build",),
           options=(Option("reruns", "--reruns", "int", 3, "re-runs of failing tests", minimum=0),),
           resources=Resources(8, "32G", "08:00:00")),
+    Stage("align", "Align with bytecode", "8c", "jdeps on the classes the baseline compiled: smells are then "
+          "measured on the dependencies the bytecode shows (what Arcan sees); a partial graph is not used. Run Triage "
+          "and Plan again afterwards",
+          outputs=("model/alignment.json",), requires=("baseline",), resources=Resources(4, "16G", "01:00:00")),
     Stage("loop", "Repair loop", "8r", "Verify, learn from every failure (banned steps, risky classes), plan the "
           "groups without an accepted fix again and verify again, until a round teaches nothing new",
           outputs=("lessons/loop.json",), requires=("plan", "baseline"),
@@ -301,6 +305,7 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
         "prepare_build": ["prepare-build", res, "--workdir", work],
         "baseline": ["baseline", res, "--workdir", work],
         "loop": ["loop", res, "--workdir", work],
+        "align": ["align", res, "--workdir", work],
         "sensitivity": ["sensitivity", res],
         "stats": ["stats", res, "--workdir", work],
         "verify": ["verify", res, "--workdir", work],

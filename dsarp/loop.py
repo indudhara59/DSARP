@@ -52,9 +52,14 @@ def run(results: str | Path, repo: str | Path, rounds: int = 3, time_limit: floa
             ids = {g["group_id"] for g in open_groups}
             rows = pl.groups[pl.groups["group_id"].isin(ids)]
             new = {row["group_id"]: pl.plan_group(row) for _, row in rows.iterrows()}
-            plans["groups"] = [new.get(g["group_id"], g) for g in plans["groups"]]
-            write(plans, results / "plans")
-            log(f"round {r}: planned {len(new)} groups again with the lessons ({before})")
+            changed = {gid for gid, g in new.items()
+                       if _rec_steps(g) != tried.get(gid, _rec_steps(next(x for x in plans["groups"]
+                                                                          if x["group_id"] == gid)))}
+            if changed:                        # keep the frozen plans file when the lessons changed nothing
+                plans["groups"] = [new.get(g["group_id"], g) for g in plans["groups"]]
+                write(plans, results / "plans")
+            log(f"round {r}: planned {len(new)} groups again with the lessons ({before}); "
+                f"{len(changed)} recommendations changed")
         todo = set()
         for g in plans["groups"]:
             if not g.get("recommended") or (_result(results, g["group_id"]) or {}).get("accepted"):

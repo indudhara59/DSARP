@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pandas as pd
 
-WEIGHT_KEYS = ("new_smell", "side_removed", "cost", "made_public", "api_break")
+WEIGHT_KEYS = ("new_smell", "side_removed", "cost", "made_public", "api_break", "risky", "uncovered")
 FACTORS = (0.0, 0.5, 2.0)
 THRESHOLDS = {
     "MIN_FIT": (0.025, 0.1),
@@ -49,9 +49,10 @@ def rescore(p: dict, w: dict) -> float | None:
     if "benefit" not in p:
         return None
     ch = p.get("checks") or {}
-    api = ch.get("api_breaks", 0) or 0
+    api = ch.get("api_expected", ch.get("api_breaks", 0)) or 0
     risky = ch.get("risky_classes", 0) or 0
     return (p["benefit"] - w["new_smell"] * (p.get("new_smells") or 0) - w.get("risky", 0) * risky / (risky + 3)
+            - w.get("uncovered", 0) * (ch.get("uncovered") or 0)
             + w["side_removed"] * (p.get("other_smells_removed") or 0)
             - w["cost"] * (p.get("cost_normalised") or 0) - w["made_public"] * (ch.get("made_public") or 0)
             - w["api_break"] * api / (api + w["api_scale"]))

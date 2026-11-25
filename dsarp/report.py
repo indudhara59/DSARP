@@ -230,6 +230,29 @@ def build(results: str | Path) -> str:
             if api.get("count"):
                 parts.append(f"<li>public API changed for code outside the repository: {api['count']} "
                              f"({api.get('types', 0)} types, {api.get('members', 0)} members)</li>")
+            am = v.get("api_measured") or {}
+            if am.get("measured"):
+                parts.append(f"<li>public API measured with {html.escape(am.get('tool', 'japicmp'))} on the compiled "
+                             f"classes: {am['count']} binary-incompatible changes"
+                             + (f" ({am['removed_types']} types removed)" if am.get("removed_types") else "")
+                             + (": " + html.escape("; ".join(am.get("examples", [])[:5])) if am.get("examples") else "")
+                             + "</li>")
+            elif am:
+                parts.append(f"<li>public API not measured: {html.escape(am.get('reason', ''))}</li>")
+            cov = v.get("coverage") or {}
+            if cov:
+                parts.append(f"<li>line coverage of the {cov.get('classes')} changed classes (baseline tests): "
+                             f"{round(100 * cov.get('mean', 0))}%"
+                             + (f"; not run by any test: {html.escape(', '.join(cov['uncovered'][:5]))}"
+                                if cov.get("uncovered") else "") + "</li>")
+            st = v.get("steps") or {}
+            if st.get("count"):
+                parts.append(f"<li>step-wise patches (<code>verify/{html.escape(v['group_id'])}/steps/</code>): "
+                             f"{st['count']} steps"
+                             + ("" if st.get("all_compile") is None else
+                                ", each compiles on its own" if st["all_compile"] else
+                                f"; the code compiles after steps {', '.join(map(str, st['checkpoints']))} "
+                                "(apply the steps in between together)") + "</li>")
             cp = v.get("compat") or {}
             if cp.get("stubs") or cp.get("failed"):
                 keep = cp.get("target_removed_with_stubs")

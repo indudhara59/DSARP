@@ -51,8 +51,10 @@ class Verifier:
                  max_compiles: int = 30, detector_cmds: dict[str, str] | None = None, log=print,
                  max_api_breaks: int | None = -1, compat: str | None = None, allow_untested: bool = False,
                  shard: tuple[int, int] | None = None, allow_partial_baseline: bool = False,
-                 out_name: str = "verify", plans_file: str | Path | None = None, learn: bool = True):
+                 out_name: str = "verify", plans_file: str | Path | None = None, learn: bool = True,
+                 measure_api: bool = True, step_patches: bool = True):
         self.results, self.repo = Path(results), Path(repo)
+        self.measure_api, self.step_patches = measure_api, step_patches
         self.vdir = self.results / out_name                 # verify/ (placebo: placebo/)
         self.plans_file = Path(plans_file) if plans_file else self.results / "plans" / "plans.json"
         self.learn = learn
@@ -117,6 +119,81 @@ class Verifier:
                              self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
                              set(renamed.values()) | set(res.created_types), self.packages, ws.path)
         return new.empty, res, comp, new
+
+    def _step_patches(self, ws: Workspace, out: Path, ops: list[dict], checks: list[dict], modules: list[str],
+                      limit: int = 25) -> dict:
+        """One patch per step of an accepted fix, so that it can be applied (and reviewed, and reverted) in small
+        commits: step i's patch is the difference between the code with steps 1..i and with steps 1..i-1, each
+        made from the clean checkout. Each prefix is compiled with the project's build; a step after which the
+        code does not compile has to be applied together with the next steps up to a compiling one (the
+        ``checkpoints``). The compatibility stubs (compat.patch) come after the last step."""
+        sdir = out / "steps"
+        sdir.mkdir(exist_ok=True)
+        ws.reset()
+        base = prev = ws.head()
+        steps, n = [], min(len(ops), limit)
+        for i in range(1, n + 1):
+            ws.reset_to(base)
+            todo = ops[:i] if i < n else ops                     # the last patch takes all remaining steps
+            self.rw.apply(ws.path, todo, checks[:len(todo)])
+            cur = ws.commit_all(f"step {i}")
+            patch = ws.diff_between(prev, cur)
+            (sdir / f"step_{i:02d}.patch").write_text(patch)
+            compiles = None
+            if self.build_tool != "none" and modules:
+                compiles = bld.build(ws.path, modules, [], self.build_tool).compiled
+            from ..lessons import step_key
+            steps.append({"step": i, "operations": [step_key(o) for o in (ops[i - 1:i] if i < n else ops[i - 1:])],
+                          "patch": f"steps/step_{i:02d}.patch", "lines": patch.count("\n"), "compiles": compiles})
+            prev = cur
+        ws.reset_to(base)
+        checkpoints = [s["step"] for s in steps if s["compiles"]]
+        return {"count": len(steps), "steps": steps, "checkpoints": checkpoints,
+                "all_compile": all(s["compiles"] for s in steps) if steps and steps[0]["compiles"] is not None
+                else None}
+
+    def _destination_modules(self, ops: list[dict]) -> set[str]:
+        """Modules that receive a moved class (built too, so that the class is compiled where it now lives)."""
+        if not hasattr(self, "_pkg_modules"):
+            self._pkg_modules: dict[str, set[str]] = {}
+            for c, f in self.rw.type_file.items():
+                self._pkg_modules.setdefault(c.rsplit(".", 1)[0], set()).add(self.file_module.get(f, ""))
+        return {m for o in ops if o.get("to_package") for m in self._pkg_modules.get(o["to_package"], set())}
+
+    def _measure_api(self, ws: Workspace, out: Path, modules: list[str], rec: dict) -> dict:
+        """japicmp on the classes the baseline compiled and the classes compiled after the plan (with its
+        compatibility stubs, which are part of the recommendation)."""
+        from .. import align
+        from . import apicheck
+        from .baseline import build_env
+        old_dirs, _ = align.class_dirs(self.repo)
+        if not old_dirs:
+            return {"measured": False, "reason": "the original code has no compiled classes (run dsarp baseline)"}
+        if (rec.get("compat") or {}).get("stubs") and (out / "compat.patch").exists():
+            if not ws.apply(out / "compat.patch"):
+                return {"measured": False, "reason": "the compatibility stubs do not apply"}
+            b = bld.build(ws.path, modules, [], self.build_tool)
+            if not b.compiled:
+                return {"measured": False, "reason": "the build with the compatibility stubs failed"}
+        home = (build_env(self.repo) or {}).get("JAVA_HOME")
+        java = str(Path(home) / "bin" / "java") if home else "java"
+        return apicheck.run(old_dirs, apicheck.after_dirs(self.repo, ws.path, old_dirs), out / "api", java=java)
+
+    def _coverage_of(self, ops: list[dict]) -> dict | None:
+        """Line coverage (baseline run) of the classes the plan changes: only code the tests run counts as
+        behaviour-checked."""
+        from . import baseline as bsl
+        from ..plan.run import touched_classes
+        cov = getattr(self, "_cov", None)
+        if cov is None:
+            cov = self._cov = bsl.load_coverage(self.results)
+        if not cov:
+            return None
+        changed = sorted(c for c in touched_classes(ops) if c in cov)
+        if not changed:
+            return None
+        return {"mean": round(sum(cov[c] for c in changed) / len(changed), 3),
+                "uncovered": [c for c in changed if cov[c] == 0][:20], "classes": len(changed)}
 
     def _settle_flaky(self, path: Path, cmpb: dict, after_b) -> dict:
         """Re-run the tests that newly failed up to three times: one that passes is flaky, not broken."""
@@ -255,8 +332,9 @@ class Verifier:
                 changed |= {interface_name(o) for o in kept_ops if o["op"] == "extract_interface"}
                 tests, scope = bld.select_tests_scoped(self.model, changed) if self.run_tests else ([], "not run")
                 rec["test_scope"] = scope
-                modules = sorted({self.file_module.get(f, "") for f in
-                                  [self.rw.type_file.get(c, "") for c in changed]} - {""})
+                modules = sorted(({self.file_module.get(f, "") for f in
+                                   [self.rw.type_file.get(c, "") for c in changed]}
+                                  | self._destination_modules(kept_ops)) - {""})
                 if self.build_tool == "none":
                     rec["build"] = {"status": "not built", "check": "compiler only",
                                     "reason": "the build was switched off (--build none): only the compiler check "
@@ -283,8 +361,16 @@ class Verifier:
                         cmpb = self._settle_flaky(ws.path, cmpb, after_b)
                     rec["build"] = {"modules": modules, "tests_selected": len(tests), **cmpb}
                 rec["reflection"] = reflection_gate(ws.path, res, kept_ops)
+                rec["coverage"] = self._coverage_of(kept_ops)
             rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
                                                                                    self.allow_untested)
+            # the API change of an accepted fix, measured on the compiled classes (japicmp)
+            # (also when only the count on the sources is over the limit: the measurement decides)
+            if self.measure_api and self.build_tool != "none" and kept_ops and \
+                    final_status(rec, None, self.allow_untested)[1]:
+                rec["api_measured"] = self._measure_api(ws, out, rec.get("build", {}).get("modules") or [], rec)
+                rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
+                                                                                       self.allow_untested)
             # the real detectors confirm accepted fixes (running them on every plan would take too long)
             if rec["accepted"] and self.detector_cmds:
                 for tool, command in self.detector_cmds.items():
@@ -294,6 +380,9 @@ class Verifier:
                         rec.setdefault("confirmed_by", []).append(tool)
                     elif d.get("ok") and d.get("groups", {}).get(gid) is True:
                         rec.setdefault("still_reported_by", []).append(tool)
+            if rec["accepted"] and self.step_patches and len(kept_ops) > 1:
+                rec["steps"] = self._step_patches(ws, out, kept_ops, [checks[i] for i in kept],
+                                                  (rec.get("build") or {}).get("modules") or [])
         rec["seconds"] = round(time.time() - t0, 1)
         rec["api_predicted"] = ((plan.get("checks") or {}).get("api_breaks"))
         rec["level"] = evidence_level(rec)
@@ -520,7 +609,8 @@ def evidence_level(r: dict | None) -> str:
     st, b = r.get("status"), (r.get("build") or {})
     if st in ("not_applicable", "breaks the build") or b.get("status") in (None, "not built"):
         return "1"
-    if st in ("breaks tests", "tests did not finish") or b.get("status") == "builds":
+    if st in ("breaks tests", "tests did not finish") or b.get("status") == "builds" or \
+            (r.get("coverage") or {}).get("mean") == 0:
         return "2"
     return "3"
 
@@ -551,6 +641,9 @@ def final_status(r: dict, max_api_breaks: int | None = None, allow_untested: boo
         why.append(b.get("reason") or "not built with the project's build")
     elif b.get("status") == "builds" and not allow_untested:
         why.append("no test runs the changed code (" + (r.get("test_scope") or b.get("reason") or "no tests") + ")")
+    cov = r.get("coverage") or {}
+    if cov and cov.get("mean") == 0 and not allow_untested:
+        why.append(f"the tests do not run any line of the {cov.get('classes')} changed classes (coverage 0)")
     if r.get("patch_applies") is False:
         why.append("the patch does not apply to a clean checkout")
     refl = r.get("reflection") or {}
@@ -559,9 +652,11 @@ def final_status(r: dict, max_api_breaks: int | None = None, allow_untested: boo
             ([f"adds reflective lookups ({', '.join(refl['added_lookups'][:2])})"] if refl.get("added_lookups") else [])
             + ([f"old class name still in a string ({refl['old_names_in_strings'][0]})"]
                if refl.get("old_names_in_strings") else [])))
-    api = (r.get("api_breaks") or {}).get("count", 0)
+    m = r.get("api_measured") or {}
+    api = m["count"] if m.get("measured") else (r.get("api_breaks") or {}).get("count", 0)
     if max_api_breaks is not None and api > max_api_breaks:
-        why.append(f"it changes {api} public types and members (limit {max_api_breaks})")
+        how = "measured with japicmp" if m.get("measured") else "counted on the sources"
+        why.append(f"it changes {api} public types and members ({how}; limit {max_api_breaks})")
     return st, not why, "; ".join(why)
 
 

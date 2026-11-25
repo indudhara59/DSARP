@@ -29,6 +29,12 @@ from pathlib import Path
 from . import build as bld
 
 RERUNS = 3
+JACOCO = os.environ.get("DSARP_JACOCO_VERSION", "0.8.12")
+
+
+def jacoco_goals() -> tuple[str, str]:
+    g = f"org.jacoco:jacoco-maven-plugin:{JACOCO}"
+    return f"{g}:prepare-agent", f"{g}:report"
 
 
 # ------------------------------------------------------------------ JDK per repository
@@ -103,7 +109,7 @@ def modules_reported(repo: Path) -> list[str]:
 
 # ------------------------------------------------------------------ the baseline
 def run(repo: str | Path, out_dir: str | Path, tool: str = "auto", timeout: int | None = None,
-        reruns: int = RERUNS, log=print) -> dict:
+        reruns: int = RERUNS, log=print, coverage: bool = True) -> dict:
     """Build and test the original code once; write ``baseline.json`` in ``out_dir``."""
     repo, out_dir = Path(repo), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +129,10 @@ def run(repo: str | Path, out_dir: str | Path, tool: str = "auto", timeout: int 
     if tool == "maven":
         base = bld._maven(repo, offline=bld.offline_default())
         compile_cmd = base + ["test-compile"] + bld.SKIP_CHECKS
-        test_cmd = base + ["-fae", "test", "-Dsurefire.timeout=900", "-DfailIfNoTests=false"] + bld.SKIP_CHECKS
+        agent, report = jacoco_goals()
+        test_cmd = base + ["-fae"] + ([agent] if coverage else []) + ["test"] + ([report] if coverage else []) + [
+            "-Dsurefire.timeout=900", "-DfailIfNoTests=false", "-Dmaven.test.failure.ignore=true",
+            "-Djacoco.skip=false"] + [x for x in bld.SKIP_CHECKS if "jacoco" not in x]
     else:
         g = bld._gradle(repo, offline=bld.offline_default())
         compile_cmd = g + ["testClasses"]
@@ -150,6 +159,17 @@ def run(repo: str | Path, out_dir: str | Path, tool: str = "auto", timeout: int 
                               f"(e.g. {res['missing_modules'][0]}): their tests did not run")
     if run_n == 0:
         res["reasons"].append("no test ran")
+    if coverage:
+        cov = read_coverage(repo)
+        if len(cov):
+            cov.to_csv(out_dir / "coverage.csv", index=False)
+            lc, lm = int(cov["line_covered"].sum()), int(cov["line_missed"].sum())
+            res["coverage"] = {"classes": int(len(cov)), "covered_classes": int((cov["line_covered"] > 0).sum()),
+                               "line_ratio": round(lc / max(lc + lm, 1), 4),
+                               "modules_with_report": modules_with_coverage(repo)}
+        else:
+            res["coverage"] = {"classes": 0, "note": "no JaCoCo report (Gradle, or a test setup that overrides "
+                                                     "argLine without @{argLine}); coverage is not used"}
     # failing tests: re-run them; one pass makes a test flaky
     still, flaky = set(failing), set()
     for i in range(reruns):
@@ -180,6 +200,39 @@ def rerun(repo: Path, tests: list[str], tool: str, env=None, timeout: int = 3600
     bld._run(cmd, repo, timeout, env)
     ran = bld.test_results(repo)
     return {t for t in tests if ran.get(t) is True}
+
+
+def read_coverage(repo: Path) -> "pd.DataFrame":
+    """Line coverage per top-level class from JaCoCo's CSV reports (``target/site/jacoco/jacoco.csv``)."""
+    import pandas as pd
+    frames = []
+    for f in repo.glob("**/target/site/jacoco/jacoco.csv"):
+        try:
+            frames.append(pd.read_csv(f))
+        except (OSError, ValueError):
+            continue
+    if not frames:
+        return pd.DataFrame(columns=["class", "line_covered", "line_missed", "ratio"])
+    df = pd.concat(frames, ignore_index=True)
+    df["class"] = df["PACKAGE"].astype(str) + "." + df["CLASS"].astype(str).str.split(".").str[0]
+    g = df.groupby("class").agg(line_covered=("LINE_COVERED", "sum"), line_missed=("LINE_MISSED", "sum")).reset_index()
+    g["ratio"] = (g["line_covered"] / (g["line_covered"] + g["line_missed"]).clip(lower=1)).round(4)
+    return g
+
+
+def modules_with_coverage(repo: Path) -> list[str]:
+    return sorted((f.parents[3].relative_to(repo).as_posix() or ".")
+                  for f in repo.glob("**/target/site/jacoco/jacoco.csv"))
+
+
+def load_coverage(results: str | Path) -> dict[str, float]:
+    """Line coverage ratio per top-level class from the baseline (empty when not measured)."""
+    import pandas as pd
+    f = Path(results) / "baseline" / "coverage.csv"
+    if not f.exists():
+        return {}
+    df = pd.read_csv(f)
+    return dict(zip(df["class"], df["ratio"].astype(float)))
 
 
 def _write(res: dict, out_dir: Path, t0: float) -> dict:

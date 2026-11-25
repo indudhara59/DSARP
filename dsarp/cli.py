@@ -391,6 +391,26 @@ def _cmd_sensitivity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_align(args: argparse.Namespace) -> int:
+    import json
+
+    from .align import align
+    status = 0
+    for d in map(Path, args.results):
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        r = align(d, repo, args.jdeps)
+        if r.get("complete"):
+            c, p = r["class_pairs"], r["package_pairs"]
+            print(f"{d.name}: aligned; class pairs: {c['both']} in both, {c['source_only']} only in the source, "
+                  f"{c['bytecode_only']} only in the bytecode; package pairs: {p['both']} / {p['source_only']} / "
+                  f"{p['bytecode_only']}")
+        else:
+            print(f"{d.name}: not aligned: {r.get('reason')}")
+            status = 1
+    return status
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     import json
 
@@ -440,8 +460,11 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     for d in map(Path, args.results):
         meta = json.loads((d / "model" / "model.json").read_text())
         repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
-        r = bsl.run(repo, d / "baseline", args.build, args.timeout, args.reruns)
+        r = bsl.run(repo, d / "baseline", args.build, args.timeout, args.reruns, coverage=not args.no_coverage)
         state = "complete" if r["complete"] else "PARTIAL: " + "; ".join(r["reasons"])
+        cov = r.get("coverage") or {}
+        if cov.get("classes"):
+            state += f"; line coverage {cov['line_ratio']:.0%} ({cov['covered_classes']}/{cov['classes']} classes run)"
         print(f"{d.name}: {r['tests_run']} tests, {len(r['failing'])} failing, {len(r['flaky'])} flaky; "
               f"{state} [{r['seconds']:.0f} s]")
         if not r["complete"]:
@@ -502,7 +525,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                                      None if args.max_api_breaks < 0 else args.max_api_breaks),
                      allow_untested=args.allow_untested, shard=shard,
                      allow_partial_baseline=args.allow_partial_baseline,
-                     run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
+                     run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds,
+                     measure_api=not args.no_api_measure, step_patches=not args.no_step_patches)
         v.run(args.groups, set(args.group) if args.group else None)
         print(f"  written: {d / 'verify'}")
     return 0
@@ -832,6 +856,14 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--build", default="auto", choices=["auto", "maven", "gradle"])
     pb.set_defaults(func=_cmd_prepare_build)
 
+    al = sub.add_parser("align", help="align the program model with the bytecode (jdeps on the classes the "
+                        "baseline compiled), so smells are measured on what Arcan sees")
+    al.add_argument("results", nargs="+")
+    al.add_argument("--workdir", default="work")
+    al.add_argument("--repo")
+    al.add_argument("--jdeps", default="jdeps")
+    al.set_defaults(func=_cmd_align)
+
     st = sub.add_parser("stats", help="evaluation: accepted fixes with 95 % confidence intervals, evidence levels, "
                         "calibration, and (with --placebo) random plans through the same gate + McNemar's test")
     st.add_argument("results", nargs="+")
@@ -867,6 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--build", default="auto", choices=["auto", "maven", "gradle"])
     bs.add_argument("--timeout", type=int, help="seconds for the build and for the test suite (default 14400)")
     bs.add_argument("--reruns", type=int, default=3, help="re-runs of failing tests to find flaky ones")
+    bs.add_argument("--no-coverage", action="store_true", help="do not measure line coverage with JaCoCo (Maven)")
     bs.set_defaults(func=_cmd_baseline)
 
     ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
@@ -889,6 +922,10 @@ def build_parser() -> argparse.ArgumentParser:
     ve.add_argument("--max-api-breaks", type=int, help="public types and members an accepted fix may change "
                     "(default: the limit the plans were made with; negative = no limit)")
     ve.add_argument("--no-tests", action="store_true", help="with --build: compile only")
+    ve.add_argument("--no-api-measure", action="store_true", help="do not measure the API change of accepted fixes "
+                    "with japicmp (the count on the sources is used)")
+    ve.add_argument("--no-step-patches", action="store_true", help="do not write one patch per step for accepted "
+                    "fixes")
     ve.add_argument("--max-compiles", type=int, default=30, help="compiler runs for delta debugging per plan")
     ve.add_argument("--memory", default="4g")
     ve.add_argument("--classpath", default="", help="jars of the external libraries (fewer baseline errors)")

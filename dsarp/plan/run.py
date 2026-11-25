@@ -57,7 +57,7 @@ SUPPORTED = {("cyclic_dependency", "package"), ("unstable_dependency", "package"
 ORIGINAL = {("cyclic_dependency", "package"), ("unstable_dependency", "package"), ("hub_like_dependency", "package")}
 LARGE_GROUP = 25
 WEIGHTS = {"new_smell": 0.25, "side_removed": 0.05, "cost": 0.30, "cost_scale": 20.0, "made_public": 0.01,
-           "api_break": 0.20, "api_scale": 20.0, "risky": 0.15}
+           "api_break": 0.20, "api_scale": 20.0, "risky": 0.15, "uncovered": 0.10}
 # public types and members a recommended plan may break for users of the library (None: no limit);
 # --max-api-breaks overrides it. Every plan also pays a score penalty for what it breaks.
 MAX_API_BREAKS = {"strict": 10, "balanced": 30, "off": None}
@@ -138,11 +138,12 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict |
     side = max(len(sim.removed_smells) - (1 if benefit == 1.0 else 0), 0)
     scale = w["cost_scale"] * (1.0 + _size(sim, smell_type) / 5.0)   # bigger smells justify more change
     cost_n = plan.change_cost / (plan.change_cost + scale) if plan.change_cost else 0.0
-    api = check_summary.get("api_breaks", 0)
+    api = check_summary.get("api_expected", check_summary.get("api_breaks", 0))
     risky = check_summary.get("risky_classes", 0)
     total = (benefit - w["new_smell"] * new + w["side_removed"] * side - w["cost"] * cost_n
              - w["made_public"] * check_summary.get("made_public", 0)
-             - w["api_break"] * api / (api + w["api_scale"]) - w.get("risky", 0) * risky / (risky + 3))
+             - w["api_break"] * api / (api + w["api_scale"]) - w.get("risky", 0) * risky / (risky + 3)
+             - w.get("uncovered", 0) * check_summary.get("uncovered", 0))
     return {"score": round(total, 4), "benefit": round(benefit, 4), "new_smells": round(new, 3),
             "other_smells_removed": side, "cost_normalised": round(cost_n, 4)}
 
@@ -278,12 +279,19 @@ class Planner:
         summ = summarise(checks)
         api = api_breaks(self.model, ops, self.compat)
         summ["api_breaks"] = api["count"]
+        f = self.lessons.api_factor()
+        if f != 1.0:                                  # japicmp measured more (or fewer) changes than counted
+            summ["api_expected"] = round(api["count"] * f, 1)
         summ["api_covered_by_stubs"] = api["covered_by_stubs"]
         summ["api_examples"] = api["examples"]
         lesson = self.lessons.banned_reason(ops)
         if lesson:
             summ["status"] = "blocked"
             summ["lesson"] = lesson
+        cov = touched_coverage(self.rf, ops)
+        if cov is not None:
+            summ["coverage"] = round(cov, 3)
+            summ["uncovered"] = round(1 - cov, 3)
         risky = self.lessons.risky(ops)
         if risky:
             summ["risky_classes"] = len(risky)
@@ -402,6 +410,12 @@ class Planner:
         return out
 
     def plan_group(self, row) -> dict:
+        from .confidence import annotate
+        out = self._plan_group(row)
+        annotate(out, self.lessons.calibration(out["type"]), getattr(self.rf, "coverage", {}) or {})
+        return out
+
+    def _plan_group(self, row) -> dict:
         gid, t = row["group_id"], row["type"]
         scope = self.scopes.get(gid, {})
         kind = kind_of(t, row["level"])
@@ -503,6 +517,22 @@ class Planner:
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}
 
 
+def touched_classes(ops: list[dict]) -> set[str]:
+    out = set()
+    for o in ops:
+        for k in ("class", "from_class", "owner", "client", "provider"):
+            if o.get(k):
+                out.add(o[k])
+    return out
+
+
+def touched_coverage(rf, ops: list[dict]) -> float | None:
+    """Mean line coverage (baseline run) of the classes a plan changes; None when coverage was not measured."""
+    cov = getattr(rf, "coverage", None) or {}
+    vals = [cov[c] for c in touched_classes(ops) if c in cov]
+    return sum(vals) / len(vals) if vals else None
+
+
 def why_rejected(plans: list[dict]) -> str:
     """Why no candidate plan was recommended, from the evaluated candidates (with numbers)."""
     cands = [p for p in plans if p.get("operations") and "score" in p]
@@ -592,14 +622,18 @@ def write(result: dict, out_dir: str | Path) -> dict[str, Path]:
                          "operations": len(p["operations"]), "change_cost": p["change_cost"],
                          "remaining_in_model": p["remaining"], "score": p.get("score"),
                          "benefit": p.get("benefit"), "new_smells": p.get("new_smells"),
-                         "checks": (p.get("checks") or {}).get("status"), "gap": p["gap"], "seconds": p["seconds"]})
+                         "checks": (p.get("checks") or {}).get("status"), "gap": p["gap"], "seconds": p["seconds"],
+                         "confidence": (p.get("confidence") or {}).get("value"),
+                         "coverage": (p.get("checks") or {}).get("coverage")})
             for i, o in enumerate(p["operations"]):
                 rows.append({"group_id": g["group_id"], "plan": p["name"], "recommended": p["name"] == g["recommended"],
                              "step": i + 1, "op": o["op"],
                              "element": o.get("class") or o.get("member") or o.get("client", ""),
                              "from": o.get("from_package") or o.get("owner") or "",
                              "to": o.get("to_package") or o.get("import") or o.get("provider", ""),
-                             "check": o["check"]["status"], "notes": "; ".join(o["check"]["notes"])})
+                             "check": o["check"]["status"], "notes": "; ".join(o["check"]["notes"]),
+                             "planners_agreeing": o.get("planners_agreeing", ""),
+                             "confidence": o.get("confidence")})
         if not g["plans"]:
             summ.append({"group_id": g["group_id"], "type": g["type"], "rank": g["rank"], "plan": "",
                          "status": g.get("skipped", "")})

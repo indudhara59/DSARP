@@ -244,8 +244,10 @@ def prepare(repo: str | Path, tool: str = "auto", timeout: int = 7200) -> BuildR
         return BuildResult("none", False, [], 0.0, error="no pom.xml or Gradle build found")
     if tool == "maven":
         base = _maven(repo, offline=False)
+        from .baseline import jacoco_goals
+        agent, report = jacoco_goals()
         steps = [base + ["test-compile"] + SKIP_CHECKS,
-                 base + ["test", "-Dtest=DsarpNoSuchTest", "-Dsurefire.failIfNoSpecifiedTests=false",
+                 base + [agent, "test", report, "-Dtest=DsarpNoSuchTest", "-Dsurefire.failIfNoSpecifiedTests=false",
                          "-DfailIfNoTests=false"] + SKIP_CHECKS]
     else:
         exe = "./gradlew" if (repo / "gradlew").exists() else (shutil.which("gradle") or "gradle")
@@ -259,6 +261,10 @@ def prepare(repo: str | Path, tool: str = "auto", timeout: int = 7200) -> BuildR
         if i == 0 and not ok_i:
             ok = False
             break
+    if ok:                                          # japicmp, for the API check of accepted fixes (optional)
+        from . import apicheck
+        if apicheck.japicmp_jar() is None:
+            _run(apicheck.fetch_command(_maven(repo, offline=False)), repo, 900, env)
     _clear_reports(repo)
     return BuildResult(tool, ok, steps[0], round(time.time() - t0, 1), "\n".join(log.splitlines()[-40:]),
                        compiled=ok, error="" if ok else "the build failed (see the log)")

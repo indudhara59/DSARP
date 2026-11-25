@@ -263,6 +263,14 @@ def explain_group(rf: RepoFacts, group: dict, base: dict, llm=None) -> dict:
     sim = plan["simulation"]
     lines.append(f"- **Recommended plan:** `{plan['name']}` with {len(plan['operations'])} steps, "
                  f"score {plan['score']}, change cost {plan['change_cost']}")
+    conf = plan.get("confidence") or {}
+    if conf:
+        parts = [f"calibration {conf['calibration']} ({conf['verified_before']} plans of this type verified)"]
+        if conf.get("agreement") is not None:
+            parts.append(f"{round(100 * conf['agreement'])}% of the steps also chosen by other planners")
+        if conf.get("coverage") is not None:
+            parts.append(f"tests run {round(100 * conf['coverage'])}% of the lines of the changed classes")
+        lines.append(f"- **Confidence:** {conf['level']} ({conf['value']}): " + "; ".join(parts))
     lines.append(f"- **Effect:** {_target_text(group.get('kind', t), sim['target_before'], sim['target_after'])}")
     if sim["new_smells"]:
         lines.append("- **Side effects (new):** " + "; ".join(

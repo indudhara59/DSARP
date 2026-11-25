@@ -146,6 +146,29 @@ def summarise(results: str | Path) -> dict:
                 probs.append((min(max(float(p["benefit"]), 0.0), 1.0), 1.0 if v.get("target_removed") else 0.0))
         if probs:
             out["calibration"]["brier_benefit"] = round(sum((a - b) ** 2 for a, b in probs) / len(probs), 4)
+    # confidence against acceptance (Brier score, acceptance per confidence level)
+    bymap = {g["group_id"]: g for g in groups}
+    conf = []
+    for v in ver:
+        p = next((x for x in bymap.get(v["group_id"], {}).get("plans", []) if x["name"] == v.get("plan")), None)
+        c = (p or {}).get("confidence") or {}
+        if c.get("value") is not None:
+            conf.append((float(c["value"]), c.get("level", "?"), bool(v.get("accepted"))))
+    if conf:
+        lv = {}
+        for _, l, a in conf:
+            lv.setdefault(l, [0, 0])
+            lv[l][0] += a
+            lv[l][1] += 1
+        out["confidence"] = {"plans": len(conf), "brier": round(sum((c - a) ** 2 for c, _, a in conf) / len(conf), 4),
+                             "by_level": {k: {"accepted": a, "plans": n, "wilson": wilson(a, n)}
+                                          for k, (a, n) in lv.items()}}
+    # API changes measured with japicmp against the counts on the sources
+    api = [((v.get("api_breaks") or {}).get("count", 0), v["api_measured"]["count"]) for v in ver
+           if (v.get("api_measured") or {}).get("measured")]
+    if api:
+        out["api"] = {"measured_plans": len(api), "counted_on_sources": sum(a for a, _ in api),
+                      "measured": sum(b for _, b in api), "equal": sum(a == b for a, b in api)}
     # placebo and McNemar on the paired groups
     pl = load_verified(results, "placebo")
     if pl:
@@ -181,6 +204,21 @@ def write(results: str | Path) -> dict:
                   f"both {c['both']}"]
         if "brier_benefit" in c:
             lines.append(f"- Brier score of the predicted benefit as probability of removal: {c['brier_benefit']}")
+    if "confidence" in s:
+        c = s["confidence"]
+        lines += ["", "## Confidence against acceptance", "",
+                  f"- Brier score of the plan confidence as probability of acceptance: {c['brier']} "
+                  f"({c['plans']} verified plans)"]
+        for k in ("high", "medium", "low"):
+            if k in c["by_level"]:
+                v = c["by_level"][k]
+                p, lo, hi = v["wilson"]
+                lines.append(f"- {k}: {v['accepted']}/{v['plans']} accepted ({p:.0%}, 95 % CI {lo:.0%}-{hi:.0%})")
+    if "api" in s:
+        a = s["api"]
+        lines += ["", "## API changes (japicmp on accepted fixes)", "",
+                  f"- {a['measured_plans']} fixes measured: {a['measured']} binary-incompatible changes measured, "
+                  f"{a['counted_on_sources']} counted on the sources; equal for {a['equal']} fixes"]
     if "placebo" in s:
         pl = s["placebo"]
         p, lo, hi = pl["accepted_rate"]
