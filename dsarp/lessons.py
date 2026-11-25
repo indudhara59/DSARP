@@ -48,6 +48,7 @@ class Lessons:
         self.folder = Path(folder)
         self.file = self.folder / f"lessons{tag}.json"
         self.data = {"banned": {}, "banned_sets": [], "risky": {}, "log": []}
+        self.other_log: list[dict] = []                          # other shards' logs (read only)
         for f in sorted(self.folder.glob("lessons*.json")):      # every shard's file
             try:
                 d = json.loads(f.read_text())
@@ -59,6 +60,8 @@ class Lessons:
                 self.data["risky"].setdefault(c, v)
             if f == self.file:
                 self.data["log"] = d.get("log", [])
+            else:
+                self.other_log += d.get("log", [])
         self.added = 0
 
     # ------------------------------------------------------------------ reading (planner)
@@ -120,13 +123,34 @@ class Lessons:
             self.ban_set(hit, "reflection: " + "; ".join(refl.get("old_names_in_strings", [])
                                                          + refl.get("added_lookups", []))[:200], gid, "reflection")
         if rec.get("kept"):
-            self.data["log"].append({"group_id": gid, "plan": rec.get("plan"), "time": int(time.time()),
+            self.data["log"].append({"group_id": gid, "type": rec.get("type"), "plan": rec.get("plan"),
+                                     "time": int(time.time()),
                                      "predicted_removed": rec.get("predicted_removed"),
                                      "measured_removed": rec.get("target_removed"),
                                      "prediction_matches": rec.get("prediction_matches"),
                                      "status": st, "accepted": rec.get("accepted"), "level": rec.get("level"),
                                      "api_predicted": rec.get("api_predicted"),
-                                     "api_measured": (rec.get("api_breaks") or {}).get("count")})
+                                     "api_verify": (rec.get("api_breaks") or {}).get("count"),
+                                     "api_measured": ((rec.get("api_measured") or {}).get("count")
+                                                      if (rec.get("api_measured") or {}).get("measured") else None)})
+
+    def api_factor(self, minimum: int = 3) -> float:
+        """How the API changes japicmp measured on accepted fixes compare with the counts on the sources
+        (sum measured + 1) / (sum counted + 1), between 0.25 and 4; 1 until ``minimum`` fixes were measured.
+        The planner scales its predicted API cost with it."""
+        pairs = [(e["api_measured"], e["api_verify"]) for e in self.data["log"] + self.other_log
+                 if e.get("api_measured") is not None and e.get("api_verify") is not None]
+        if len(pairs) < minimum:
+            return 1.0
+        f = (sum(m for m, _ in pairs) + 1) / (sum(v for _, v in pairs) + 1)
+        return round(min(4.0, max(0.25, f)), 3)
+
+    def calibration(self, smell_type: str | None = None) -> tuple[float, int]:
+        """Share of verified plans (of a smell type) that were accepted, with a uniform prior: (1 + k) / (2 + n).
+        Returns the value and n."""
+        log = [e for e in self.data["log"] + self.other_log if smell_type is None or e.get("type") == smell_type]
+        k = sum(1 for e in log if e.get("accepted"))
+        return round((1 + k) / (2 + len(log)), 3), len(log)
 
     def reject_by_developer(self, ops: list[dict], reason: str, group: str) -> None:
         for o in ops:

@@ -719,6 +719,65 @@ benefit), and with `--placebo` random plans of the same size on the same groups
 (with the same follow-up edits) through exactly the same gate, compared with
 McNemar's exact test (`evaluation/stats.md`).
 
+### 7d3. Bytecode, coverage, measured API, confidence and step-wise patches (version 0.15)
+
+**Bytecode alignment** (`dsarp align results/<p> --repo <checkout>`, after
+`dsarp baseline`). The program model is extracted from the sources; the
+compiled classes the baseline wrote (`target/classes`, `build/classes/java/main`)
+are read with `jdeps -verbose:class` and compared with it
+(`model/bytecode_edges.csv`, `model/alignment.json`: pairs found in both, only
+in the sources, only in the bytecode). When every module with sources has
+compiled classes, the dependency graph the planner and the simulation use is
+the one the bytecode confirms (source-only pairs are dropped, bytecode-only
+pairs (e.g. from generated code) are added as `bytecode`
+dependencies); a partial graph is reported and not used. Precondition checks
+and the rewriter still read the sources.
+
+**Test coverage.** With Maven, the baseline runs the suite with the JaCoCo
+agent (`org.jacoco:jacoco-maven-plugin`, `DSARP_JACOCO_VERSION`, default
+0.8.12; downloaded by `dsarp prepare-build`) and keeps line coverage per class
+(`baseline/coverage.csv`; `--no-coverage` to skip). The planner charges plans
+that change code no test runs (weight `uncovered`), Verify records the
+coverage of the changed classes, and a plan whose changed classes are not run
+by any test (coverage 0) is not accepted (evidence level 2;
+`--allow-untested` overrides). Gradle projects and setups that override
+`argLine` without `@{argLine}` give no report; coverage is then not used.
+
+**Measured API changes.** For a plan that passes everything else, Verify packs
+the classes the baseline compiled and the classes compiled after the plan
+(with its compatibility stubs) into two jars and compares them with japicmp
+(binary-incompatible changes to public types and members: a removed type
+counts once, otherwise each method, constructor and field, and the type when
+its own declaration changed). The measured count replaces the count on the
+sources for the `--max-api-breaks` limit (`api_measured` in the result,
+`verify/<group>/api/japicmp.xml`). The jar comes from `DSARP_JAPICMP_JAR` or
+the Maven repository (`dsarp prepare-build` downloads
+`com.github.siom79.japicmp:japicmp:0.26.5:jar-with-dependencies`;
+`DSARP_JAPICMP_VERSION`); without it the count on the sources is used
+(`--no-api-measure`). The lessons store compares measured and counted
+changes; once three fixes were measured, the planner scales its predicted API
+cost by that ratio (`api_expected`). A moved class's destination module is now
+built too.
+
+**Confidence.** Every plan and step gets a confidence (plans.json, a
+`confidence` column in summary.csv and operations.csv, a line in the report):
+the share of verified plans of the same smell type that were accepted
+((1 + accepted) / (2 + verified), from the lessons log) times the softened
+share of steps that other candidate plans also chose (`planners_agreeing`,
+e.g. `2/4`) times the softened coverage of the changed classes (0.5 + 0.5 x;
+unknown = 0.75). Levels: high >= 0.5, medium >= 0.25, low. It is a ranking aid,
+not a probability; `dsarp stats` reports its Brier score and the acceptance
+per level against the verification.
+
+**Step-wise patches.** For an accepted fix with several steps, Verify writes
+`verify/<group>/steps/step_NN.patch`: the difference between the code with
+steps 1..i and with steps 1..i-1, each made from the clean checkout and
+committed in the working copy, so the fix can go in as small reviewable
+commits. Each prefix is compiled with the project's build; `checkpoints` lists
+the steps after which the code compiles (steps in between go in together).
+The compatibility stubs (`compat.patch`) come after the last step
+(`--no-step-patches` to skip).
+
 ### 7e. Sensitivity of the recommendations
 
 ```bash
@@ -915,6 +974,10 @@ Detector output of the study repositories is not stored in this repository.
     new smells on the compiled code, public API counted and limited, patches checked; compatibility stubs,
     test selection through configuration and modules, resources and OSGi exports, merging packages,
     sensitivity analysis, detector confirmation of accepted fixes, exact combined plan, sharded verification.
+11. **Phase A, safety and evidence** (0.14): full-suite baseline with flaky tests, safety rules, lessons store
+    and repair loop, frozen plans, evidence levels, statistics with a placebo.
+12. **Phase B, measured evidence** (0.15): bytecode alignment (jdeps), JaCoCo coverage, japicmp on accepted
+    fixes, confidence per plan and step, step-wise patches.
 
 ## Limitations and threats to validity
 
@@ -927,6 +990,8 @@ mitigation and how to measure it.
    fixes. *Measure:* accepted fixes per repository after Prepare build and
    Verify.
 2. **Public API.** Fixing structure in a library usually renames public types.
+   japicmp measures binary compatibility of accepted fixes (not source
+   compatibility, and not reflective or serialization use).
    Stubs keep old code compiling for one release, but the change still
    reaches users when the stubs are removed, and while they exist a moved
    class's cycle usually remains (`target_removed_with_stubs`). *Measure:* API
@@ -937,11 +1002,12 @@ mitigation and how to measure it.
    mediators, or change build modules; those groups get a reason and, if
    wanted, unverified design advice. *Measure:* share of groups with
    "needs a design change" or "no safe plan".
-4. **Behaviour.** Passing tests show only what the tests check. Coverage is
-   not measured; the selection follows code and configuration references, so
-   behaviour reached through reflection or generated code may be missed.
-   *Mitigation:* module tests as a fallback, untested changes are not
-   accepted.
+4. **Behaviour.** Passing tests show only what the tests check. Line
+   coverage (JaCoCo, Maven only) shows whether the changed classes are run at
+   all, not whether their behaviour is checked; the selection follows code and
+   configuration references, so behaviour reached through reflection or
+   generated code may be missed. *Mitigation:* module tests as a fallback,
+   untested and uncovered changes are not accepted.
 5. **Rewriting.** Class names built at run time (string concatenation,
    reflection on computed names) and generated code are not rewritten; the
    build and tests catch some of these, not all.

@@ -260,6 +260,11 @@ XML
 [ -f SKIPB ] || report b b.Tests <<XML
 <testsuite name="b"><testcase classname="b.Ok" name="t"/></testsuite>
 XML
+case "$*" in
+  *prepare-agent*) mkdir -p a/target/site/jacoco
+    printf 'GROUP,PACKAGE,CLASS,INSTRUCTION_MISSED,INSTRUCTION_COVERED,LINE_MISSED,LINE_COVERED\n' > a/target/site/jacoco/jacoco.csv
+    printf 'a,a,Svc,0,10,2,8\na,a,Svc.Inner,0,5,0,2\na,a,Dead,10,0,6,0\n' >> a/target/site/jacoco/jacoco.csv ;;
+esac
 exit 1
 """
 
@@ -415,3 +420,21 @@ def test_evidence_levels():
     assert evidence_level(_verified(accepted=False, status="breaks tests", build={"status": "breaks tests"})) == "2"
     assert evidence_level(_verified(accepted=False, status="removed", build={"status": "builds"})) == "2"
     assert evidence_level(_verified(accepted=False, status="made_worse")) == "3"
+
+
+def test_baseline_measures_coverage_and_untested_changes_are_not_accepted(suite, tmp_path):
+    from dsarp.plan.run import touched_coverage
+    from dsarp.verify import baseline as bsl
+    res = tmp_path / "res"
+    r = bsl.run(suite, res / "baseline", "maven", timeout=60, log=lambda *_: None)
+    assert r["coverage"]["classes"] == 2 and r["coverage"]["covered_classes"] == 1
+    cov = bsl.load_coverage(res)
+    assert cov == {"a.Svc": 0.8333, "a.Dead": 0.0}             # nested classes counted with their top-level class
+    rf = SimpleNamespace(coverage=cov)
+    assert touched_coverage(rf, [{"op": "move_class", "class": "a.Dead"}]) == 0.0
+    assert touched_coverage(rf, [{"op": "move_class", "class": "x.Unknown"}]) is None
+    st, ok, why = final_status(_verified(coverage={"mean": 0.0, "classes": 1, "uncovered": ["a.Dead"]}), 30)
+    assert not ok and "coverage 0" in why
+    from dsarp.verify.run import evidence_level
+    assert evidence_level(_verified(accepted=False, coverage={"mean": 0.0})) == "2"
+    assert final_status(_verified(coverage={"mean": 0.5, "classes": 2}), 30)[1]

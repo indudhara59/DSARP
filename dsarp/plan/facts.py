@@ -112,6 +112,8 @@ class RepoFacts:
         module = dict(zip(tl["type"], tl["build_module"].astype(str).where(tl["build_module"].astype(str) != "",
                                                                            tl["module"].astype(str))))
         d = model.deps
+        if getattr(model, "aligned", False):                # smell graphs follow the bytecode (Arcan)
+            d = d[d["in_bytecode"].astype(bool)]
         d = d.assign(st=d["source_type"].map(top), tt=d["target_type"].map(top))
         d = d[d["st"].isin(prod) & d["tt"].isin(prod) & (d["st"] != d["tt"])]
         edges: dict[tuple[str, str], ClassEdge] = {}
@@ -157,6 +159,8 @@ class RepoFacts:
         f.ext_users = allu[allu["sm"] != allu["tm"]].groupby("tt")["st"].nunique().astype(int).to_dict()
         f.api_policy = api_policy
         f.frozen = f._frozen(api_policy)
+        from ..verify.baseline import load_coverage
+        f.coverage = load_coverage(model.folder.parent)     # line coverage per class from the baseline run
         return f
 
     def _frozen(self, policy: str) -> dict[str, str]:

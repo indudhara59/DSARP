@@ -69,6 +69,23 @@ class Workspace:
                            capture_output=True, text=True)
         return r.returncode == 0
 
+    def head(self) -> str:
+        return _git(self.path, "rev-parse", "HEAD").stdout.strip()
+
+    def commit_all(self, message: str) -> str:
+        """Commit everything in the working copy (local to this working copy) and return the commit."""
+        _git(self.path, "add", "-A")
+        _git(self.path, "-c", "user.name=dsarp", "-c", "user.email=dsarp@localhost", "commit", "-q",
+             "--allow-empty", "--no-verify", "-m", message)
+        return self.head()
+
+    def reset_to(self, commit: str) -> None:
+        _git(self.path, "reset", "-q", "--hard", commit)
+        _git(self.path, "clean", "-qfd")
+
+    def diff_between(self, a: str, b: str) -> str:
+        return _git(self.path, "diff", "-M", "--stat", "--patch", a, b).stdout
+
     def remove(self) -> None:
         if self.git:
             _git(self.repo, "worktree", "remove", "--force", str(self.path), check=False)
