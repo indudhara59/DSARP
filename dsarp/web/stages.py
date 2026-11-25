@@ -94,7 +94,7 @@ STAGES: tuple[Stage, ...] = (
                    Option("remine", "--remine", "bool", False, "mine the history again")),
           resources=Resources(4, "16G", "04:00:00")),
     Stage("plan", "Plan", "5-6", "Solver plans, whole-repo simulation, tree search, score and checks",
-          outputs=("plans/plans.json", "plans/summary.csv"), requires=("triage",), optional_requires=("learn",),
+          outputs=("plans/plans.json", "plans/summary.csv"), requires=("triage",), optional_requires=("learn", "baseline", "align"),
           inner=("5a solver", "5b simulate", "5c search", "6 score + checks"),
           options=(Option("groups", "--groups", "int", 20, "top groups to plan", minimum=1),
                    Option("time_limit", "--time-limit", "float", 300.0, "solver seconds per plan", minimum=1),

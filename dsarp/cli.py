@@ -864,7 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--jdeps", default="jdeps")
     al.set_defaults(func=_cmd_align)
 
-    st = sub.add_parser("stats", help="evaluation: accepted fixes with 95 % confidence intervals, evidence levels, "
+    st = sub.add_parser("stats", help="evaluation: accepted fixes with 95 %% confidence intervals, evidence levels, "
                         "calibration, and (with --placebo) random plans through the same gate + McNemar's test")
     st.add_argument("results", nargs="+")
     st.add_argument("--placebo", type=int, default=0, help="groups to verify random plans of the same size for")
