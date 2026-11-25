@@ -438,3 +438,12 @@ def test_baseline_measures_coverage_and_untested_changes_are_not_accepted(suite,
     from dsarp.verify.run import evidence_level
     assert evidence_level(_verified(accepted=False, coverage={"mean": 0.0})) == "2"
     assert final_status(_verified(coverage={"mean": 0.5, "classes": 2}), 30)[1]
+
+
+def test_every_help_text_renders():
+    from dsarp.cli import build_parser
+    p = build_parser()
+    assert "stats" in p.format_help()
+    for a in p._subparsers._group_actions:
+        for name, sp in a.choices.items():
+            sp.format_help()
