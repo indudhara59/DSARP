@@ -107,6 +107,8 @@ STAGES: tuple[Stage, ...] = (
                           "public API that must not move", ("balanced", "strict", "off")),
                    Option("max_api_breaks", "--max-api-breaks", "int", None, "public types and members a plan may "
                           "change (empty = 10 strict, 30 balanced, no limit off; -1 = no limit)"),
+                   Option("no_widening", "--no-widening", "bool", False, "never make non-public elements public "
+                          "to allow a move"),
                    Option("compat", "--compat", "choice", "stubs", "deprecated stubs keep moved public classes "
                           "compiling for users (compat.patch)", ("stubs", "none")),
                    Option("explain", "--explain", "bool", True, "also write plans/report.md"),
@@ -136,6 +138,12 @@ STAGES: tuple[Stage, ...] = (
           outputs=("plans/report.md",), requires=("plan",),
           options=(Option("llm", "--llm", "choice", "none", "language model for the summary", ("none", "openai")),),
           resources=Resources(1, "4G", "00:30:00")),
+    Stage("stats", "Statistics", "E3", "Accepted fixes with 95 % confidence intervals, evidence levels, calibration "
+          "of the simulation; with a placebo, random plans of the same size through the same gate and McNemar's test",
+          outputs=("evaluation/stats.md",), requires=("verify",),
+          options=(Option("placebo", "--placebo", "int", 0, "groups to verify random plans for (0 = none)",
+                          minimum=0),),
+          resources=Resources(8, "32G", "12:00:00")),
     Stage("sensitivity", "Sensitivity", "E2", "How much the recommendations depend on the score weights (all "
           "groups) and on the thresholds (a sample of groups planned again)",
           outputs=("evaluation/sensitivity.md",), requires=("plan",),
@@ -146,6 +154,17 @@ STAGES: tuple[Stage, ...] = (
           "login node, which has the internet), so that Verify and Combined plan can build and run tests offline",
           outputs=("verify/build_ready.json",), requires=("checkout",), network=True,
           resources=Resources(4, "16G", "02:00:00")),
+    Stage("baseline", "Baseline", "8b", "Build the original code and run its full test suite once; failing "
+          "tests are re-run to find flaky ones. A partial baseline (build fails, run does not finish, a module's "
+          "tests do not run) means no plan can be proven",
+          outputs=("baseline/baseline.json",), requires=("prepare_build",),
+          options=(Option("reruns", "--reruns", "int", 3, "re-runs of failing tests", minimum=0),),
+          resources=Resources(8, "32G", "08:00:00")),
+    Stage("loop", "Repair loop", "8r", "Verify, learn from every failure (banned steps, risky classes), plan the "
+          "groups without an accepted fix again and verify again, until a round teaches nothing new",
+          outputs=("lessons/loop.json",), requires=("plan", "baseline"),
+          options=(Option("rounds", "--rounds", "int", 3, "rounds at most", minimum=1),),
+          resources=Resources(8, "32G", "24:00:00")),
     Stage("verify", "Verify", "8", "Apply plans to the code, compile, delta-debug, build and run the tests before "
           "and after, re-detect, check new smells and broken public API, write patches",
           outputs=("verify/verification.json", "verify/summary.csv"), requires=("plan", "checkout"),
@@ -280,7 +299,10 @@ def command(stage_id: str, p: Paths, values: dict | None = None) -> list[str]:
         "advise": ["advise", res],
         "explain": ["explain", res],
         "prepare_build": ["prepare-build", res, "--workdir", work],
+        "baseline": ["baseline", res, "--workdir", work],
+        "loop": ["loop", res, "--workdir", work],
         "sensitivity": ["sensitivity", res],
+        "stats": ["stats", res, "--workdir", work],
         "verify": ["verify", res, "--workdir", work],
         "combine": ["combine", res, "--workdir", work],
         "evaluate": ["evaluate", res],

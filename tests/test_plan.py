@@ -192,3 +192,80 @@ def test_sensitivity_of_weights_and_thresholds(project, tmp_path):
     assert "Score weights" in (res / "evaluation" / "sensitivity.md").read_text()
     from dsarp.plan import facts
     assert facts.MIN_FIT == 0.05                                           # constants restored afterwards
+
+
+def test_lessons_block_failed_steps_and_combinations(project, tmp_path):
+    import shutil as sh
+    from dsarp.lessons import Lessons, step_key
+    res = tmp_path / "res"
+    sh.copytree(project / "model", res / "model")
+    sh.copytree(project / "triage", res / "triage")
+    pl = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None,
+                 log=lambda *_: None)
+    row = next(r for _, r in pl.groups.iterrows() if r["type"] == "cyclic_dependency")
+    first = pl.plan_group(row)
+    rec = next(p for p in first["plans"] if p["name"] == first["recommended"])
+    step = {k: v for k, v in rec["operations"][0].items() if k != "check"}
+    # a verification found that this step breaks the build
+    les = Lessons(res / "lessons")
+    les.learn({"group_id": row["group_id"], "status": "breaks the build", "kept": 1}, [step], [])
+    les.save()
+    assert les.summary()["banned_steps"] == 1
+    pl2 = Planner(res / "model", res / "triage", backend="highs", time_limit=20, max_api_breaks=None,
+                  log=lambda *_: None)
+    again = pl2.plan_group(row)
+    banned = [p for p in again["plans"] if any(step_key(o) == step_key(step) for o in p["operations"])]
+    assert banned and all(p["checks"]["status"] == "blocked" and "failed before" in p["checks"]["lesson"]
+                          for p in banned)
+    assert again["recommended"] != first["recommended"] or again["recommended"] is None
+    # test failures: a combination is banned and the classes become risky
+    les2 = Lessons(res / "lessons2")
+    other = {"op": "move_class", "class": "x.Other", "from_package": "x", "to_package": "y"}
+    two = [step, other]
+    les2.learn({"group_id": "g", "status": "breaks tests", "kept": 2,
+                "build": {"reason": "1 tests fail", "new_failures": ["T#t"]}}, two, [])
+    assert les2.banned_reason(two) and not les2.banned_reason([step]) and not les2.banned_reason([other])
+    assert les2.risky([other]) == ["x.Other"]
+
+
+def test_repair_loop_runs_rounds_and_freezes(project, tmp_path):
+    import shutil as sh
+    from dsarp import loop
+    from dsarp.freeze import is_frozen
+    from tests.conftest import PROJECT
+    res = tmp_path / "res"
+    sh.copytree(project / "model", res / "model")
+    sh.copytree(project / "triage", res / "triage")
+    planner = Planner(res / "model", res / "triage", backend="highs", time_limit=10, max_api_breaks=None,
+                      log=lambda *_: None)
+    write(planner.run(2), res / "plans")
+    out = loop.run(res, PROJECT, rounds=3, time_limit=10, backend="highs",
+                   verifier_kwargs={"build_tool": "none"}, log=lambda *_: None)
+    assert out["rounds"][0]["verified"] >= 1
+    assert len(out["rounds"]) <= 3 and (res / "lessons" / "loop.json").exists()
+    assert is_frozen(res)
+    reg = json.loads((res / "plans" / "preregistration.json").read_text())
+    assert reg["snapshots"][0]["targets"] and "plans/plans.json" in reg["snapshots"][0]["inputs"]
+    v = json.loads((res / "verify" / "verification.json").read_text())
+    assert all(r["frozen"] for r in v)
+
+
+def test_stats_with_a_placebo_through_the_same_gate(project, tmp_path):
+    import shutil as sh
+    from dsarp.evaluate import stats
+    from tests.conftest import PROJECT
+    from dsarp.verify.run import Verifier
+    res = tmp_path / "res"
+    sh.copytree(project / "model", res / "model")
+    sh.copytree(project / "triage", res / "triage")
+    write(Planner(res / "model", res / "triage", backend="highs", time_limit=10, max_api_breaks=None,
+                  log=lambda *_: None).run(2), res / "plans")
+    Verifier(res, PROJECT, log=lambda *_: None, build_tool="none").run()
+    pl = stats.run_placebo(res, PROJECT, groups=2, verifier_kwargs={"build_tool": "none"}, log=lambda *_: None)
+    assert pl and all(r["plan"] == "placebo" for r in pl)
+    assert not (res / "lessons" / "lessons.json").exists() or "placebo" not in (res / "lessons" /
+                                                                                "lessons.json").read_text()
+    s = stats.write(res)
+    assert s["verified"] >= 1 and "placebo" in s and 0 <= s["placebo"]["mcnemar_p"] <= 1
+    md = (res / "evaluation" / "stats.md").read_text()
+    assert "95 % CI" in md and "Placebo" in md

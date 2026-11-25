@@ -57,7 +57,7 @@ SUPPORTED = {("cyclic_dependency", "package"), ("unstable_dependency", "package"
 ORIGINAL = {("cyclic_dependency", "package"), ("unstable_dependency", "package"), ("hub_like_dependency", "package")}
 LARGE_GROUP = 25
 WEIGHTS = {"new_smell": 0.25, "side_removed": 0.05, "cost": 0.30, "cost_scale": 20.0, "made_public": 0.01,
-           "api_break": 0.20, "api_scale": 20.0}
+           "api_break": 0.20, "api_scale": 20.0, "risky": 0.15}
 # public types and members a recommended plan may break for users of the library (None: no limit);
 # --max-api-breaks overrides it. Every plan also pays a score penalty for what it breaks.
 MAX_API_BREAKS = {"strict": 10, "balanced": 30, "off": None}
@@ -139,9 +139,10 @@ def score(plan: Plan, sim, check_summary: dict, smell_type: str, weights: dict |
     scale = w["cost_scale"] * (1.0 + _size(sim, smell_type) / 5.0)   # bigger smells justify more change
     cost_n = plan.change_cost / (plan.change_cost + scale) if plan.change_cost else 0.0
     api = check_summary.get("api_breaks", 0)
+    risky = check_summary.get("risky_classes", 0)
     total = (benefit - w["new_smell"] * new + w["side_removed"] * side - w["cost"] * cost_n
              - w["made_public"] * check_summary.get("made_public", 0)
-             - w["api_break"] * api / (api + w["api_scale"]))
+             - w["api_break"] * api / (api + w["api_scale"]) - w.get("risky", 0) * risky / (risky + 3))
     return {"score": round(total, 4), "benefit": round(benefit, 4), "new_smells": round(new, 3),
             "other_smells_removed": side, "cost_normalised": round(cost_n, 4)}
 
@@ -150,9 +151,10 @@ class Planner:
     def __init__(self, model_dir: str | Path, triage_dir: str | Path, backend: str = "auto",
                  time_limit: float = 60.0, log=print, affinity: str | Path | None = None,
                  search: str = "auto", search_time: float = 120.0, llm=None, api_policy: str = "balanced",
-                 max_api_breaks: int | None = -1, compat: str = "stubs"):
+                 max_api_breaks: int | None = -1, compat: str = "stubs", no_widening: bool = False):
         self.log = log
         self.compat = compat
+        self.no_widening = no_widening
         # -1: the default of the API policy; None: no limit
         self.max_api_breaks = MAX_API_BREAKS.get(api_policy) if max_api_breaks == -1 else max_api_breaks
         t0 = time.time()
@@ -173,6 +175,11 @@ class Planner:
         self.reported_by = _reported_by(triage_dir)
         self.scopes = json.loads((triage_dir / "scopes.json").read_text())
         self.rf.detector_note = detector_note(triage_dir.parent)
+        self.rf.no_widening = no_widening
+        from ..lessons import Lessons
+        self.lessons = Lessons(triage_dir.parent / "lessons")
+        if self.lessons.summary()["banned_steps"] or self.lessons.summary()["banned_combinations"]:
+            self.log("lessons: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in self.lessons.summary().items()))
         if self.rf.detector_note:
             self.log("note: " + self.rf.detector_note)
         self.backend, self.time_limit = backend, time_limit
@@ -273,6 +280,14 @@ class Planner:
         summ["api_breaks"] = api["count"]
         summ["api_covered_by_stubs"] = api["covered_by_stubs"]
         summ["api_examples"] = api["examples"]
+        lesson = self.lessons.banned_reason(ops)
+        if lesson:
+            summ["status"] = "blocked"
+            summ["lesson"] = lesson
+        risky = self.lessons.risky(ops)
+        if risky:
+            summ["risky_classes"] = len(risky)
+            summ["risky_examples"] = risky[:3]
         lim = self.max_api_breaks
         if lim is not None and api["count"] > lim:
             summ["status"] = "blocked"
@@ -377,7 +392,8 @@ class Planner:
             if plans and not any(p.operations for p in plans):
                 out["skipped"] = info.get("why_none") or ("no change that the planner can make reduces the smell "
                                                           "without breaking a rule (see the model information)")
-            elif any((e.get("checks") or {}).get("api_limit") for e in out["plans"]):
+            elif any((e.get("checks") or {}).get("api_limit") or (e.get("checks") or {}).get("lesson")
+                     for e in out["plans"]):
                 out["no_plan_reason"] = why_rejected(out["plans"])     # plans exist, but break too much public API
             elif info.get("why_none"):
                 out["no_plan_reason"] = info["why_none"]
@@ -481,6 +497,7 @@ class Planner:
         return {"groups": results, "backends": slv.available_backends(), "weights": WEIGHTS,
                 "affinity_model": self.affinity, "search": self.search, "api_policy": self.rf.api_policy,
                 "max_api_breaks": self.max_api_breaks, "compat": self.compat,
+                "no_widening": self.no_widening,
                 "frozen_classes": len(self.rf.frozen),
                 "llm": getattr(self.llm, "name", "none") if self.llm else "none",
                 "baseline_smells": {k: int(v) for k, v in self.sim.base["type"].value_counts().items()}}
@@ -499,6 +516,8 @@ def why_rejected(plans: list[dict]) -> str:
     parts = []
     if (p.get("checks") or {}).get("api_limit"):
         parts.append(p["checks"]["api_limit"])
+    if (p.get("checks") or {}).get("lesson"):
+        parts.append(p["checks"]["lesson"])
     if (p.get("checks") or {}).get("status") == "blocked" and (p.get("checks") or {}).get("blocked"):
         notes = [n for o in p["operations"] for n in (o.get("check") or {}).get("notes", [])
                  if (o.get("check") or {}).get("status") == "blocked"]

@@ -112,6 +112,10 @@ class Checker:
             chk.warn(rf.misfit_reason(c, new_pkg))
         if c[len(old_pkg) + 1:] in rf.simple_names.get(new_pkg, set()):
             chk.block(f"a class with the same name already exists in {new_pkg}")
+        # public API stays public: not into an internal or implementation package
+        internal = {"internal", "impl"}
+        if rf.api.get(c) and set(new_pkg.split(".")) & internal and not set(old_pkg.split(".")) & internal:
+            chk.block(f"public class would move into the internal package {new_pkg}, out of users' reach")
         if not new and rf.module.get(c) not in rf.pkg_modules.get(new_pkg, set()):
             chk.block(f"{new_pkg} is in another build module")
         if new:
@@ -149,6 +153,15 @@ class Checker:
             for tgt_t, target in zip(h["tt"], h["target"]):
                 if self._pkg(tgt_t, after) == old_pkg and self._vis(target) in NON_PUBLIC:
                     uses_widen.add(target)
+        # created through a hidden constructor in its package: moving it would need a wider constructor
+        hidden = sorted({str(t) for src_t, t in zip(g["st"], g["target"]) if g is not None
+                         and "#<init>(" in str(t) and str(t).startswith(c + "#") and self._vis(str(t)) in NON_PUBLIC
+                         and src_t != c and self._pkg(src_t, after) == old_pkg}) if g is not None else []
+        if hidden:
+            chk.block(f"classes in {old_pkg} create it through a non-public constructor ({hidden[0].split('#')[1]})")
+        if (widen or uses_widen) and getattr(rf, "no_widening", False):
+            chk.block(f"the move needs {len(widen | uses_widen)} non-public elements made public, and widening is "
+                      "switched off (--no-widening)")
         if widen:
             chk.warn(f"{len(widen)} non-public elements of the class are used from other packages")
             chk.edits.append({"edit": "make_public", "elements": self._limit(widen)})

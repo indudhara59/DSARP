@@ -50,7 +50,8 @@ def rescore(p: dict, w: dict) -> float | None:
         return None
     ch = p.get("checks") or {}
     api = ch.get("api_breaks", 0) or 0
-    return (p["benefit"] - w["new_smell"] * (p.get("new_smells") or 0)
+    risky = ch.get("risky_classes", 0) or 0
+    return (p["benefit"] - w["new_smell"] * (p.get("new_smells") or 0) - w.get("risky", 0) * risky / (risky + 3)
             + w["side_removed"] * (p.get("other_smells_removed") or 0)
             - w["cost"] * (p.get("cost_normalised") or 0) - w["made_public"] * (ch.get("made_public") or 0)
             - w["api_break"] * api / (api + w["api_scale"]))

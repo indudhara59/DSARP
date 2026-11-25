@@ -139,6 +139,10 @@ def build(results: str | Path) -> str:
     if verify:
         acc = sum(1 for g in groups if accepted(vmap.get(g["group_id"])))
         built = sum(1 for v in verify if (v.get("build") or {}).get("status") not in (None, "not built"))
+        from .verify.run import LEVELS
+        lv = Counter(v.get("level") or "?" for v in verify)
+        cards += [("evidence levels", " · ".join(f"{k}: {lv[k]}" for k in ("4c", "4b", "4a", "3", "2", "1")
+                                                 if lv.get(k)) or "none")]
         cards += [("accepted fixes", f"{acc}/{len(verify)}"),
                   ("removed (verified)", counts["removed"]), ("reduced (verified)", counts["reduced"]),
                   ("break the build or tests", counts["breaks the build"] + counts["breaks tests"]
@@ -149,6 +153,9 @@ def build(results: str | Path) -> str:
     cards += [("no safe plan", counts["no safe plan"]), ("needs a design change", counts["needs a design change"])]
     parts.append("<div class='cards'>" + "".join(f"<div class='card'><b>{html.escape(str(v))}</b>{k}</div>"
                                                 for k, v in cards) + "</div>")
+    from .verify.run import LEVELS
+    parts.append("<p><b>Evidence levels</b>: " + "; ".join(f"<b>{k}</b> {html.escape(t)}" for k, t in LEVELS.items())
+                 + ".</p>")
     parts.append("<p><b>Accepted fix</b>: the smell is removed or reduced on the compiled code, the project's own "
                  "build compiles the change (libraries included), the tests that use a changed class and passed "
                  "before still pass, no new smell appears, the patch applies to a clean checkout and at most "
@@ -174,6 +181,7 @@ def build(results: str | Path) -> str:
                    "steps": f"{v['kept']}/{v['operations']} kept" if v else (len(p["operations"]) if p else ""),
                    "score": p.get("score", "") if p else "",
                    "accepted": ("yes" if v.get("accepted") else "no") if v else "",
+                   "level": (v.get("level") or "") if v else ("0" if not name else ""),
                    "checked by": (v.get("build") or {}).get("check", "") if v else "",
                    "public API changed": (v.get("api_breaks") or {}).get("count", "") if v else
                    ((p or {}).get("checks") or {}).get("api_breaks", ""),

@@ -110,6 +110,11 @@ SKIP_CHECKS = ["-Drat.skip=true", "-Dcheckstyle.skip=true", "-Denforcer.skip=tru
 
 
 OUTPUT_DIRS = ("target/classes", "target/test-classes", "build/classes")
+SKIP_PARTS = {".git", "target", "build", "node_modules", ".gradle"}
+
+
+def offline_default() -> bool:
+    return os.environ.get("DSARP_BUILD_OFFLINE", "1").lower() not in ("0", "false", "no")
 
 
 def _clear_reports(repo: Path, outputs: bool = True) -> None:
@@ -121,33 +126,39 @@ def _clear_reports(repo: Path, outputs: bool = True) -> None:
                 shutil.rmtree(p, ignore_errors=True)
 
 
-def test_reports(repo: str | Path) -> tuple[int, list[str]]:
-    """Tests run and failing tests (``Class#method``) from the JUnit XML reports of Maven and Gradle."""
+def test_results(repo: str | Path) -> dict[str, bool]:
+    """Every test case in the JUnit XML reports of Maven and Gradle: ``Class#method`` -> passed."""
     import xml.etree.ElementTree as ET
     repo = Path(repo)
-    run, failing = 0, []
+    out: dict[str, bool] = {}
     for d in REPORT_DIRS:
         for f in repo.glob(f"**/{d}/**/TEST-*.xml"):
             try:
                 root = ET.parse(f).getroot()
             except ET.ParseError:
-                failing.append(f"{f.stem[5:]} (unreadable report)")
+                out[f"{f.stem[5:]} (unreadable report)"] = False
                 continue
             suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
             for su in suites:
                 for tc in su.findall("testcase"):
                     if tc.find("skipped") is not None:
                         continue
-                    run += 1
-                    if tc.find("failure") is not None or tc.find("error") is not None:
-                        failing.append(f"{tc.get('classname') or su.get('name')}#{tc.get('name')}")
-    return run, sorted(set(failing))
+                    key = f"{tc.get('classname') or su.get('name')}#{tc.get('name')}"
+                    ok = tc.find("failure") is None and tc.find("error") is None
+                    out[key] = out.get(key, True) and ok          # a re-run of the same test: both must pass
+    return out
 
 
-def _run(cmd: list[str], repo: Path, timeout: int) -> tuple[bool, str, bool]:
+def test_reports(repo: str | Path) -> tuple[int, list[str]]:
+    """Tests run and failing tests (``Class#method``) from the JUnit XML reports of Maven and Gradle."""
+    r = test_results(repo)
+    return len(r), sorted(k for k, ok in r.items() if not ok)
+
+
+def _run(cmd: list[str], repo: Path, timeout: int, env: dict | None = None) -> tuple[bool, str, bool]:
     """(success, output, finished in time)."""
     try:
-        r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
         return r.returncode == 0, r.stdout + r.stderr, True
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -164,6 +175,11 @@ def _maven(repo: Path, offline: bool) -> list[str]:
     return cmd
 
 
+def _gradle(repo: Path, offline: bool) -> list[str]:
+    exe = "./gradlew" if (repo / "gradlew").exists() else (shutil.which("gradle") or "gradle")
+    return [exe, "--console=plain", "-q"] + (["--offline"] if offline else [])
+
+
 def build(repo: str | Path, modules: list[str], tests: list[str], tool: str = "auto", timeout: int | None = None,
           offline: bool | None = None, test_timeout: int | None = None) -> BuildResult:
     """Compile the affected modules (main and test code) with the project's own build, then run the selected tests.
@@ -176,7 +192,9 @@ def build(repo: str | Path, modules: list[str], tests: list[str], tool: str = "a
     timeout = timeout or int(os.environ.get("DSARP_BUILD_TIMEOUT", "3600"))
     test_timeout = test_timeout or int(os.environ.get("DSARP_TEST_TIMEOUT", "1800"))
     if offline is None:
-        offline = os.environ.get("DSARP_BUILD_OFFLINE", "1").lower() not in ("0", "false", "no")
+        offline = offline_default()
+    from .baseline import build_env
+    env = build_env(repo)
     tool = detect_tool(repo, tool)
     if tool is None:
         return BuildResult("none", False, [], 0.0, error="no pom.xml or Gradle build found", tests=tests)
@@ -188,20 +206,19 @@ def build(repo: str | Path, modules: list[str], tests: list[str], tool: str = "a
         test_cmd = base + ["test", "-Dtest=" + ",".join(simple), "-Dsurefire.failIfNoSpecifiedTests=false",
                            "-DfailIfNoTests=false", "-Dsurefire.timeout=600"] + SKIP_CHECKS
     else:
-        exe = "./gradlew" if (repo / "gradlew").exists() else (shutil.which("gradle") or "gradle")
-        g = [exe, "--console=plain", "-q"] + (["--offline"] if offline else [])
+        g = _gradle(repo, offline)
         tasks = [f":{m.replace('/', ':')}:" for m in mods] or [":"]
         compile_cmd = g + [tk + "testClasses" for tk in tasks]
         test_cmd = g + ["--continue"] + [x for tk in tasks for x in [tk + "test"] + [y for s in simple
                                                                                        for y in ("--tests", f"*{s}")]]
     t0 = time.time()
     _clear_reports(repo)
-    ok, log, finished = _run(compile_cmd, repo, timeout)
+    ok, log, finished = _run(compile_cmd, repo, timeout, env)
     res = BuildResult(tool, False, compile_cmd, 0.0, "\n".join(log.splitlines()[-40:]), tests, compiled=ok)
     if not ok:
         res.error = "the build did not finish in time" if not finished else "compilation failed"
     elif simple:
-        ok_t, log_t, finished = _run(test_cmd, repo, test_timeout)
+        ok_t, log_t, finished = _run(test_cmd, repo, test_timeout, env)
         res.command = test_cmd
         res.log_tail = "\n".join(log_t.splitlines()[-40:])
         res.tests_finished = finished
@@ -234,9 +251,11 @@ def prepare(repo: str | Path, tool: str = "auto", timeout: int = 7200) -> BuildR
         exe = "./gradlew" if (repo / "gradlew").exists() else (shutil.which("gradle") or "gradle")
         steps = [[exe, "--console=plain", "testClasses"], [exe, "--console=plain", "test", "--tests", "DsarpNoSuchTest",
                                                            "--continue"]]
+    from .baseline import build_env
+    env = build_env(repo)
     t0, ok, log = time.time(), True, ""
     for i, cmd in enumerate(steps):
-        ok_i, log, finished = _run(cmd, repo, timeout)
+        ok_i, log, finished = _run(cmd, repo, timeout, env)
         if i == 0 and not ok_i:
             ok = False
             break

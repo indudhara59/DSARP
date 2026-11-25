@@ -391,6 +391,64 @@ def _cmd_sensitivity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stats(args: argparse.Namespace) -> int:
+    import json
+
+    from .evaluate import stats
+    for d in map(Path, args.results):
+        if args.placebo:
+            meta = json.loads((d / "model" / "model.json").read_text())
+            repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+            stats.run_placebo(d, repo, args.placebo, args.seed, {"build_tool": args.build})
+        s = stats.write(d)
+        p, lo, hi = s["accepted_of_groups"]
+        print(f"{d.name}: {s['accepted']}/{s['groups']} groups with an accepted fix ({p:.0%}, 95 % CI "
+              f"{lo:.0%}-{hi:.0%})" + (f"; placebo {s['placebo']['accepted']}/{s['placebo']['groups']}, McNemar p = "
+                                       f"{s['placebo']['mcnemar_p']:.4f}" if "placebo" in s else ""))
+        print(f"  written: {d / 'evaluation' / 'stats.md'}")
+    return 0
+
+
+def _cmd_loop(args: argparse.Namespace) -> int:
+    import json
+
+    from .loop import run
+    for d in map(Path, args.results):
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        out = run(d, repo, rounds=args.rounds, time_limit=args.time_limit, backend=args.backend,
+                  verifier_kwargs={"build_tool": args.build, "memory": args.memory})
+        print(f"{d.name}: {len(out['rounds'])} rounds, {out['accepted_total']} accepted fixes; lessons: "
+              + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in out["lessons"].items()))
+    return 0
+
+
+def _cmd_freeze(args: argparse.Namespace) -> int:
+    from .freeze import freeze
+    for d in map(Path, args.results):
+        s = freeze(d)
+        print(f"{d.name}: {len(s['targets'])} plans frozen, {len(s['inputs'])} inputs hashed "
+              f"(plans.json {s['plans_sha256'][:12]})")
+    return 0
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    import json
+
+    from .verify import baseline as bsl
+    status = 0
+    for d in map(Path, args.results):
+        meta = json.loads((d / "model" / "model.json").read_text())
+        repo = Path(args.repo) if args.repo else Path(args.workdir) / meta["repo"]
+        r = bsl.run(repo, d / "baseline", args.build, args.timeout, args.reruns)
+        state = "complete" if r["complete"] else "PARTIAL: " + "; ".join(r["reasons"])
+        print(f"{d.name}: {r['tests_run']} tests, {len(r['failing'])} failing, {len(r['flaky'])} flaky; "
+              f"{state} [{r['seconds']:.0f} s]")
+        if not r["complete"]:
+            status = 1
+    return status
+
+
 def _cmd_prepare_build(args: argparse.Namespace) -> int:
     import json
 
@@ -443,6 +501,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                      max_api_breaks=(-1 if args.max_api_breaks is None else
                                      None if args.max_api_breaks < 0 else args.max_api_breaks),
                      allow_untested=args.allow_untested, shard=shard,
+                     allow_partial_baseline=args.allow_partial_baseline,
                      run_tests=not args.no_tests, max_compiles=args.max_compiles, detector_cmds=cmds)
         v.run(args.groups, set(args.group) if args.group else None)
         print(f"  written: {d / 'verify'}")
@@ -580,7 +639,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                           api_policy=args.api_policy,
                           max_api_breaks=(-1 if args.max_api_breaks is None else
                                           None if args.max_api_breaks < 0 else args.max_api_breaks),
-                          compat=args.compat)
+                          compat=args.compat, no_widening=args.no_widening)
         if affinity:
             print(f"  learned affinity: {affinity}")
         types = set(args.types.split(",")) if args.types else None
@@ -667,6 +726,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--max-api-breaks", type=int, help="public types and members a recommended plan may change for "
                     "users of the library (default: 10 with strict, 30 with balanced, no limit with off; "
                     "a negative number: no limit)")
+    pl.add_argument("--no-widening", action="store_true", help="never make non-public classes or members public "
+                    "to allow a move (moves that need it are not planned)")
     pl.add_argument("--compat", default="stubs", choices=["stubs", "none"],
                     help="stubs (default): moved public classes keep a deprecated stub at the old place (delivered as "
                          "compat.patch), so they do not count as API breaks; none: every move counts")
@@ -771,6 +832,43 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--build", default="auto", choices=["auto", "maven", "gradle"])
     pb.set_defaults(func=_cmd_prepare_build)
 
+    st = sub.add_parser("stats", help="evaluation: accepted fixes with 95 % confidence intervals, evidence levels, "
+                        "calibration, and (with --placebo) random plans through the same gate + McNemar's test")
+    st.add_argument("results", nargs="+")
+    st.add_argument("--placebo", type=int, default=0, help="groups to verify random plans of the same size for")
+    st.add_argument("--seed", type=int, default=7)
+    st.add_argument("--workdir", default="work")
+    st.add_argument("--repo")
+    st.add_argument("--build", default="auto", choices=["none", "auto", "maven", "gradle"])
+    st.set_defaults(func=_cmd_stats)
+
+    lp = sub.add_parser("loop", help="repair loop: verify, learn from failures, plan the open groups again, verify "
+                        "again, until a round teaches nothing new")
+    lp.add_argument("results", nargs="+")
+    lp.add_argument("--workdir", default="work")
+    lp.add_argument("--repo")
+    lp.add_argument("--rounds", type=int, default=3)
+    lp.add_argument("--time-limit", type=float, default=60.0, help="solver seconds per group when planning again")
+    lp.add_argument("--backend", default="auto", choices=["auto", "cpsat", "highs"])
+    lp.add_argument("--build", default="auto", choices=["none", "auto", "maven", "gradle"])
+    lp.add_argument("--memory", default="8g")
+    lp.set_defaults(func=_cmd_loop)
+
+    fz = sub.add_parser("freeze", help="record the plans and the SHA-256 of every input before verification "
+                        "(verify does this automatically)")
+    fz.add_argument("results", nargs="+")
+    fz.set_defaults(func=_cmd_freeze)
+
+    bs = sub.add_parser("baseline", help="build the original code and run the full test suite once (flaky tests "
+                        "re-run); verify compares every plan with it")
+    bs.add_argument("results", nargs="+")
+    bs.add_argument("--workdir", default="work", help="folder with the checkouts")
+    bs.add_argument("--repo", help="checkout folder (default: <workdir>/<name>)")
+    bs.add_argument("--build", default="auto", choices=["auto", "maven", "gradle"])
+    bs.add_argument("--timeout", type=int, help="seconds for the build and for the test suite (default 14400)")
+    bs.add_argument("--reruns", type=int, default=3, help="re-runs of failing tests to find flaky ones")
+    bs.set_defaults(func=_cmd_baseline)
+
     ve = sub.add_parser("verify", help="stage 8: apply the recommended plans to the code, compile, detect again")
     ve.add_argument("results", nargs="+")
     ve.add_argument("--workdir", default="work", help="folder with the checkouts")
@@ -784,6 +882,8 @@ def build_parser() -> argparse.ArgumentParser:
     ve.add_argument("--shard", help="i/n: verify only every n-th group starting at i (parallel Slurm jobs); "
                     "then run dsarp verify --merge")
     ve.add_argument("--merge", action="store_true", help="merge the results of all shards into verification.json")
+    ve.add_argument("--allow-partial-baseline", action="store_true", help="verify against a partial baseline "
+                    "(exploration only: no plan is proven then)")
     ve.add_argument("--allow-untested", action="store_true", help="accept fixes that build but that no test runs "
                     "(default: a fix needs at least one test of the changed code or its module)")
     ve.add_argument("--max-api-breaks", type=int, help="public types and members an accepted fix may change "

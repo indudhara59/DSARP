@@ -271,6 +271,18 @@ def _inputs(cfg: RepoConfig) -> list[dict]:
     return out
 
 
+def _input_hashes(cfg: RepoConfig) -> dict[str, str]:
+    """SHA-256 of every detector output file read (reproducibility: the same input gives the same plans)."""
+    from .freeze import sha256
+    out = {}
+    for inp in cfg.detectors:
+        p = Path(inp.path)
+        files = [p] if p.is_file() else sorted(x for x in p.rglob("*") if x.is_file()) if p.is_dir() else []
+        for f in files[:2000]:
+            out[f"{inp.tool}:{f.as_posix()}"] = sha256(f)
+    return out
+
+
 def ingest(cfg: RepoConfig) -> IngestResult:
     """Run stages 0 and 1 for one repository configuration."""
     results = [detectors.load(d) for d in cfg.detectors]
@@ -306,6 +318,7 @@ def ingest(cfg: RepoConfig) -> IngestResult:
         },
         "warnings": warnings,
         "build_output": build_output,
+        "input_sha256": _input_hashes(cfg),
     }
     return IngestResult(cfg, commit, smells, components, manifest, warnings)
 
