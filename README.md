@@ -455,7 +455,9 @@ Another model: `DSARP_LLM_MODEL=<id>` when downloading and submitting.
 
 ```bash
 dsarp prepare-build results/tika --workdir work           # once, with internet (login node): build dependencies
+dsarp baseline results/tika --workdir work                # once: build + full test suite, flaky tests re-run
 dsarp verify results/tika --workdir work                  # compile, delta debugging, build + tests, re-detection
+dsarp loop results/tika --workdir work --rounds 3         # verify, learn from failures, plan again, verify again
 dsarp verify results/tika --workdir work --build none     # compiler check only (no plan is then an accepted fix)
 dsarp verify results/tika --arcan-cmd "java -jar arcan.jar -i {repo} -o {out}"   # also re-run a detector
 ```
@@ -661,6 +663,61 @@ in a separate file so raters are not influenced. `rating agreement` reports
 the share of sensible steps per rater and smell type, Cohen's (two raters) or
 Fleiss' kappa (more), the majority verdict, and each rater's agreement with
 the language-model review.
+
+### 7d2. Baseline, safety rules, lessons and the repair loop (version 0.14)
+
+**Baseline first.** `dsarp baseline` builds the original code once and runs
+its **full test suite**; every failing test is re-run up to three times: one
+that passes is **flaky**, one that fails every time **failed already**.
+Neither is ever blamed on a plan. The baseline is **partial** when the build
+fails, the run does not finish, or a module with tests produced no report;
+then no plan can be an accepted fix (`--allow-partial-baseline` for
+exploration). Verify compares every plan with this baseline instead of
+building the original code again for each plan, and re-runs the tests a plan
+newly fails up to three times before blaming it. The JDK is chosen from the
+project's Java level (`maven.compiler.release`, `source`, Gradle
+`sourceCompatibility` or toolchain) when `DSARP_JDK_<n>` variables point to
+installed JDKs.
+
+**Safety rules** (from failed builds in the cycle-repair-loop experiments of
+the DSARP team): a class that other classes of its package create through a
+non-public constructor is not moved; a public class does not move into an
+`internal` or `impl` package; `--no-widening` forbids making anything public
+to allow a move; a plan that adds reflective lookups to a file
+(`Class.forName`, `getMethod`, `ServiceLoader.load`, ...) or leaves a moved
+class's old name in a string is not accepted (reflection gate).
+
+**Lessons store** (`lessons/lessons*.json`). Every verification teaches:
+steps that delta debugging dropped, the only step of a plan that broke the
+build, tests or the reflection gate, and developers' rejections become
+**banned steps**; the steps of a plan that broke the build or tests or created
+new smells, when the culprit is not known, become a **banned combination**;
+classes changed when tests failed become **risky** (they cost more to move);
+and what the simulation predicted is logged next to what was measured. The
+planner blocks plans with banned steps or combinations (with the reason) and
+charges risky classes. `dsarp loop` verifies, re-plans the groups without an
+accepted fix with the lessons, and verifies the new plans, until a round adds
+no lesson (`lessons/loop.json`).
+
+**Frozen plans.** Before verification, `plans/preregistration.json` records
+every recommended plan (steps, predicted benefit and API changes), the
+settings and the SHA-256 of every input (detector output hashes are also in
+the ingest manifest); each verified result says whether its plans were frozen
+(`frozen`, `plans_sha256`). Each round of the loop is frozen separately.
+
+**Evidence levels.** Every verified plan gets a grade: **0** no plan, **1**
+does not build (or could not be built), **2** builds but tests fail, do not
+finish or no test runs it, **3** builds and tests pass but no improvement or
+unsafe (new smells, API limit, patch, reflection), **4a** accepted, smell
+reduced, **4b** accepted, removed by DSARP's measurement, **4c** accepted,
+removed and the original detectors agree.
+
+**Statistics** (`dsarp stats results/<p> [--placebo N]`): accepted fixes per
+group and smell type with 95 % Wilson intervals, evidence levels, calibration
+of the simulation (agreement on "removed", Brier score of the predicted
+benefit), and with `--placebo` random plans of the same size on the same groups
+(with the same follow-up edits) through exactly the same gate, compared with
+McNemar's exact test (`evaluation/stats.md`).
 
 ### 7e. Sensitivity of the recommendations
 

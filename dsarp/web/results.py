@@ -121,6 +121,8 @@ def numbers(res: Path) -> dict:
                          "equal_to_simulation": sum(1 for v in vj if v.get("prediction_matches")),
                          "next_best_used": sum(1 for v in vj if v.get("fallback_from")),
                          "accepted": sum(1 for v in vj if v.get("accepted")),
+                         "levels": {k: sum(1 for v in vj if v.get("level") == k)
+                                    for k in ("4c", "4b", "4a", "3", "2", "1")},
                          "built": sum(1 for v in vj if (v.get("build") or {}).get("status") not in (None, "not built")),
                          "build_or_tests_fail": sum(1 for v in vj if (v.get("build") or {}).get("status") in
                                                     ("breaks the build", "breaks tests", "tests did not finish")),

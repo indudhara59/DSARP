@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import shutil
 import time
 from collections import Counter
@@ -49,9 +50,13 @@ class Verifier:
                  memory: str = "4g", classpath: str = "", build_tool: str = "auto", run_tests: bool = True,
                  max_compiles: int = 30, detector_cmds: dict[str, str] | None = None, log=print,
                  max_api_breaks: int | None = -1, compat: str | None = None, allow_untested: bool = False,
-                 shard: tuple[int, int] | None = None):
+                 shard: tuple[int, int] | None = None, allow_partial_baseline: bool = False,
+                 out_name: str = "verify", plans_file: str | Path | None = None, learn: bool = True):
         self.results, self.repo = Path(results), Path(repo)
-        self.workdir = Path(workdir) if workdir else self.results / "verify" / "work"
+        self.vdir = self.results / out_name                 # verify/ (placebo: placebo/)
+        self.plans_file = Path(plans_file) if plans_file else self.results / "plans" / "plans.json"
+        self.learn = learn
+        self.workdir = Path(workdir) if workdir else self.vdir / "work"
         self.memory, self.classpath, self.log = memory, classpath, log
         self.build_tool, self.run_tests, self.max_compiles = build_tool, run_tests, max_compiles
         self._base_builds: dict[tuple, object] = {}      # builds of the original code, per modules and tests
@@ -63,8 +68,13 @@ class Verifier:
         self.max_api_breaks = max_api_breaks
         self.compat = meta.get("compat", "none") if compat is None else compat
         self.allow_untested = allow_untested
+        from . import baseline as bsl
+        from ..lessons import Lessons
+        self.base_info = bsl.load(self.results)          # the baseline stage (full suite, flaky tests)
+        self.allow_partial_baseline = allow_partial_baseline
         self.shard = shard                                # (i, n): verify every n-th group starting at i
         self.tag = f"-shard{shard[0]}of{shard[1]}" if shard else ""
+        self.lessons = Lessons(self.results / "lessons", self.tag)
         self.detector_cmds = detector_cmds or {}
         self.model = ProgramModel(self.results / "model")
         self.meta = json.loads((self.results / "model" / "model.json").read_text())
@@ -89,7 +99,7 @@ class Verifier:
             # compile a clean copy at the analysed commit (the checkout itself may have local changes)
             with Workspace(self.repo, self.workdir / f"baseline{self.tag}", self.meta.get("commit")) as ws:
                 self._baseline = cmp.compile_tree(ws.path, self.rw.java_files, self.roots,
-                                                  self.results / "verify" / f"baseline{self.tag}", self.classpath,
+                                                  self.vdir / f"baseline{self.tag}", self.classpath,
                                                   self.memory)
             self.log(f"baseline compile: {len(self._baseline.errors)} errors (missing libraries) "
                      f"in {time.time() - t0:.0f} s")
@@ -107,6 +117,25 @@ class Verifier:
                              self.symbols | {n.rsplit(".", 1)[-1] for n in res.created_types},
                              set(renamed.values()) | set(res.created_types), self.packages, ws.path)
         return new.empty, res, comp, new
+
+    def _settle_flaky(self, path: Path, cmpb: dict, after_b) -> dict:
+        """Re-run the tests that newly failed up to three times: one that passes is flaky, not broken."""
+        from . import baseline as bsl
+        still, flaky = set(cmpb["new_failures"]), set()
+        for _ in range(bsl.RERUNS):
+            if not still:
+                break
+            passed = bsl.rerun(path, sorted(still), after_b.tool, bsl.build_env(path))
+            flaky |= passed
+            still -= passed
+        out = {**cmpb, "new_failures": sorted(still), "flaky": sorted(flaky)}
+        if not still:
+            out.update(status="builds and tests pass",
+                       reason=f"{after_b.tests_run} tests ran; {len(flaky)} failed once and passed when re-run (flaky)")
+        else:
+            out["reason"] = (f"{len(still)} tests fail that passed before, also when re-run (e.g. {sorted(still)[0]})"
+                             + (f"; {len(flaky)} flaky" if flaky else ""))
+        return out
 
     def _compat(self, ws: Workspace, group: dict, res, kept_ops: list[dict], out: Path) -> dict:
         """Deprecated stubs for moved public classes: written, compiled with the plan, kept when they compile;
@@ -160,10 +189,11 @@ class Verifier:
 
     def verify_plan(self, group: dict, plan: dict, sub: str | None = None) -> dict:
         gid = group["group_id"]
-        out = self.results / "verify" / gid / sub if sub else self.results / "verify" / gid
+        out = self.vdir / gid / sub if sub else self.vdir / gid
         out.mkdir(parents=True, exist_ok=True)
         ops = [{k: v for k, v in o.items() if k != "check"} for o in plan["operations"]]
         checks = [o.get("check", {}) for o in plan["operations"]]
+        kept_ops: list[dict] = []
         t0 = time.time()
         rec = {"group_id": gid, "type": group["type"], "plan": plan["name"], "operations": len(ops)}
         with Workspace(self.repo, self.workdir / gid, self.meta.get("commit")) as ws:
@@ -232,14 +262,27 @@ class Verifier:
                                     "reason": "the build was switched off (--build none): only the compiler check "
                                               "of the sources was done"}
                     self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
+                elif self.base_info and not self.base_info.get("complete") and not self.allow_partial_baseline:
+                    self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
+                    rec["build"] = {"status": "not built", "check": "partial baseline",
+                                    "reason": "the baseline is partial (" + "; ".join(self.base_info.get("reasons", []))
+                                              + "): no plan can be proven against it"}
                 else:
-                    key = (tuple(modules), tuple(tests))
-                    if key not in self._base_builds:                 # the original code (workspace is clean)
-                        self._base_builds[key] = bld.build(ws.path, modules, tests, self.build_tool)
+                    from . import baseline as bsl
+                    if self.base_info:                                # the baseline stage: full suite, flaky tests
+                        base_b = bsl.as_build_result(self.base_info)
+                    else:
+                        key = (tuple(modules), tuple(tests))
+                        if key not in self._base_builds:             # the original code (workspace is clean)
+                            self._base_builds[key] = bld.build(ws.path, modules, tests, self.build_tool)
+                        base_b = self._base_builds[key]
                     self.rw.apply(ws.path, kept_ops, [checks[i] for i in kept])
                     after_b = bld.build(ws.path, modules, tests, self.build_tool)
-                    rec["build"] = {"modules": modules, "tests_selected": len(tests),
-                                    **bld.compare(self._base_builds[key], after_b)}
+                    cmpb = bld.compare(base_b, after_b)
+                    if cmpb["status"] == "breaks tests" and cmpb.get("new_failures"):
+                        cmpb = self._settle_flaky(ws.path, cmpb, after_b)
+                    rec["build"] = {"modules": modules, "tests_selected": len(tests), **cmpb}
+                rec["reflection"] = reflection_gate(ws.path, res, kept_ops)
             rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
                                                                                    self.allow_untested)
             # the real detectors confirm accepted fixes (running them on every plan would take too long)
@@ -252,6 +295,10 @@ class Verifier:
                     elif d.get("ok") and d.get("groups", {}).get(gid) is True:
                         rec.setdefault("still_reported_by", []).append(tool)
         rec["seconds"] = round(time.time() - t0, 1)
+        rec["api_predicted"] = ((plan.get("checks") or {}).get("api_breaks"))
+        rec["level"] = evidence_level(rec)
+        if self.learn:
+            self.lessons.learn(rec, kept_ops if rec.get("kept") else [], rec.get("dropped_operations") or [])
         (out / "verification.json").write_text(json.dumps(rec, indent=1, default=str))
         return rec
 
@@ -289,6 +336,7 @@ class Verifier:
         return {"new_smells": news, "new_smells_count": sum(len(n["elements"]) for n in news),
                 "target_before": _small(tb), "target_after": _small(ta), "target_removed": not ta.get("present", True),
                 "predicted_after": _small(predicted.target_after),
+                "predicted_removed": not _small(predicted.target_after).get("present", True),
                 "prediction_matches": _small(predicted.target_after) == _small(ta),
                 "smells_before": dict(Counter(before["type"])), "smells_after": dict(Counter(after["type"]))}
 
@@ -302,7 +350,7 @@ class Verifier:
             if p["name"] != g["recommended"] and _acceptable(p) and key not in seen:
                 ranked.append(p)
                 seen.add(key)
-        for old in (self.results / "verify" / g["group_id"]).glob("try_*"):
+        for old in (self.vdir / g["group_id"]).glob("try_*"):
             shutil.rmtree(old, ignore_errors=True)
         tried = []
         for i, plan in enumerate(ranked[:1 + FALLBACK_PLANS]):
@@ -320,19 +368,24 @@ class Verifier:
         rec["recommended_plan"] = g["recommended"]
         if best:
             rec["fallback_from"] = g["recommended"]
-            top = self.results / "verify" / g["group_id"]
+            top = self.vdir / g["group_id"]
             src = top / f"try_{rec['plan']}"
             for f in src.iterdir():
                 if f.is_file():
                     shutil.copy2(f, top / f.name)
         rec["status"], rec["accepted"], rec["why_not_accepted"] = final_status(rec, self.max_api_breaks,
                                                                                self.allow_untested)
-        (self.results / "verify" / g["group_id"] / "verification.json").write_text(
+        rec["level"] = evidence_level(rec)
+        (self.vdir / g["group_id"] / "verification.json").write_text(
             json.dumps(rec, indent=1, default=str))
         return rec
 
     def run(self, groups: int | None = None, only: set[str] | None = None) -> list[dict]:
-        plans = json.loads((self.results / "plans" / "plans.json").read_text())
+        from ..freeze import freeze, plans_sha
+        if self.learn and (not self.shard or self.shard[0] == 0):   # plans are frozen before anything is tested
+            freeze(self.results)
+        self.plans_sha = plans_sha(self.results)
+        plans = json.loads(self.plans_file.read_text())
         self.baseline()
         out = []
         todo = [g for g in plans["groups"] if g.get("recommended") and (not only or g["group_id"] in only)]
@@ -341,7 +394,12 @@ class Verifier:
             todo = todo[self.shard[0]::self.shard[1]]
         for g in todo:
             rec = self.verify_group(g)
-            (self.results / "verify" / g["group_id"] / "result.json").write_text(json.dumps(rec, indent=1, default=str))
+            rec["plans_sha256"] = self.plans_sha
+            from ..freeze import is_frozen
+            rec["frozen"] = is_frozen(self.results)
+            (self.vdir / g["group_id"] / "result.json").write_text(json.dumps(rec, indent=1, default=str))
+            if self.learn:
+                self.lessons.save()
             yn = {True: "yes", False: "no", None: "-"}
             self.log(f"{g['group_id']}: plan {rec['plan']}"
                      + (f" (fallback from {rec['fallback_from']})" if rec.get("fallback_from") else "")
@@ -353,17 +411,17 @@ class Verifier:
                      + f" [{rec['seconds']:.0f} s]")
             out.append(rec)
         if self.shard:          # the shards are merged afterwards (dsarp verify --merge)
-            (self.results / "verify" / f"verification{self.tag}.json").write_text(json.dumps(out, indent=1, default=str))
+            (self.vdir / f"verification{self.tag}.json").write_text(json.dumps(out, indent=1, default=str))
             return out
         # keep earlier results of groups that were not verified in this run
-        prev_file = self.results / "verify" / "verification.json"
+        prev_file = self.vdir / "verification.json"
         if only and prev_file.exists():
             done = {r["group_id"] for r in out}
             out = [r for r in json.loads(prev_file.read_text()) if r["group_id"] not in done] + out
-        summary = self.results / "verify" / "summary.csv"
+        summary = self.vdir / "summary.csv"
         pd.DataFrame([{k: v for k, v in r.items() if not isinstance(v, (dict, list))} for r in out]).to_csv(
             summary, index=False)
-        (self.results / "verify" / "verification.json").write_text(json.dumps(out, indent=1, default=str))
+        (self.vdir / "verification.json").write_text(json.dumps(out, indent=1, default=str))
         return out
 
 
@@ -391,6 +449,36 @@ def _acceptable(p: dict) -> bool:
         and (p.get("benefit") or 0) > 0 and (p.get("score") or 0) > 0
 
 
+REFLECTIVE = re.compile(r"(?:\bClass\.forName|\.loadClass|\.getDeclared(?:Method|Field|Constructor)s?|"
+                        r"\.get(?:Method|Field|Constructor)s?|\bServiceLoader\.load|\bMethodHandles\.(?:lookup|"
+                        r"privateLookupIn))\s*\(")
+
+
+def reflection_gate(path: Path, res, ops: list[dict]) -> dict:
+    """Hidden breakage through reflection: a plan must not add reflective lookups to a file (each changed Java
+    file is compared with its own original), and no string may still name a moved class by its old name
+    (``Class.forName("old.Name")`` would fail at run time)."""
+    import subprocess
+    added = []
+    moved_back = {new: old for old, new in res.moved.items()}
+    for f in sorted(set(res.changed) | set(res.moved.values()) | set(res.created)):
+        if not f.endswith(".java") or not (path / f).exists():
+            continue
+        orig = subprocess.run(["git", "-C", str(path), "show", f"HEAD:{moved_back.get(f, f)}"],
+                              capture_output=True, text=True)
+        before = len(REFLECTIVE.findall(orig.stdout)) if orig.returncode == 0 else 0
+        after = len(REFLECTIVE.findall((path / f).read_text(errors="replace")))
+        if after > before:
+            added.append(f"{f} (+{after - before})")
+    stale = []
+    for old in _renamed(ops):
+        r = subprocess.run(["git", "-C", str(path), "grep", "--untracked", "-l", "-F", f'"{old}"', "--", "*.java"],
+                           capture_output=True, text=True)
+        if r.stdout.strip():
+            stale.append(f"{old} in {r.stdout.split()[0]}")
+    return {"ok": not added and not stale, "added_lookups": added[:20], "old_names_in_strings": stale[:20]}
+
+
 def _write_stub(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -408,6 +496,33 @@ def _improved(r: dict) -> bool:
     tb, ta = r.get("target_before") or {}, r.get("target_after") or {}
     return any(isinstance(v, (int, float)) and isinstance(ta.get(k), (int, float)) and ta[k] < v
                for k, v in tb.items() if k != "present")
+
+
+LEVELS = {
+    "0": "no plan",
+    "1": "the change does not build (or could not be built)",
+    "2": "builds, but tests fail, do not finish, or no test runs it",
+    "3": "builds and tests pass, but no improvement or unsafe (new smells, API limit, patch, reflection)",
+    "4a": "accepted fix: smell reduced",
+    "4b": "accepted fix: smell removed (DSARP's measurement on the compiled code)",
+    "4c": "accepted fix: smell removed, and the original detectors agree",
+}
+
+
+def evidence_level(r: dict | None) -> str:
+    """How far a verified plan got (see ``LEVELS``)."""
+    if not r:
+        return "0"
+    if r.get("accepted"):
+        if r.get("status") == "removed":
+            return "4c" if r.get("confirmed_by") and not r.get("still_reported_by") else "4b"
+        return "4a"
+    st, b = r.get("status"), (r.get("build") or {})
+    if st in ("not_applicable", "breaks the build") or b.get("status") in (None, "not built"):
+        return "1"
+    if st in ("breaks tests", "tests did not finish") or b.get("status") == "builds":
+        return "2"
+    return "3"
 
 
 def final_status(r: dict, max_api_breaks: int | None = None, allow_untested: bool = False) -> tuple[str, bool, str]:
@@ -438,6 +553,12 @@ def final_status(r: dict, max_api_breaks: int | None = None, allow_untested: boo
         why.append("no test runs the changed code (" + (r.get("test_scope") or b.get("reason") or "no tests") + ")")
     if r.get("patch_applies") is False:
         why.append("the patch does not apply to a clean checkout")
+    refl = r.get("reflection") or {}
+    if refl and not refl.get("ok", True):
+        why.append("reflection: " + "; ".join(
+            ([f"adds reflective lookups ({', '.join(refl['added_lookups'][:2])})"] if refl.get("added_lookups") else [])
+            + ([f"old class name still in a string ({refl['old_names_in_strings'][0]})"]
+               if refl.get("old_names_in_strings") else [])))
     api = (r.get("api_breaks") or {}).get("count", 0)
     if max_api_breaks is not None and api > max_api_breaks:
         why.append(f"it changes {api} public types and members (limit {max_api_breaks})")

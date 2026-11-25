@@ -238,3 +238,180 @@ def test_combined_plan_selection_is_exact():
     chosen, conflicts, _ = c._exact_order(cands)
     assert [g["group_id"] for g, _, _ in chosen] == ["B", "C"]
     assert conflicts and conflicts[0]["group_id"] == "A"
+
+
+FAKE_SUITE = """#!/bin/sh
+# full suite: module a (Ok passes, Flaky fails the first time, Bad always fails), module b (skipped if SKIPB)
+case " $* " in
+  *" test-compile "*) [ -f BROKEN ] && exit 1; exit 0 ;;
+esac
+report() { mkdir -p "$1/target/surefire-reports"; cat > "$1/target/surefire-reports/TEST-$2.xml"; }
+case "$*" in
+  *-Dtest=*)
+    report a reruns <<XML
+<testsuite name="x"><testcase classname="a.Flaky" name="t"/><testcase classname="a.Bad" name="t"><failure/></testcase></testsuite>
+XML
+    exit 1 ;;
+esac
+report a a.Tests <<XML
+<testsuite name="a"><testcase classname="a.Ok" name="t"/><testcase classname="a.Flaky" name="t"><failure/></testcase>
+<testcase classname="a.Bad" name="t"><error/></testcase></testsuite>
+XML
+[ -f SKIPB ] || report b b.Tests <<XML
+<testsuite name="b"><testcase classname="b.Ok" name="t"/></testsuite>
+XML
+exit 1
+"""
+
+
+@pytest.fixture
+def suite(tmp_path):
+    (tmp_path / "pom.xml").write_text("<project><properties><maven.compiler.release>11</maven.compiler.release>"
+                                      "</properties></project>")
+    for m in ("a", "b"):
+        d = tmp_path / m / "src" / "test" / "java"
+        d.mkdir(parents=True)
+        (d / "T.java").write_text("class T {}")
+    m = tmp_path / "mvnw"
+    m.write_text(FAKE_SUITE)
+    m.chmod(m.stat().st_mode | stat.S_IEXEC)
+    return tmp_path
+
+
+def test_baseline_finds_flaky_and_failing_tests(suite, tmp_path):
+    from dsarp.verify import baseline as bsl
+    r = bsl.run(suite, tmp_path / "out", "maven", timeout=60, log=lambda *_: None)
+    assert r["complete"] and r["tests_run"] == 4 and r["java_level"] == 11
+    assert r["flaky"] == ["a.Flaky#t"] and r["failing"] == ["a.Bad#t"]
+    assert r["modules_with_tests"] == ["a", "b"] and r["missing_modules"] == []
+    assert (tmp_path / "out" / "baseline.json").exists()
+    # neither the flaky nor the failing test is blamed on a plan
+    base = bsl.as_build_result(r)
+    after = bld.BuildResult("maven", False, [], 1.0, tests=["a.Bad"], compiled=True, tests_run=2,
+                            failing=["a.Bad#t", "a.Flaky#t"])
+    assert bld.compare(base, after)["status"] == "builds and tests pass"
+
+
+def test_partial_baselines_are_refused(suite, tmp_path):
+    from dsarp.verify import baseline as bsl
+    (suite / "SKIPB").write_text("")
+    r = bsl.run(suite, tmp_path / "o1", "maven", timeout=60, log=lambda *_: None)
+    assert not r["complete"] and r["missing_modules"] == ["b"] and "produced no test report" in r["reasons"][0]
+    (suite / "BROKEN").write_text("")
+    r = bsl.run(suite, tmp_path / "o2", "maven", timeout=60, log=lambda *_: None)
+    assert not r["complete"] and "does not build" in r["reasons"][0]
+
+
+def test_jdk_is_chosen_from_the_java_level(tmp_path, monkeypatch):
+    from dsarp.verify import baseline as bsl
+    (tmp_path / "pom.xml").write_text("<project><properties><maven.compiler.source>1.8</maven.compiler.source>"
+                                      "</properties></project>")
+    assert bsl.java_level(tmp_path) == 8
+    j8, j17 = tmp_path / "jdk8", tmp_path / "jdk17"
+    j8.mkdir()
+    j17.mkdir()
+    monkeypatch.setenv("DSARP_JDK_17", str(j17))
+    assert bsl.java_home(8) == (str(j17), 17)                  # nearest newer JDK
+    monkeypatch.setenv("DSARP_JDK_8", str(j8))
+    assert bsl.java_home(8) == (str(j8), 8)
+    assert bsl.build_env(tmp_path)["JAVA_HOME"] == str(j8)
+    (tmp_path / "pom.xml").unlink()
+    (tmp_path / "build.gradle").write_text("java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }")
+    assert bsl.java_level(tmp_path) == 17
+
+
+needs_jdk_here = pytest.mark.skipif(not shutil.which("javac"), reason="needs a JDK")
+
+
+@needs_jdk_here
+def test_safety_rules_from_failed_builds(tmp_path):
+    """Moves that broke real builds in the cycle-repair-loop experiments are not planned."""
+    from pathlib import Path as P
+    from dsarp.config import parse_config
+    from dsarp.plan.checks import Checker
+    from dsarp.plan.facts import RepoFacts
+    from dsarp.program import ProgramModel, build_model
+    repo = tmp_path / "repo"
+    src = repo / "src/main/java/com/a"
+    src.mkdir(parents=True)
+    (repo / "src/main/java/com/b").mkdir(parents=True)
+    (repo / "pom.xml").write_text("<project><modelVersion>4.0.0</modelVersion><groupId>s</groupId>"
+                                  "<artifactId>s</artifactId><version>1</version></project>")
+    (src / "Widget.java").write_text("package com.a;\npublic class Widget {\n    Widget(int n) {}\n"
+                                     "    public int size() { return 1; }\n}\n")
+    (src / "Factory.java").write_text("package com.a;\npublic class Factory {\n    public Widget make() "
+                                      "{ return new Widget(3); }\n    int secret() { return 2; }\n}\n")
+    (src / "Helper.java").write_text("package com.a;\npublic class Helper {\n    public int use(Factory f) "
+                                     "{ return f.secret(); }\n}\n")
+    (src / "Api.java").write_text("package com.a;\npublic class Api {\n    public int x() { return 1; }\n}\n")
+    (repo / "src/main/java/com/b/Thing.java").write_text("package com.b;\npublic class Thing {\n    "
+                                                         "public int n(com.a.Widget w) { return w.size(); }\n}\n")
+    cfg = parse_config({"name": "s", "repo_url": "x", "build": "maven", "detectors": [{"tool": "designite",
+                                                                                         "path": "x"}]}, P("."))
+    build_model(cfg, repo, tmp_path / "model", history_commits=0)
+    rf = RepoFacts.build(ProgramModel(tmp_path / "model"), api_policy="off")
+    mv = lambda c, to, new=False: {"op": "move_class", "class": f"com.a.{c}", "from_package": "com.a",
+                                   "to_package": to, **({"new_package": True} if new else {})}
+
+    def blocked(op):
+        c = Checker(rf).check([op], {op["class"]: op["to_package"]})[0]
+        return c.status == "blocked", " | ".join(c.notes)
+
+    b, why = blocked(mv("Widget", "com.b"))
+    assert b and "non-public constructor" in why
+    b, why = blocked(mv("Api", "com.a.internal", new=True))
+    assert b and "internal package" in why
+    b, why = blocked(mv("Helper", "com.b"))
+    assert not b                                                   # widening allowed by default
+    rf.no_widening = True
+    b, why = blocked(mv("Helper", "com.b"))
+    assert b and "widening is switched off" in why
+
+
+@needs_git
+def test_reflection_gate(tmp_path):
+    from dsarp.verify.run import reflection_gate
+    repo = tmp_path / "r"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    g("init", "-q")
+    (repo / "A.java").write_text("class A { Object o = null; }\n")
+    (repo / "B.java").write_text('class B { String n = "com.x.Old"; }\n')
+    g("add", "-A")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+    res = SimpleNamespace(moved={}, changed={"A.java"}, created=[])
+    op = [{"op": "move_class", "class": "com.x.Other", "from_package": "com.x", "to_package": "com.y"}]
+    assert reflection_gate(repo, res, op)["ok"]
+    (repo / "A.java").write_text('class A { Object o = Class.forName("com.y.Other"); }\n')
+    r = reflection_gate(repo, res, op)
+    assert not r["ok"] and r["added_lookups"] == ["A.java (+1)"]
+    (repo / "A.java").write_text("class A { Object o = null; }\n")
+    op2 = [{"op": "move_class", "class": "com.x.Old", "from_package": "com.x", "to_package": "com.y"}]
+    r = reflection_gate(repo, res, op2)
+    assert not r["ok"] and r["old_names_in_strings"][0].startswith("com.x.Old in B.java")
+    st, ok, why = final_status(_verified(reflection=r), 30)
+    assert not ok and "old class name still in a string" in why
+
+
+def test_wilson_and_mcnemar_known_values():
+    from dsarp.evaluate.stats import mcnemar_exact, wilson
+    p, lo, hi = wilson(8, 29)                            # e.g. 8 of 29 cycles dissolved and accepted
+    assert round(p, 3) == 0.276 and round(lo, 3) == 0.147 and round(hi, 3) == 0.457
+    assert wilson(0, 0) == (0.0, 0.0, 0.0) and wilson(0, 10)[1] == 0.0
+    assert mcnemar_exact(0, 0) == 1.0
+    assert round(mcnemar_exact(10, 2), 4) == 0.0386      # binomial, two-sided
+    assert mcnemar_exact(3, 3) == 1.0
+
+
+def test_evidence_levels():
+    from dsarp.verify.run import evidence_level
+    assert evidence_level(None) == "0"
+    assert evidence_level(_verified(accepted=True, status="removed", confirmed_by=["arcan"])) == "4c"
+    assert evidence_level(_verified(accepted=True, status="removed")) == "4b"
+    assert evidence_level(_verified(accepted=True, status="reduced")) == "4a"
+    assert evidence_level(_verified(accepted=False, status="breaks the build",
+                                    build={"status": "breaks the build"})) == "1"
+    assert evidence_level(_verified(accepted=False, status="removed", build={"status": "not built"})) == "1"
+    assert evidence_level(_verified(accepted=False, status="breaks tests", build={"status": "breaks tests"})) == "2"
+    assert evidence_level(_verified(accepted=False, status="removed", build={"status": "builds"})) == "2"
+    assert evidence_level(_verified(accepted=False, status="made_worse")) == "3"

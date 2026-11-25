@@ -301,3 +301,20 @@ def test_rewriter_updates_class_names_in_resources_and_osgi_exports(project, tmp
         assert "other=com.acme.core.EngineFactory" in props                 # a different class is left alone
         assert "com.acme.core.engine,com.acme.core;version=1.0" in (ws.path / "core/core.bnd").read_text()
         assert "core/src/main/resources/app.properties" in res.changed
+
+
+@needs_jdk
+def test_no_plan_is_proven_against_a_partial_baseline(project):
+    (project / "baseline").mkdir(exist_ok=True)
+    (project / "baseline" / "baseline.json").write_text(json.dumps(
+        {"tool": "maven", "complete": False, "reasons": ["the test suite did not finish within 60 s"],
+         "tests_run": 3, "failing": [], "flaky": []}))
+    v = Verifier(project, PROJECT, log=lambda *_: None)
+    group = {"group_id": "G-part", "type": "cyclic_dependency", "core": ["com.acme.core", "com.acme.util"],
+             "central": ""}
+    plan = {"name": "manual", "operations": [{**MOVE_ENGINE, "check": {"edits": [
+        {"edit": "make_public", "elements": ["com.acme.core.Engine#runs"]}]}}]}
+    rec = v.verify_plan(group, plan)
+    assert rec["build"]["check"] == "partial baseline" and "did not finish" in rec["build"]["reason"]
+    assert not rec["accepted"] and "partial" in rec["why_not_accepted"]
+    (project / "baseline" / "baseline.json").unlink()
